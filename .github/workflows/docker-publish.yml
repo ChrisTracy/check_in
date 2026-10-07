@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ${{ vars.DOCKERHUB_IMAGE || format('{0}/check-in-api', vars.DOCKERHUB_USERNAME) }}
+  IMAGE: ${{ vars.DOCKERHUB_IMAGE || format('{0}/check-in', vars.DOCKERHUB_USERNAME) }}
 
 jobs:
   test:
