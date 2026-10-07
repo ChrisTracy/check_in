@@ -13,6 +13,7 @@ A high-throughput check-in API with dynamic fields, per-record change history, C
 - **Built for load.** Writes are batched into one SQLite transaction per event-loop tick, so thousands of simultaneous calls share a single disk sync.
 - **Live dashboard** at `/`: virtualised table, cards and activity views; filters; grouping; saved views; column show/hide, reorder and resize; CSV import and export; multi-select delete; and a **Clear all** button.
 - **Users and roles** (Admin, Power user, User, Reader) with password sign-in, HTTP Basic auth for scripts, an API key for devices, and **Microsoft Entra ID single sign-on** (OIDC).
+- **Built-in HTTPS** for when there's no reverse proxy: upload a PEM or PFX certificate, or generate a self-signed one, in the admin portal. Certificates are stored in the data volume and reload without a restart.
 
 ## Screenshots
 
@@ -55,6 +56,9 @@ To load some sample data, run `npm run seed`. If an API key is set, run it as `A
 | `APP_SECRET` | *(generated)* | Encrypts the stored SSO client secret and sign-in cookies. If empty, a random one is saved to `data/.app-secret`. Back that file up with the database |
 | `SESSION_TTL_HOURS` | `12` | Browser sign-in lifetime, extended while in use |
 | `TRUST_PROXY` | *(empty)* | Set (`true`, a hop count, or proxy IPs) when behind a reverse proxy / load balancer, so HTTPS and client IPs are detected |
+| `HTTPS_PORT` | `3443` | Port for the built-in HTTPS server (only used when HTTPS is turned on in Admin → HTTPS) |
+| `TLS_DIR` | `data/tls` | Where certificates are stored (next to the database by default, so inside the Docker volume) |
+| `TLS_DISABLE` | `false` | Break-glass: `true` forces HTTP only, ignoring saved HTTPS settings |
 | `COOKIE_SECURE` | `auto` | `auto` marks cookies Secure on HTTPS requests; or force `true` / `false` |
 | `CORS_ORIGIN` | *(empty)* | Set to an origin (or `*`) to allow calls from browsers on other sites |
 | `MAX_BATCH` | `5000` | Maximum writes per transaction |
@@ -87,6 +91,7 @@ Things to know:
 - **Run one container only.** SQLite is a single-writer file database. Don't scale to more than one replica or point two containers at the same volume.
 - **Use a named volume, not a Windows folder bind mount.** SQLite's WAL file locking is unreliable on host folders bind-mounted through Docker Desktop. The compose file already uses the named volume `checkin-data`.
 - **Set `APP_SECRET`** in production. Otherwise a secret is generated in the volume (`/app/data/.app-secret`) and must be backed up with the database, or the stored SSO client secret can't be decrypted.
+- **No reverse proxy?** Use [built-in HTTPS](#built-in-https) and publish port 3443 too.
 - **Behind a reverse proxy or load balancer** (nginx, Traefik, Azure App Gateway and so on) that terminates HTTPS: set `TRUST_PROXY=true` (or the hop count), and set **Public URL** in Admin → Single sign-on, so cookies are marked Secure and the Entra redirect URI uses your public `https://` address. Server-Sent Events (live updates) need response buffering turned off for `/api/events`. The app sends `X-Accel-Buffering: no` for nginx.
 - **Backups:** stop the container (or accept a crash-consistent copy), then archive the volume:
   ```bash
@@ -121,6 +126,32 @@ One-time setup:
 To run a published image instead of building locally, replace `build: .` in `docker-compose.yml` with `image: <user>/check-in:1.0.0`.
 
 `.github/workflows/ci.yml` runs the tests on Node 22 and 24 and does a Docker build and smoke test on every push and pull request.
+
+## Built-in HTTPS
+
+If the app can't sit behind a reverse proxy or load balancer, it can serve HTTPS itself. Everything is configured in **Admin → HTTPS** (admins only), and certificates are saved in the data volume (`data/tls`), so they survive container rebuilds.
+
+1. **Install a certificate**, in one of three ways:
+   - **PEM files:** the certificate (with intermediates after it, as a full chain) plus the private key. Encrypted keys are accepted with their password and stored decrypted, as nginx does.
+   - **PFX / P12:** the usual export from Windows certificate stores and many CAs. The password is stored encrypted with the app secret.
+   - **Generate self-signed:** for testing or internal use. Clients warn until they trust it; use **Download certificate** to install it as trusted.
+
+   The upload is checked before anything is saved: wrong passwords, a key that doesn't match the certificate, and unreadable files are all rejected with a clear message.
+2. **Choose a mode:**
+   - **Off:** HTTP only (the default).
+   - **HTTPS and HTTP:** both work, which is handy while moving devices over.
+   - **HTTPS only:** HTTP gets a `307` redirect to HTTPS. A 307 keeps POST bodies, so check-ins that follow redirects still work. `/health` stays on HTTP for container health checks.
+3. Optionally turn on **HSTS**, and set **Public HTTPS port** if clients reach the server on a different port than it listens on (for example `443` mapped to `3443`).
+
+Notes:
+
+- Changes apply immediately, with no restart. Replacing a certificate swaps it on the running server. If HTTPS can't start (for example, the port is in use), the mode change is rolled back so HTTP never redirects to a dead port.
+- The status panel shows the certificate's names, issuer, expiry (with a warning under 30 days) and SHA-256 fingerprint. The startup log also warns when the certificate is close to expiry.
+- **Automated renewals:** copy `cert.pem` and `key.pem` into `data/tls` (for example from certbot or another ACME client). Changes are picked up within a minute.
+- Minimum protocol is TLS 1.2.
+- **Locked out?** Start with `TLS_DISABLE=true` to force HTTP only, fix the settings, then remove the variable.
+- **Docker:** the container listens for HTTPS on `3443`. Publish it with `PUBLISH_HTTPS_PORT=443` in `.env` (compose maps `443:3443`). The container runs as a non-root user, so it can't bind port 443 itself. Set **Public HTTPS port** to `443` so redirects point at the right port.
+- Using Entra sign-in over HTTPS? Set **Public URL** in Admin → Single sign-on to your `https://` address, and register that redirect URI in Entra.
 
 ## Users, roles and sign-in
 
@@ -261,6 +292,9 @@ curl -X POST http://localhost:3000/api/checkin -H "Content-Type: application/jso
 | `GET/PUT /api/admin/sso` · `POST /api/admin/sso/test` | Admin | Entra SSO settings and discovery test |
 | `GET/POST /api/admin/apikey` | Admin | `{ "action": "generate" \| "set" \| "disable", "key" }`. `generate` returns the new key once |
 | `GET /auth/oidc/login` · `GET /auth/oidc/callback` | public | The Entra sign-in redirect flow |
+| `GET/PUT /api/admin/tls` | Admin | HTTPS status and settings: `{ "mode": "off" \| "both" \| "redirect", "hsts": false, "publicPort": 443 }` |
+| `POST /api/admin/tls/certificate` | Admin | Install a certificate: `{ "type": "pem", "cert", "key", "passphrase" }`, `{ "type": "pfx", "pfx": "<base64>", "passphrase" }` or `{ "type": "self-signed", "hostnames": "host, 10.0.0.5", "days": 365 }` |
+| `GET /api/admin/tls/certificate.pem` · `DELETE /api/admin/tls/certificate` | Admin | Download the public certificate · remove it (HTTPS must be off) |
 
 ### Accepting check-ins (pause / resume)
 
@@ -347,6 +381,7 @@ src/
   store.js    batched write queue, upsert/history logic, queries
   db.js       SQLite (built-in node:sqlite) schema, pragmas, transaction helper
   csv.js      CSV helpers
+  tls.js      built-in HTTPS: certificate storage, validation, hot reload, redirects
   config.js   env/.env loading
   auth/
     plugin.js    identity resolution, permissions, CSRF, auth + admin routes

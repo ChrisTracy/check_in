@@ -42,6 +42,7 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 try {
   await app.listen({ port: config.port, host: config.host });
+  const t = await app.tls.apply();
   const s = store.summary();
   console.log(`Check-in API listening on http://localhost:${config.port}`);
   console.log(`  Dashboard:     http://localhost:${config.port}/`);
@@ -50,6 +51,9 @@ try {
   console.log(`  Users:         ${accounts.count() || 'none yet: open the dashboard to create the first admin'}`);
   console.log(`  API key:       ${accounts.apiKeyInfo().set ? 'set (required for anonymous check-ins)' : 'not set (check-ins are open)'}`);
   console.log(`  Entra SSO:     ${accounts.ssoReady() ? 'enabled' : 'off'}`);
+  if (config.tlsDisable) console.log('  HTTPS:         disabled by TLS_DISABLE');
+  else if (t.listening) console.log(`  HTTPS:         https://localhost:${t.listeningPort}/ (${t.mode === 'redirect' ? 'HTTP redirects to HTTPS' : 'HTTP also served'})${t.cert?.daysLeft < 30 ? `  ⚠ certificate expires in ${t.cert.daysLeft} days` : ''}`);
+  else console.log(`  HTTPS:         ${t.error ? 'error: ' + t.error : 'off (turn on in Admin → HTTPS)'}`);
 } catch (err) {
   console.error(err);
   process.exit(1);

@@ -1,4 +1,5 @@
 import path from 'node:path';
+import http from 'node:http';
 import querystring from 'node:querystring';
 import { Readable } from 'node:stream';
 import Fastify from 'fastify';
@@ -8,6 +9,7 @@ import { HttpError, normalizeInput } from './store.js';
 import { csvRow, parseCsv, decodeCell } from './csv.js';
 import { ROOT } from './config.js';
 import { registerAuth } from './auth/plugin.js';
+import { TlsManager } from './tls.js';
 
 const AUTH_QUERY_KEYS = new Set(['api_key', 'apikey']);
 const MAX_BULK_DELETE = 100_000;
@@ -27,11 +29,35 @@ function stamp() {
 }
 
 export function buildApp({ config, store, accounts, oidc }) {
+  // Keep a reference to Fastify's request handler so the optional HTTPS server can share it.
+  let handler;
   const app = Fastify({
     logger: config.logLevel === 'silent' ? false : { level: config.logLevel },
     bodyLimit: config.bodyLimitMb * 1024 * 1024,
-    keepAliveTimeout: 65_000,
     trustProxy: config.trustProxy,
+    serverFactory: (h) => {
+      handler = h;
+      const server = http.createServer(h);
+      server.keepAliveTimeout = 65_000;
+      return server;
+    },
+  });
+
+  // ---- built-in HTTPS (optional; configured in Admin → HTTPS) ------------
+  const tlsManager = new TlsManager({
+    dir: config.tlsDir,
+    accounts,
+    handler: (req, res) => handler(req, res),
+    port: config.httpsPort,
+    host: config.host,
+    disabled: config.tlsDisable,
+    log: app.log,
+    pollMs: config.tlsPollMs ?? 60_000,
+  });
+  app.decorate('tls', tlsManager);
+  app.addHook('onRequest', async (req, reply) => {
+    const target = tlsManager.redirectTarget(req);
+    if (target) return reply.code(307).header('Location', target).send();
   });
 
   // ---- body parsers ------------------------------------------------------
@@ -48,6 +74,9 @@ export function buildApp({ config, store, accounts, oidc }) {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'same-origin');
     reply.header('X-Frame-Options', 'DENY');
+    if (req.protocol === 'https' && tlsManager.settings().hsts && tlsManager.mode !== 'off') {
+      reply.header('Strict-Transport-Security', 'max-age=31536000');
+    }
     return payload;
   });
 
@@ -76,6 +105,21 @@ export function buildApp({ config, store, accounts, oidc }) {
 
   // ---- auth --------------------------------------------------------------
   registerAuth(app, { accounts, oidc, config, broadcast });
+
+  // ---- admin: HTTPS / TLS --------------------------------------------------
+  const tlsCap = { config: { cap: 'tls' } };
+  app.get('/api/admin/tls', tlsCap, async () => tlsManager.state());
+  app.put('/api/admin/tls', tlsCap, async (req) => tlsManager.updateSettings(req.body || {}));
+  app.post('/api/admin/tls/certificate', { ...tlsCap, bodyLimit: 2 * 1024 * 1024 }, async (req) =>
+    tlsManager.install(req.body, req.auth.user?.username || req.auth.name));
+  app.delete('/api/admin/tls/certificate', tlsCap, async () => tlsManager.remove());
+  app.get('/api/admin/tls/certificate.pem', tlsCap, async (req, reply) => {
+    const pem = tlsManager.certificatePem();
+    if (!pem) return reply.code(404).send({ ok: false, error: 'No certificate installed' });
+    reply.header('Content-Type', 'application/x-pem-file');
+    reply.header('Content-Disposition', 'attachment; filename="check-in-certificate.pem"');
+    return pem;
+  });
 
   // ---- static assets -----------------------------------------------------
   app.register(fastifyStatic, { root: path.join(ROOT, 'public'), prefix: '/', index: false });
@@ -287,6 +331,7 @@ export function buildApp({ config, store, accounts, oidc }) {
   });
 
   app.addHook('onClose', async () => {
+    await tlsManager.close();
     clearInterval(heartbeat);
     for (const res of clients) res.end();
     clients.clear();

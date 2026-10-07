@@ -22,6 +22,7 @@ export const CAPS = {
   apiKey: 'admin',
   sso: 'admin',
   users: 'admin',
+  tls: 'admin',
 };
 export const can = (role, cap) => roleLevel(role) >= roleLevel(CAPS[cap]);
 export const capsFor = (role) => Object.fromEntries(Object.keys(CAPS).map((c) => [c, can(role, c)]));

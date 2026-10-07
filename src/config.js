@@ -51,6 +51,11 @@ export const config = {
   // Testing / non-Entra providers only
   oidcIssuerOverride: process.env.OIDC_ISSUER_OVERRIDE || '',
   oidcAllowInsecure: process.env.OIDC_ALLOW_INSECURE === 'true',
+  // Built-in HTTPS (turned on in Admin → HTTPS). Certificates are stored in TLS_DIR.
+  httpsPort: int(process.env.HTTPS_PORT, 3443),
+  tlsDir: path.resolve(ROOT, process.env.TLS_DIR || path.join(path.dirname(process.env.DB_PATH || 'data/checkin.db'), 'tls')),
+  // Break-glass: force HTTP only, ignoring the saved HTTPS settings.
+  tlsDisable: process.env.TLS_DISABLE === 'true',
   maxBatch: int(process.env.MAX_BATCH, 5000),
   maxFieldsPerRecord: int(process.env.MAX_FIELDS, 500),
   bodyLimitMb: int(process.env.BODY_LIMIT_MB, 10),

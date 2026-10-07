@@ -489,3 +489,12 @@ body.compact .td { font-size: 13px; }
 .pause-banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 10px; background: var(--aging-soft); color: var(--aging); border: 1px solid color-mix(in srgb, var(--aging) 35%, transparent); font-size: 13px; }
 .pause-banner span { flex: 1; color: var(--text); }
 .pause-banner b { color: var(--aging); }
+
+.seg.text { align-self: flex-start; }
+.seg.text button { width: auto; padding: 0 12px; font-size: 13px; font-weight: 550; }
+.radio-card:has(input:disabled) { opacity: .55; cursor: not-allowed; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+.field-label { display: flex; align-items: baseline; gap: 6px; }
+.field-label small { font-weight: 400; color: var(--muted); }
+.install-form { display: flex; flex-direction: column; gap: 14px; }

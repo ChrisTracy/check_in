@@ -23,6 +23,7 @@
     plus: '<svg class="i" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
     copy: '<svg class="i" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>',
     x: '<svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+    download: '<svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg>',
     edit: '<svg class="i" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16zM14 6l4 4"/></svg>',
   };
 
@@ -55,7 +56,7 @@
     $$('.admin-nav [data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
     $('#aBody').innerHTML = '<div class="muted">Loading…</div>';
     foot('');
-    ({ users: loadUsers, sso: loadSso, apikey: loadApiKey })[t]();
+    ({ users: loadUsers, sso: loadSso, apikey: loadApiKey, tls: loadTls })[t]();
   }
 
   // ================================================================== Users
@@ -411,6 +412,201 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
       body: `<p>Copy it now. For security it won't be shown again.</p><div class="key-reveal" id="newKey">${esc(key)}</div>`,
       actions: [{ label: 'Copy key', cls: 'primary', onClick: () => { copy(key); return false; } }, { label: 'Done' }],
     });
+  }
+
+  // ================================================================== HTTPS / TLS
+  let tlsState = null;
+  let tlsSource = 'pem';
+
+  async function loadTls() {
+    try { tlsState = await apiJson('/api/admin/tls'); renderTls(); } catch (e) { $('#aBody').innerHTML = `<div class="warn-box">${esc(e.message)}</div>`; }
+  }
+
+  function tlsStatusTag(st) {
+    if (st.disabledByEnv) return '<span class="tag off">Disabled by TLS_DISABLE</span>';
+    if (st.listening) return `<span class="tag ok">On · port ${st.listeningPort}</span>`;
+    if (st.error) return '<span class="tag off">Error</span>';
+    return '<span class="tag">Off</span>';
+  }
+
+  function certCard(c, st) {
+    if (!c) return '<div class="radio-card" style="cursor:default"><span><b>No certificate installed</b><small>Install one below: your own certificate (PEM or PFX), or a self-signed one for testing.</small></span></div>';
+    const days = c.daysLeft;
+    const exp = c.expired ? '<span class="tag off">Expired</span>' : days < 30 ? `<span class="tag off">Expires in ${days} days</span>` : `<span class="tag ok">${days} days left</span>`;
+    const src = { pem: 'PEM upload', pfx: 'PFX upload', 'self-signed': 'Generated (self-signed)' }[st.source] || 'Files in the data volume';
+    return `<div class="radio-card" style="cursor:default;flex-direction:column;align-items:stretch;gap:10px">
+      <div class="status-line" style="justify-content:space-between;flex-wrap:wrap">
+        <span class="status-line"><i class="dot ${c.expired ? 'stale' : days < 30 ? 'aging' : 'fresh'}"></i><b>${esc(c.subject)}</b>${c.selfSigned ? '<span class="tag">Self-signed</span>' : ''}</span>${exp}</div>
+      <table class="kv" style="font-size:13px">
+        <tr><td>Names</td><td>${c.names.length ? c.names.map((n) => `<span class="tag">${esc(n)}</span>`).join(' ') : '<span class="muted">none (subject only)</span>'}</td></tr>
+        <tr><td>Issuer</td><td>${esc(c.issuer)}</td></tr>
+        <tr><td>Valid</td><td>${esc(absTime(c.validFrom))} → ${esc(absTime(c.validTo))}</td></tr>
+        <tr><td>Key</td><td>${esc((c.keyType || '').toUpperCase())}</td></tr>
+        <tr><td>SHA-256</td><td><code style="word-break:break-all">${esc(c.fingerprint256)}</code></td></tr>
+        <tr><td>Source</td><td>${esc(src)}${st.uploadedAt ? ` · ${esc(relTime(st.uploadedAt))}${st.uploadedBy ? ' by ' + esc(st.uploadedBy) : ''}` : ''}</td></tr>
+      </table>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn sm" id="tDownload">${ICON.download}Download certificate</button>
+        <button class="btn sm danger" id="tRemove" ${st.savedMode !== 'off' ? 'disabled title="Turn HTTPS off first"' : ''}>${ICON.trash}Remove</button>
+      </div></div>`;
+  }
+
+  function installForm() {
+    const host = location.hostname;
+    const seg = (k, l) => `<button data-src="${k}" class="${tlsSource === k ? 'active' : ''}">${l}</button>`;
+    let form = '';
+    if (tlsSource === 'pem') {
+      form = `<div class="grid2">
+        <label class="field">Certificate (.pem, .crt, .cer)<input class="input" type="file" id="tCert" accept=".pem,.crt,.cer,.txt"><small>Include intermediate certificates (full chain) after your certificate.</small></label>
+        <label class="field">Private key (.key, .pem)<input class="input" type="file" id="tKey" accept=".key,.pem,.txt"></label>
+        <label class="field"><span class="field-label">Key password <small>(only if the key is encrypted)</small></span><input class="input" type="password" id="tKeyPass" autocomplete="off"></label></div>`;
+    } else if (tlsSource === 'pfx') {
+      form = `<div class="grid2">
+        <label class="field">PFX / PKCS#12 file (.pfx, .p12)<input class="input" type="file" id="tPfx" accept=".pfx,.p12"><small>The usual export format from Windows certificate stores and many CAs.</small></label>
+        <label class="field">Password<input class="input" type="password" id="tPfxPass" autocomplete="off"><small>Stored encrypted with the app secret.</small></label></div>`;
+    } else {
+      form = `<div class="callout">Self-signed certificates encrypt traffic, but browsers and devices show a warning unless they're set to trust it. Use for testing, or download it afterwards and install it as trusted on your clients. For production, use a certificate from your CA.</div>
+        <div class="grid2">
+        <label class="field">Host names and IP addresses<input class="input" id="tHosts" value="${esc([host, host === 'localhost' ? '' : 'localhost'].filter(Boolean).join(', '))}"><small>Comma-separated: every name clients use to reach the server.</small></label>
+        <label class="field">Valid for (days)<input class="input" type="number" id="tDays" min="1" max="3650" value="365"></label></div>`;
+    }
+    return `<div class="seg text" id="tSrc">${seg('pem', 'PEM files')}${seg('pfx', 'PFX / P12')}${seg('self-signed', 'Generate self-signed')}</div>
+      ${form}
+      <div><button class="btn primary" id="tInstall">${tlsState.cert ? 'Replace certificate' : 'Install certificate'}</button></div>`;
+  }
+
+  function renderTls() {
+    const st = tlsState;
+    head('HTTPS', 'Serve the dashboard and API over TLS without a reverse proxy', tlsStatusTag(st));
+    const mode = st.savedMode;
+    const radio = (v, title, desc) => `<label class="radio-card"><input type="radio" name="tlsMode" value="${v}" ${mode === v ? 'checked' : ''} ${v !== 'off' && !st.cert ? 'disabled' : ''}><span><b>${title}</b><small>${desc}</small></span></label>`;
+    $('#aBody').innerHTML = `
+      ${st.disabledByEnv ? '<div class="warn-box">HTTPS is forced off by the <code>TLS_DISABLE=true</code> environment variable. Settings can be changed but won\'t take effect until it\'s removed.</div>' : ''}
+      ${st.error && !st.disabledByEnv ? `<div class="warn-box">${esc(st.error)}</div>` : ''}
+      <div class="admin-section">
+        <h4>Certificate</h4>
+        ${certCard(st.cert, st)}
+      </div>
+      <div class="admin-section">
+        <h4>${st.cert ? 'Replace certificate' : 'Install a certificate'}</h4>
+        <div id="tForm" class="install-form">${installForm()}</div>
+        <p class="muted" style="margin:0;font-size:12px">Certificates are saved in the data volume (<code>data/tls</code>) and survive container rebuilds. You can also copy <code>cert.pem</code> and <code>key.pem</code> into that folder (for example from certbot); changes are picked up within a minute.</p>
+      </div>
+      <div class="admin-section">
+        <h4>Mode</h4>
+        <div style="display:grid;gap:8px">
+          ${radio('off', 'Off', 'HTTP only. Use this when a reverse proxy or load balancer handles HTTPS.')}
+          ${radio('both', 'HTTPS and HTTP', 'Both work. Useful while moving devices over, or for devices that can only speak HTTP.')}
+          ${radio('redirect', 'HTTPS only', 'HTTP requests are redirected to HTTPS (307, keeps POST bodies). <code>/health</code> stays on HTTP for container health checks.')}
+        </div>
+        <label class="switch"><input type="checkbox" id="tHsts" ${st.hsts ? 'checked' : ''}><span class="track"></span>Send HSTS (browsers will insist on HTTPS for this host for a year)</label>
+        <div class="grid2">
+          <label class="field"><span class="field-label">Public HTTPS port <small>(optional)</small></span><input class="input" type="number" id="tPublicPort" min="1" max="65535" placeholder="${st.httpsPort}" value="${st.publicPort ?? ''}">
+            <small>The port clients use, if different from the one the server listens on, e.g. 443 when Docker maps <code>443:${st.httpsPort}</code>. Used for redirects.</small></label>
+          <div class="field">Listening port<div class="input" style="display:flex;align-items:center;background:var(--surface-2)">${st.httpsPort} <span class="muted" style="margin-left:6px">(HTTPS_PORT)</span></div>
+            <small>Set with the <code>HTTPS_PORT</code> environment variable. In Docker, publish it: <code>"443:${st.httpsPort}"</code>.</small></div>
+        </div>
+        <p class="muted" style="margin:0;font-size:12px">Using Entra sign-in over HTTPS? Set <b>Public URL</b> in Single sign-on to your <code>https://</code> address and add that redirect URI in Entra. If you lock yourself out, start the container with <code>TLS_DISABLE=true</code>.</p>
+      </div>`;
+    foot('<button class="btn primary" id="tSave">Save HTTPS settings</button>');
+
+    // Delegate on the container: the source switcher is re-rendered with the form.
+    $('#tForm').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-src]');
+      if (!b || b.dataset.src === tlsSource) return;
+      tlsSource = b.dataset.src;
+      $('#tForm').innerHTML = installForm();
+      wireInstall();
+    });
+    wireInstall();
+    $('#tDownload')?.addEventListener('click', downloadCert);
+    $('#tRemove')?.addEventListener('click', () => modal({
+      title: 'Remove the certificate?',
+      body: '<p>The certificate and key are deleted from the data volume.</p>',
+      actions: [{ label: 'Cancel' }, { label: 'Remove', cls: 'danger solid', onClick: async () => {
+        try { tlsState = await apiJson('/api/admin/tls/certificate', { method: 'DELETE' }); renderTls(); toast('Certificate removed'); } catch (e) { toast(e.message, 'error'); }
+      } }],
+    }));
+    $('#tSave').addEventListener('click', saveTls);
+  }
+
+  function wireInstall() {
+    $('#tSrc').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b.dataset.src === tlsSource));
+    $('#tInstall').addEventListener('click', installCert);
+  }
+
+  const readText = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsText(file); });
+  const readB64 = (file) => new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(',')[1] || '');
+    r.onerror = rej;
+    r.readAsDataURL(file);
+  });
+
+  async function installCert() {
+    let body;
+    try {
+      if (tlsSource === 'pem') {
+        const c = $('#tCert').files[0];
+        const k = $('#tKey').files[0];
+        if (!c || !k) { toast('Choose both the certificate and the private key', 'error'); return; }
+        body = { type: 'pem', cert: await readText(c), key: await readText(k), passphrase: $('#tKeyPass').value };
+      } else if (tlsSource === 'pfx') {
+        const f = $('#tPfx').files[0];
+        if (!f) { toast('Choose a .pfx or .p12 file', 'error'); return; }
+        body = { type: 'pfx', pfx: await readB64(f), passphrase: $('#tPfxPass').value };
+      } else {
+        body = { type: 'self-signed', hostnames: $('#tHosts').value, days: Number($('#tDays').value) || 365 };
+      }
+    } catch { toast('Could not read the file', 'error'); return; }
+    $('#tInstall').disabled = true;
+    try {
+      const r = await apiJson('/api/admin/tls/certificate', json('POST', body));
+      tlsState = r;
+      renderTls();
+      toast(`Installed certificate for ${r.installed.subject}${r.listening ? '. HTTPS reloaded' : ''}`);
+    } catch (e) {
+      toast(e.message, 'error');
+      $('#tInstall').disabled = false;
+    }
+  }
+
+  async function downloadCert() {
+    try {
+      const res = await UI.api('/api/admin/tls/certificate.pem');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(await res.blob());
+      a.download = 'check-in-certificate.pem';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    } catch (e) { toast(e.message, 'error'); }
+  }
+
+  async function saveTls() {
+    const mode = $('input[name=tlsMode]:checked')?.value || 'off';
+    const pp = $('#tPublicPort').value.trim();
+    const body = { mode, hsts: $('#tHsts').checked, publicPort: pp ? Number(pp) : null };
+    $('#tSave').disabled = true;
+    try {
+      tlsState = await apiJson('/api/admin/tls', json('PUT', body));
+      renderTls();
+      if (tlsState.listening && location.protocol === 'http:') {
+        const port = tlsState.publicPort || tlsState.listeningPort;
+        const url = `https://${location.hostname}${port === 443 ? '' : ':' + port}${location.pathname}`;
+        modal({
+          title: 'HTTPS is on',
+          body: `<p>The server is now listening for HTTPS on port ${tlsState.listeningPort}.${mode === 'redirect' ? ' Plain HTTP now redirects there.' : ''}</p>
+            <p><code>${esc(url)}</code></p>
+            ${tlsState.cert?.selfSigned ? '<p style="font-size:12px">Your browser will warn about the self-signed certificate until you trust it.</p>' : ''}`,
+          actions: [{ label: 'Stay here' }, { label: 'Open HTTPS', cls: 'primary', onClick: () => { location.href = url; } }],
+        });
+      } else {
+        toast(mode === 'off' ? 'HTTPS turned off' : 'HTTPS settings saved');
+      }
+    } catch (e) {
+      toast(e.message, 'error');
+      $('#tSave').disabled = false;
+    }
   }
 
   // ================================================================== wiring

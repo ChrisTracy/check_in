@@ -10,6 +10,8 @@ services:
     stop_grace_period: 20s
     ports:
       - "${PUBLISH_PORT:-3000}:3000"
+      # Built-in HTTPS (only used when turned on in Admin → HTTPS), e.g. PUBLISH_HTTPS_PORT=443
+      - "${PUBLISH_HTTPS_PORT:-3443}:3443"
     env_file:
       - path: .env
         required: false
@@ -17,6 +19,7 @@ services:
       # Fixed inside the container; change the published port above instead.
       HOST: 0.0.0.0
       PORT: 3000
+      HTTPS_PORT: 3443
       DB_PATH: /app/data/checkin.db
     volumes:
       # Use a named volume (not a Windows folder bind mount): SQLite's WAL locking

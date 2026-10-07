@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import https from 'node:https';
+import { execFileSync } from 'node:child_process';
 import { openDb } from '../src/db.js';
 import { Store } from '../src/store.js';
 import { Accounts } from '../src/auth/accounts.js';
@@ -11,7 +16,8 @@ const basic = (u, p) => 'Basic ' + Buffer.from(`${u}:${p}`).toString('base64');
 
 async function setup(overrides = {}, { apiKey = true } = {}) {
   const config = { historyLimit: 3, maxBatch: 5000, maxFieldsPerRecord: 500, bodyLimitMb: 10, importLimitMb: 50,
-    logLevel: 'silent', corsOrigin: '', cookieSecure: 'auto', trustProxy: false, oidcIssuerOverride: '', ...overrides };
+    logLevel: 'silent', corsOrigin: '', cookieSecure: 'auto', trustProxy: false, oidcIssuerOverride: '',
+    host: '127.0.0.1', httpsPort: 0, tlsDir: fs.mkdtempSync(path.join(os.tmpdir(), 'ci-tls-')), tlsDisable: false, tlsPollMs: 0, ...overrides };
   const db = openDb(':memory:');
   const store = new Store(db, { historyLimit: config.historyLimit, maxBatch: config.maxBatch });
   const accounts = new Accounts(db, { secret: crypto.randomBytes(32), sessionTtlHours: 1 });
@@ -206,4 +212,113 @@ test('power users can pause check-ins; status is public', async () => {
 
   await power({ method: 'PUT', url: '/api/status', payload: { paused: false } });
   assert.equal((await call({ method: 'POST', url: '/api/checkin?id=x' })).statusCode, 201);
+});
+
+function httpsGet(port, urlPath) {
+  return new Promise((resolve, reject) => {
+    https.get({ host: '127.0.0.1', port, path: urlPath, rejectUnauthorized: false, agent: false }, (res) => {
+      const cert = res.socket.getPeerCertificate();
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body, cert }));
+    }).on('error', reject);
+  });
+}
+
+test('HTTPS: self-signed certificate, redirect mode, HSTS and hot reload', async (t) => {
+  const { app, admin: adminHttp, accounts, as } = await setup({ trustProxy: true });
+  t.after(() => app.close());
+  // Once HTTP redirects, admin calls must arrive as HTTPS (here via a trusted proxy header).
+  const admin = (o) => adminHttp({ ...o, headers: { 'x-forwarded-proto': 'https', ...(o.headers || {}) } });
+  await accounts.create({ username: 'pp', password: 'password1234', role: 'power' });
+  assert.equal((await as('pp', 'password1234')({ url: '/api/admin/tls' })).statusCode, 403);
+
+  let st = (await admin({ url: '/api/admin/tls' })).json();
+  assert.deepEqual([st.mode, st.listening, st.cert], ['off', false, null]);
+  assert.equal((await admin({ method: 'PUT', url: '/api/admin/tls', payload: { mode: 'both' } })).statusCode, 400); // no cert yet
+
+  let r = await admin({ method: 'POST', url: '/api/admin/tls/certificate', payload: { type: 'self-signed', hostnames: 'checkin.local, 127.0.0.1', days: 30 } });
+  assert.equal(r.statusCode, 200);
+  assert.equal(r.json().installed.subject, 'checkin.local');
+  assert.deepEqual(r.json().installed.names, ['checkin.local', '127.0.0.1']);
+  assert.equal(r.json().installed.selfSigned, true);
+  assert.ok(fs.existsSync(path.join(app.tls.dir, 'key.pem')));
+
+  st = (await admin({ method: 'PUT', url: '/api/admin/tls', payload: { mode: 'redirect', hsts: true, publicPort: 8443 } })).json();
+  assert.equal(st.listening, true);
+  const port = st.listeningPort;
+
+  // HTTP is redirected (307 keeps the method), except /health
+  r = await app.inject({ url: '/api/records?x=1', headers: { host: 'checkin.local:3000' } });
+  assert.equal(r.statusCode, 307);
+  assert.equal(r.headers.location, 'https://checkin.local:8443/api/records?x=1');
+  assert.equal((await app.inject({ url: '/health' })).statusCode, 200);
+
+  // Real TLS handshake against the shared handler
+  let h = await httpsGet(port, '/health');
+  assert.equal(h.status, 200);
+  assert.equal(h.headers['strict-transport-security'], 'max-age=31536000');
+  assert.equal(h.cert.subject.CN, 'checkin.local');
+
+  // Replacing the certificate swaps it without restarting the server
+  r = await admin({ method: 'POST', url: '/api/admin/tls/certificate', payload: { type: 'self-signed', hostnames: ['renewed.local'] } });
+  assert.equal(r.statusCode, 200, r.body);
+  h = await httpsGet(port, '/health');
+  assert.equal(h.cert.subject.CN, 'renewed.local');
+  assert.equal((await admin({ url: '/api/admin/tls' })).json().listeningPort, port);
+
+  // Download the public certificate
+  r = await admin({ url: '/api/admin/tls/certificate.pem' });
+  assert.ok(r.body.startsWith('-----BEGIN CERTIFICATE-----'));
+
+  assert.equal((await admin({ method: 'DELETE', url: '/api/admin/tls/certificate' })).statusCode, 400); // must turn off first
+  st = (await admin({ method: 'PUT', url: '/api/admin/tls', payload: { mode: 'off' } })).json();
+  assert.equal(st.listening, false);
+  assert.equal((await app.inject({ url: '/api/auth/status' })).statusCode, 200); // no redirect when off
+  assert.equal((await admin({ method: 'DELETE', url: '/api/admin/tls/certificate' })).json().cert, null);
+});
+
+test('HTTPS: PEM and PFX uploads are validated', async (t) => {
+  const { app, admin } = await setup();
+  t.after(() => app.close());
+  const { generate } = await import('selfsigned');
+  const a = await generate([{ name: 'commonName', value: 'a.local' }], { keySize: 2048 });
+  const b = await generate([{ name: 'commonName', value: 'b.local' }], { keySize: 2048 });
+  const up = (payload) => admin({ method: 'POST', url: '/api/admin/tls/certificate', payload });
+
+  assert.match((await up({ type: 'pem', cert: a.cert, key: b.private })).json().error, /does not match/);
+  assert.match((await up({ type: 'pem', cert: 'nope', key: a.private })).json().error, /BEGIN CERTIFICATE/);
+  const encKey = crypto.createPrivateKey(a.private).export({ type: 'pkcs8', format: 'pem', cipher: 'aes-256-cbc', passphrase: 'k3y-pass' });
+  assert.match((await up({ type: 'pem', cert: a.cert, key: encKey })).json().error, /encrypted/);
+  const ok = await up({ type: 'pem', cert: a.cert, key: encKey, passphrase: 'k3y-pass' });
+  assert.equal(ok.statusCode, 200);
+  assert.ok(!fs.readFileSync(path.join(app.tls.dir, 'key.pem'), 'utf8').includes('ENCRYPTED')); // stored decrypted
+
+  let openssl = true;
+  try { execFileSync('openssl', ['version']); } catch { openssl = false; }
+  if (!openssl) return t.diagnostic('openssl not available: skipping PFX checks');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ci-pfx-'));
+  fs.writeFileSync(path.join(dir, 'c.pem'), b.cert);
+  fs.writeFileSync(path.join(dir, 'k.pem'), b.private);
+  execFileSync('openssl', ['pkcs12', '-export', '-in', path.join(dir, 'c.pem'), '-inkey', path.join(dir, 'k.pem'),
+    '-out', path.join(dir, 'c.pfx'), '-passout', 'pass:pfx-pass']);
+  const pfx = fs.readFileSync(path.join(dir, 'c.pfx')).toString('base64');
+  assert.match((await up({ type: 'pfx', pfx, passphrase: 'wrong' })).json().error, /Wrong password/);
+  const r = await up({ type: 'pfx', pfx, passphrase: 'pfx-pass' });
+  assert.equal(r.json().installed.subject, 'b.local');
+  assert.equal(r.json().source, 'pfx');
+  assert.ok(!fs.existsSync(path.join(app.tls.dir, 'key.pem')));
+  const st = (await admin({ method: 'PUT', url: '/api/admin/tls', payload: { mode: 'both' } })).json();
+  assert.equal((await httpsGet(st.listeningPort, '/health')).cert.subject.CN, 'b.local');
+});
+
+test('HTTPS: TLS_DISABLE forces HTTP only', async (t) => {
+  const { app, admin } = await setup({ tlsDisable: true });
+  t.after(() => app.close());
+  await admin({ method: 'POST', url: '/api/admin/tls/certificate', payload: { type: 'self-signed', hostnames: 'x.local' } });
+  const r = await admin({ method: 'PUT', url: '/api/admin/tls', payload: { mode: 'redirect' } });
+  assert.equal(r.statusCode, 200); // saved, but not applied
+  const s2 = r.json();
+  assert.deepEqual([s2.mode, s2.savedMode, s2.disabledByEnv, s2.listening], ['off', 'redirect', true, false]);
+  assert.equal((await app.inject({ url: '/api/auth/status' })).statusCode, 200);
 });

@@ -12,6 +12,7 @@ FROM ${NODE_IMAGE}
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3000 \
+    HTTPS_PORT=3443 \
     DB_PATH=/app/data/checkin.db
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
@@ -20,11 +21,11 @@ COPY src ./src
 COPY public ./public
 COPY scripts ./scripts
 
-# The database, its WAL files and the generated app secret live in /app/data.
+# The database, its WAL files, the generated app secret and any HTTPS certificate live in /app/data.
 RUN mkdir -p /app/data && chown -R node:node /app/data
 USER node
 VOLUME ["/app/data"]
-EXPOSE 3000
+EXPOSE 3000 3443
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
