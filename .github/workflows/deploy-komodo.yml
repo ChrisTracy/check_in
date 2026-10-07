@@ -48,7 +48,7 @@ jobs:
             --header "Content-Type: application/json" \
             --header "X-Api-Key: $KOMODO_API_KEY" \
             --header "X-Api-Secret: $KOMODO_API_SECRET" \
-            --data '{"stack": "6a96ef2bd57097ba6065653d"}'
+            --data '{"stack": "6ac6a0858424ce6edfe5bf50"}'
           echo
           echo "Komodo deploy requested for the check-in stack."
  
