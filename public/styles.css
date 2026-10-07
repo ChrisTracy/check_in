@@ -485,3 +485,7 @@ body.compact .td { font-size: 13px; }
 
 .menu .menu-head small#userSub { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; white-space: normal; }
 .menu .menu-head small#userSub span:first-child { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.pause-banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 10px; background: var(--aging-soft); color: var(--aging); border: 1px solid color-mix(in srgb, var(--aging) 35%, transparent); font-size: 13px; }
+.pause-banner span { flex: 1; color: var(--text); }
+.pause-banner b { color: var(--aging); }

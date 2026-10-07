@@ -80,7 +80,18 @@ export function buildApp({ config, store, accounts, oidc }) {
   // ---- static assets -----------------------------------------------------
   app.register(fastifyStatic, { root: path.join(ROOT, 'public'), prefix: '/', index: false });
 
-  app.get('/health', async () => ({ ok: true }));
+  app.get('/health', async () => ({ ok: true, accepting: !accounts.ingest().paused }));
+
+  // Reject new data while a power user has paused check-ins.
+  function rejectIfPaused(reply) {
+    const s = accounts.ingest();
+    if (!s.paused) return false;
+    reply.code(503).header('Retry-After', '30').send({
+      ok: false, accepting: false, paused: true, since: s.since,
+      error: 'Check-ins are paused on this server. Try again later.',
+    });
+    return true;
+  }
   app.get('/api/config', { config: { cap: 'public' } }, async () => ({
     historyLimit: config.historyLimit,
     apiKeySet: accounts.apiKeyInfo().set,
@@ -88,6 +99,7 @@ export function buildApp({ config, store, accounts, oidc }) {
 
   // ---- check-in (create or update) --------------------------------------
   app.post('/api/checkin', { config: { cap: 'checkin' } }, async (req, reply) => {
+    if (rejectIfPaused(reply)) return reply;
     const query = flattenParams(req.query);
     const body = req.body;
 
@@ -206,7 +218,8 @@ export function buildApp({ config, store, accounts, oidc }) {
   // ---- CSV import --------------------------------------------------------
   // Each row is processed as a check-in (create or update, with history).
   // Empty cells are skipped so they don't overwrite existing values.
-  app.post('/api/import', { bodyLimit: config.importLimitMb * 1024 * 1024, config: { cap: 'import' } }, async (req) => {
+  app.post('/api/import', { bodyLimit: config.importLimitMb * 1024 * 1024, config: { cap: 'import' } }, async (req, reply) => {
+    if (rejectIfPaused(reply)) return reply;
     if (typeof req.body !== 'string') {
       throw new HttpError(415, 'Send the CSV file as the raw request body with Content-Type: text/csv');
     }

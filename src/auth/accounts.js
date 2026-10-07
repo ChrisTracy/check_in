@@ -102,6 +102,16 @@ export class Accounts {
   get staleMinutes() { return this.getSetting('staleMinutes', 15); }
   get passwordLogin() { return this.getSetting('passwordLogin', true); }
 
+  /** Whether the server is accepting check-ins (power users can pause it). */
+  ingest() { return { paused: false, since: null, by: null, ...this.getSetting('ingest', {}) }; }
+  setIngestPaused(paused, by) {
+    const cur = this.ingest();
+    if (cur.paused === Boolean(paused)) return cur;
+    const next = { paused: Boolean(paused), since: new Date().toISOString(), by: by || null };
+    this.setSetting('ingest', next);
+    return next;
+  }
+
   sso() { return { ...DEFAULT_SSO, ...this.getSetting('sso', {}) }; }
   ssoSecret() { const s = this.sso(); return s.clientSecretEnc ? decrypt(this.secret, s.clientSecretEnc) : ''; }
   ssoReady() { const s = this.sso(); return Boolean(s.enabled && s.tenantId && s.clientId && s.clientSecretEnc); }

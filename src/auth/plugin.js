@@ -226,6 +226,25 @@ export function registerAuth(app, { accounts, oidc, config, broadcast }) {
     return reply.redirect(tx.returnTo || '/');
   });
 
+  // ---------------------------------------------------------------- check-in pause
+  // Public so devices and monitors can ask "are you accepting check-ins?" without credentials.
+  const ingestStatus = (a) => {
+    const s = accounts.ingest();
+    const body = { accepting: !s.paused, paused: s.paused, since: s.since };
+    if (a && a.kind !== 'anon') body.by = s.by;
+    return body;
+  };
+  app.get('/api/status', { config: { cap: 'public' } }, async (req) => ingestStatus(req.auth));
+
+  app.put('/api/status', { config: { cap: 'pause' } }, async (req) => {
+    const { paused } = req.body || {};
+    if (typeof paused !== 'boolean') throw new HttpError(400, 'Body must be { "paused": true } or { "paused": false }');
+    accounts.setIngestPaused(paused, req.auth.user?.username || req.auth.name);
+    const s = ingestStatus(req.auth);
+    broadcast('ingest', s);
+    return s;
+  });
+
   // ---------------------------------------------------------------- settings (shared)
   app.get('/api/settings', { config: { cap: 'view' } }, async () => ({
     staleMinutes: accounts.staleMinutes,

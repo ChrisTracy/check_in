@@ -130,7 +130,7 @@ To run a published image instead of building locally, replace `build: .` in `doc
 | Check in (API) | | ✓ | ✓ | ✓ |
 | Import CSV, export CSV | | ✓ | ✓ | ✓ |
 | Delete records (single or multi-select) | | ✓ | ✓ | ✓ |
-| **Clear all**, pause live updates, change the fresh threshold | | | ✓ | ✓ |
+| **Clear all**, pause/resume check-ins, change the fresh threshold | | | ✓ | ✓ |
 | Manage users, single sign-on and the API key | | | | ✓ |
 
 The fresh threshold is now a shared, server-side setting. When a power user changes it, every open dashboard updates. Permissions are enforced by the server; the dashboard also hides what your role can't do.
@@ -260,6 +260,24 @@ curl -X POST http://localhost:3000/api/checkin -H "Content-Type: application/jso
 | `GET/POST /api/admin/apikey` | Admin | `{ "action": "generate" \| "set" \| "disable", "key" }`. `generate` returns the new key once |
 | `GET /auth/oidc/login` · `GET /auth/oidc/callback` | public | The Entra sign-in redirect flow |
 
+### Accepting check-ins (pause / resume)
+
+| Method & path | Role | Description |
+|---|---|---|
+| `GET /api/status` | public | `{ "accepting": true, "paused": false, "since": "…" }`. Signed-in callers also get `by` (who paused it) |
+| `PUT /api/status` | Power user or Admin | `{ "paused": true }` to stop accepting check-ins, `{ "paused": false }` to resume |
+
+While paused, `POST /api/checkin` and `POST /api/import` return **503** with `Retry-After: 30` and `{"ok": false, "accepting": false, "paused": true, ...}`. Nothing is queued, so devices should retry. Reads, exports and deletes keep working. `/health` also includes `accepting`, but stays HTTP 200 so Docker doesn't restart a paused container. The pause survives restarts.
+
+```bash
+curl http://localhost:3000/api/status
+curl -u admin:password -X PUT http://localhost:3000/api/status -H "Content-Type: application/json" -d '{"paused":true}'
+```
+
+```powershell
+(Invoke-RestMethod http://localhost:3000/api/status).accepting
+```
+
 ### CSV
 
 | Method & path | Description |
@@ -287,7 +305,8 @@ The dashboard's export menu can also download the **current view**: only the fil
 - **Saved views:** save the current filters, sort, grouping, columns and layout under a name. Views are stored in your browser.
 - **Record drawer:** click a row to see every field and a timeline of changes.
 - **Multi-select:** tick the checkboxes in the table (Shift+click selects a range) or on cards. The header checkbox selects every matching row. A bar appears where you can **Delete** or **Export** the selection; the Delete key works too. Esc clears the selection.
-- **Live updates:** changes stream in as they happen. Power users can use Pause to freeze the view.
+- **Live updates:** changes stream in as they happen.
+- **Pause check-ins** (power users and admins): the server stops accepting check-ins and CSV imports until resumed. Every open dashboard shows a banner saying who paused it and when.
 - **Import:** use the button, or drag a `.csv` file onto the page.
 - Light and dark themes, plus compact and comfortable row density.
 

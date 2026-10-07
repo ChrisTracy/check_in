@@ -9,7 +9,7 @@
 
   const ROLES = [
     ['admin', 'Admin', 'Everything, including users, single sign-on and the API key'],
-    ['power', 'Power user', 'User rights plus Clear all, pause live updates and the fresh threshold'],
+    ['power', 'Power user', 'User rights plus Clear all, pausing check-ins and the fresh threshold'],
     ['user', 'User', 'View, import, export and delete records'],
     ['reader', 'Reader', 'View records and history only'],
   ];

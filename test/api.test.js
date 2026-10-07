@@ -177,3 +177,33 @@ test('Entra SSO role mapping and provisioning', async () => {
   assert.ok(d.sso_sub);
   assert.throws(() => accounts.ssoLogin(claims('eve', { roles: ['CheckIn.Admin'] })), /has not been added/);
 });
+
+test('power users can pause check-ins; status is public', async () => {
+  const { app, accounts, as, call } = await setup();
+  await accounts.create({ username: 'uu', password: 'password1234', role: 'user' });
+  await accounts.create({ username: 'pp', password: 'password1234', role: 'power' });
+  const user = as('uu', 'password1234');
+  const power = as('pp', 'password1234');
+
+  let s = (await app.inject({ url: '/api/status' })).json();
+  assert.deepEqual([s.accepting, s.paused, s.by], [true, false, undefined]);
+
+  assert.equal((await user({ method: 'PUT', url: '/api/status', payload: { paused: true } })).statusCode, 403);
+  assert.equal((await power({ method: 'PUT', url: '/api/status', payload: { paused: 'yes' } })).statusCode, 400);
+  s = (await power({ method: 'PUT', url: '/api/status', payload: { paused: true } })).json();
+  assert.deepEqual([s.accepting, s.by], [false, 'pp']);
+
+  const anon = (await app.inject({ url: '/api/status' })).json();
+  assert.equal(anon.accepting, false);
+  assert.equal(anon.by, undefined); // who paused is only shown to signed-in callers
+
+  const r = await call({ method: 'POST', url: '/api/checkin?id=x' });
+  assert.equal(r.statusCode, 503);
+  assert.equal(r.headers['retry-after'], '30');
+  assert.equal((await call({ method: 'POST', url: '/api/import', payload: 'id\nx\n', headers: { 'content-type': 'text/csv' } })).statusCode, 503);
+  assert.equal((await call({ url: '/api/records' })).statusCode, 200); // reads still work
+  assert.equal((await app.inject({ url: '/health' })).json().accepting, false);
+
+  await power({ method: 'PUT', url: '/api/status', payload: { paused: false } });
+  assert.equal((await call({ method: 'POST', url: '/api/checkin?id=x' })).statusCode, 201);
+});

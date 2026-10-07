@@ -79,8 +79,7 @@
     me: null, // { user, role, caps, csrf }
     checked: new Set(), // multi-selected record ids
     lastChecked: null,
-    live: true,
-    pending: 0,
+    ingest: { paused: false, since: null, by: null }, // server-wide check-in pause
     items: [], // flattened render list for table/cards
     filtered: [], // filtered + sorted records
     collapsed: new Set(),
@@ -174,11 +173,10 @@
     es.addEventListener('hello', () => {
       S.connected = true;
       updateLive();
-      if (everConnected) loadAll().catch(() => {}); // re-sync after reconnect
+      if (everConnected) { loadAll().catch(() => {}); loadIngest(); } // re-sync after reconnect
       everConnected = true;
     });
     es.addEventListener('change', (e) => {
-      if (!S.live) { S.pending += JSON.parse(e.data).count || 1; updateLive(); return; }
       fetchChanges();
     });
     es.addEventListener('delete', (e) => {
@@ -189,6 +187,7 @@
       if (S.selected && ids.includes(S.selected)) closeDrawer();
       scheduleRender(true);
     });
+    es.addEventListener('ingest', (e) => { S.ingest = JSON.parse(e.data); updateLive(); });
     es.addEventListener('reload', () => { S.checked.clear(); updateSelBar(); loadAll().catch(() => {}); });
     es.addEventListener('settings', (e) => {
       const st = JSON.parse(e.data);
@@ -212,10 +211,39 @@
 
   function updateLive() {
     const el = $('#liveStatus');
-    el.className = 'live ' + (!S.connected ? 'off' : S.live ? 'on' : 'paused');
-    $('#liveText').textContent = !S.connected ? 'Reconnecting…'
-      : S.live ? 'Live' : S.pending ? `Paused · ${nf.format(S.pending)} new updates` : 'Paused';
-    $('#liveToggle').innerHTML = S.live ? icon(ICON.pause) + '<span>Pause</span>' : icon(ICON.play) + '<span>Resume</span>';
+    const paused = S.ingest.paused;
+    el.className = 'live ' + (!S.connected ? 'off' : paused ? 'paused' : 'on');
+    $('#liveText').textContent = !S.connected ? 'Reconnecting…' : paused ? 'Check-ins paused' : 'Live';
+    const who = S.ingest.by ? ` by ${S.ingest.by}` : '';
+    el.title = paused ? `Paused${who} ${relTime(S.ingest.since)}. New check-ins are rejected with HTTP 503.` : 'Accepting check-ins';
+    $('#liveToggle').innerHTML = paused ? icon(ICON.play) + '<span>Resume check-ins</span>' : icon(ICON.pause) + '<span>Pause check-ins</span>';
+    $('#liveToggle').title = paused ? 'Start accepting check-ins again' : 'Stop accepting check-ins (devices get HTTP 503)';
+    $('#pauseBanner').hidden = !paused;
+    $('#pauseText').innerHTML = `<b>Check-ins are paused</b>${esc(who)} ${esc(relTime(S.ingest.since))}. New check-ins and imports are rejected with HTTP 503 until resumed.`;
+    $('#pauseResume').hidden = !can('pause');
+  }
+
+  async function loadIngest() {
+    try { S.ingest = await apiJson('/api/status'); updateLive(); } catch { /* ignore */ }
+  }
+
+  async function setIngestPaused(paused) {
+    try {
+      S.ingest = await apiJson('/api/status', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ paused }) });
+      updateLive();
+      toast(paused ? 'Check-ins paused' : 'Check-ins resumed');
+    } catch (e) { toast(e.message, 'error'); }
+  }
+
+  function togglePause() {
+    if (!can('pause')) return;
+    if (S.ingest.paused) { setIngestPaused(false); return; }
+    modal({
+      title: 'Pause check-ins?',
+      body: `<p>While paused, the server <b>rejects</b> new check-ins and CSV imports with HTTP 503 (Retry-After: 30). Devices should retry later. Nothing is queued.</p>
+        <p style="font-size:12px">Viewing, exporting and deleting still work. Anyone can check the state at <code>GET /api/status</code>.</p>`,
+      actions: [{ label: 'Cancel' }, { label: 'Pause check-ins', cls: 'danger solid', onClick: () => setIngestPaused(true) }],
+    });
   }
 
   // ------------------------------------------------------------------ status
@@ -1071,11 +1099,8 @@
       applyTheme();
     });
     matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
-    $('#liveToggle').addEventListener('click', () => {
-      S.live = !S.live;
-      if (S.live && S.pending) { S.pending = 0; fetchChanges(); }
-      updateLive();
-    });
+    $('#liveToggle').addEventListener('click', togglePause);
+    $('#pauseResume').addEventListener('click', () => setIngestPaused(false));
     $('#liveStatus').addEventListener('click', () => { if (can('pause')) $('#liveToggle').click(); });
 
     // account menu
@@ -1370,6 +1395,7 @@
     setInterval(() => {
       scheduleRender(true);
       if (S.selected && drawerData) renderDrawer();
+      if (S.ingest.paused) updateLive();
     }, 10_000);
   }
 
@@ -1396,6 +1422,7 @@
     try { S.config = await apiJson('/api/config'); } catch { /* ignore */ }
     try { S.settings.staleMinutes = (await apiJson('/api/settings')).staleMinutes; } catch { /* ignore */ }
     applyCaps();
+    await loadIngest();
     connect();
     try { await loadAll(); } catch (e) { if (e.message !== 'API key required') toast('Could not load records: ' + e.message, 'error'); }
     if (S.view.layout === 'activity') loadActivity();

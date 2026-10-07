@@ -19,7 +19,7 @@
       </div>
     </div>
     <div class="top-actions">
-      <button class="btn ghost" id="liveToggle" title="Pause / resume live updates"></button>
+      <button class="btn ghost" id="liveToggle" title="Pause / resume accepting check-ins"></button>
       <input type="file" id="importFile" accept=".csv,text/csv" hidden>
       <button class="btn" id="importBtn" title="Upload a CSV file"><svg class="i" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></svg><span>Import</span></button>
       <div class="dropdown">
@@ -45,6 +45,12 @@
       </div>
     </div>
   </header>
+
+  <div class="pause-banner" id="pauseBanner" hidden role="status">
+    <svg class="i" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg>
+    <span id="pauseText"></span>
+    <button class="btn sm" id="pauseResume">Resume check-ins</button>
+  </div>
 
   <!-- ===== Stat cards (click to filter by status) ===== -->
   <section class="stats" id="stats">
