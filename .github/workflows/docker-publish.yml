@@ -1,32 +1,34 @@
 name: Publish Docker image
-
+ 
 # Builds a multi-architecture image (linux/amd64 + linux/arm64) and pushes it to Docker Hub.
 #
-# One-time setup in GitHub → Settings → Secrets and variables → Actions:
-#   Variables:  DOCKERHUB_USERNAME   your Docker Hub user or organization
-#               DOCKERHUB_IMAGE      (optional) full image name, default: <DOCKERHUB_USERNAME>/check-in-api
-#   Secrets:    DOCKERHUB_TOKEN      a Docker Hub access token with Read & Write scope
+# One-time setup in GitHub → Settings → Secrets and variables → Actions (repository level):
+#   Repository secrets:
+#     DOCKERHUB_USERNAME   your Docker Hub user or organization
+#     DOCKERHUB_TOKEN      a Docker Hub access token with Read & Write scope
+#   Repository variable (optional):
+#     DOCKERHUB_IMAGE      full image name, default <DOCKERHUB_USERNAME>/check-in
+#
+# Because the username is a secret, GitHub masks it as *** in the logs (including image names).
 #
 # Tags pushed:
 #   push to main      → latest, sha-<short>
 #   tag v1.2.3        → 1.2.3, 1.2, 1, sha-<short>
-
+ 
 on:
   push:
     branches: [main]
     tags: ['v*.*.*']
   workflow_dispatch:
-
+ 
 permissions:
   contents: read
-
+ 
 concurrency:
   group: docker-publish-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  IMAGE: ${{ vars.DOCKERHUB_IMAGE || format('{0}/check-in', vars.DOCKERHUB_USERNAME) }}
-
+ 
+ 
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -38,32 +40,41 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
-
+ 
   publish:
     needs: test
     runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+      HAS_TOKEN: ${{ secrets.DOCKERHUB_TOKEN != '' }}
     steps:
       - name: Check configuration
         run: |
-          if [ -z "${{ vars.DOCKERHUB_USERNAME }}" ]; then
-            echo "::error::Set the DOCKERHUB_USERNAME repository variable and the DOCKERHUB_TOKEN secret (see the top of this workflow)."
+          missing=""
+          [ -z "$DOCKERHUB_USERNAME" ] && missing="DOCKERHUB_USERNAME"
+          [ "$HAS_TOKEN" != "true" ] && missing="${missing:+$missing and }DOCKERHUB_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s): $missing. Add them under Settings → Secrets and variables → Actions → Repository secrets."
             exit 1
           fi
-
+          image="${DOCKERHUB_IMAGE:-$DOCKERHUB_USERNAME/check-in}"
+          echo "IMAGE=$(echo "$image" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+ 
       - uses: actions/checkout@v6
-
+ 
       - name: Set up QEMU (for arm64 builds)
         uses: docker/setup-qemu-action@v4
-
+ 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-
+ 
       - name: Log in to Docker Hub
         uses: docker/login-action@v4
         with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ vars.DOCKERHUB_TOKEN }}
-
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+ 
       - name: Image tags and labels
         id: meta
         uses: docker/metadata-action@v6
@@ -75,7 +86,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=sha,format=short
-
+ 
       - name: Build and push (amd64 + arm64)
         uses: docker/build-push-action@v7
         with:

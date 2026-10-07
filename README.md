@@ -111,12 +111,14 @@ One-time setup:
 
 1. On Docker Hub, create an **access token** with *Read & Write* scope (Account settings → Personal access tokens).
 2. In the GitHub repository, go to **Settings → Secrets and variables → Actions** and add:
-   - **Variable** `DOCKERHUB_USERNAME`: your Docker Hub user or organization.
-   - **Secret** `DOCKERHUB_TOKEN`: the access token.
-   - *(Optional)* **Variable** `DOCKERHUB_IMAGE`: the full image name. The default is `<DOCKERHUB_USERNAME>/check-in-api`.
+   - **Repository secret** `DOCKERHUB_USERNAME`: your Docker Hub user or organization.
+   - **Repository secret** `DOCKERHUB_TOKEN`: the access token.
+   - *(Optional)* **Repository variable** `DOCKERHUB_IMAGE`: the full image name. The default is `<DOCKERHUB_USERNAME>/check-in`.
+
+   Use *Repository* secrets. Ones saved under an *Environment* aren't visible to this workflow. Because the username is a secret, GitHub shows it as `***` in the workflow logs.
 3. Push to `main`, or tag a release: `git tag v1.0.0 && git push origin v1.0.0`.
 
-To run a published image instead of building locally, replace `build: .` in `docker-compose.yml` with `image: <user>/check-in-api:1.0.0`.
+To run a published image instead of building locally, replace `build: .` in `docker-compose.yml` with `image: <user>/check-in:1.0.0`.
 
 `.github/workflows/ci.yml` runs the tests on Node 22 and 24 and does a Docker build and smoke test on every push and pull request.
 
