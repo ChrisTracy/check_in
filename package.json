@@ -1,0 +1,25 @@
+{
+  "name": "check-in-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "High-throughput check-in API with dynamic fields, history, CSV import/export and a live dashboard",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
+    "loadtest": "node scripts/loadtest.js",
+    "seed": "node scripts/seed.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.2",
+    "@fastify/static": "^10.1.5",
+    "csv-parse": "^7.0.3",
+    "fastify": "^5.12.5",
+    "openid-client": "^6.8.8"
+  }
+}

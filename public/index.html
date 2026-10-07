@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Check-in Dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><path d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+  <!-- ===== Top bar ===== -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></div>
+      <div>
+        <h1>Check-ins</h1>
+        <div class="live" id="liveStatus"><span class="pulse"></span><span id="liveText">Connecting…</span></div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button class="btn ghost" id="liveToggle" title="Pause / resume live updates"></button>
+      <input type="file" id="importFile" accept=".csv,text/csv" hidden>
+      <button class="btn" id="importBtn" title="Upload a CSV file"><svg class="i" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></svg><span>Import</span></button>
+      <div class="dropdown">
+        <button class="btn" id="exportBtn"><svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg><span>Export</span><svg class="i chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+        <div class="menu" id="exportMenu">
+          <button data-export="view"><b>Current view</b><small id="exportViewHint">Filtered rows, visible columns</small></button>
+          <button data-export="all"><b>All records</b><small>Every record and field</small></button>
+          <button data-export="history"><b>Full history</b><small>Every stored change</small></button>
+        </div>
+      </div>
+      <button class="btn danger" id="clearBtn"><svg class="i" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg><span>Clear all</span></button>
+      <button class="icon-btn" id="themeBtn" title="Toggle theme"><svg class="i" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+      <div class="dropdown">
+        <button class="user-btn" id="userBtn" title="Account"><span class="avatar" id="userAvatar">?</span><span class="who"><b id="userName"></b><small id="userRole"></small></span></button>
+        <div class="menu right" id="userMenu">
+          <div class="menu-head"><span class="avatar sm" id="userAvatar2">?</span><div><b id="userName2"></b><small id="userSub"></small></div></div>
+          <button class="row-item" data-act="admin" id="adminItem"><svg class="i" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>Admin</button>
+          <button class="row-item" data-act="settings"><svg class="i" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Settings</button>
+          <button class="row-item" data-act="password" id="pwItem"><svg class="i" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>Change password</button>
+          <hr>
+          <button class="row-item danger" data-act="logout"><svg class="i" viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l-5-5 5-5M5 12h11"/></svg>Sign out</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- ===== Stat cards (click to filter by status) ===== -->
+  <section class="stats" id="stats">
+    <button class="stat" data-status="all"><span class="label">Total records</span><span class="value" id="statTotal">0</span><span class="sub" id="statFields">0 fields</span></button>
+    <button class="stat" data-status="fresh"><span class="label"><i class="dot fresh"></i>Fresh</span><span class="value" id="statFresh">0</span><span class="sub" id="statFreshSub"></span></button>
+    <button class="stat" data-status="aging"><span class="label"><i class="dot aging"></i>Aging</span><span class="value" id="statAging">0</span><span class="sub" id="statAgingSub"></span></button>
+    <button class="stat" data-status="stale"><span class="label"><i class="dot stale"></i>Stale</span><span class="value" id="statStale">0</span><span class="sub" id="statStaleSub"></span></button>
+    <div class="stat static"><span class="label">Check-ins / min</span><span class="value" id="statRate">0</span><span class="sub">records updated in last 60s</span></div>
+  </section>
+
+  <!-- ===== Toolbar ===== -->
+  <section class="toolbar">
+    <div class="tb-row">
+      <div class="search">
+        <svg class="i" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="search" type="search" placeholder="Search all fields…  ( / )" autocomplete="off">
+      </div>
+      <div class="dropdown">
+        <button class="btn" id="filterBtn"><svg class="i" viewBox="0 0 24 24"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg><span>Filter</span></button>
+        <div class="menu pop" id="filterPop">
+          <div class="pop-title">Add filter</div>
+          <label>Field<select id="fField" class="select"></select></label>
+          <label>Condition<select id="fOp" class="select"></select></label>
+          <label id="fValueWrap">Value<input id="fValue" list="fValues" autocomplete="off"><datalist id="fValues"></datalist></label>
+          <div class="facets" id="fFacets"></div>
+          <div class="pop-actions"><button class="btn primary" id="fAdd">Add filter</button></div>
+        </div>
+      </div>
+      <select id="timeRange" class="select" title="Last check-in within">
+        <option value="0">Any time</option>
+        <option value="5">Last 5 min</option>
+        <option value="15">Last 15 min</option>
+        <option value="60">Last hour</option>
+        <option value="1440">Last 24 hours</option>
+        <option value="10080">Last 7 days</option>
+        <option value="-60">Not in last hour</option>
+        <option value="-1440">Not in last 24 hours</option>
+      </select>
+      <select id="groupBy" class="select" title="Group by"><option value="">No grouping</option></select>
+      <div class="spacer"></div>
+      <div class="seg" id="layoutSeg">
+        <button data-layout="table" title="Table"><svg class="i" viewBox="0 0 24 24"><path d="M3 5h18M3 12h18M3 19h18"/></svg></button>
+        <button data-layout="cards" title="Cards"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></button>
+        <button data-layout="activity" title="Activity feed"><svg class="i" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></button>
+      </div>
+      <button class="icon-btn" id="densityBtn" title="Toggle row density"><svg class="i" viewBox="0 0 24 24"><path d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></button>
+      <div class="dropdown">
+        <button class="btn" id="columnsBtn"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M15 4v16"/></svg><span>Columns</span></button>
+        <div class="menu pop right" id="columnsPop">
+          <div class="pop-title">Columns <small>drag to reorder</small></div>
+          <input id="colSearch" class="input" placeholder="Find column…">
+          <div class="col-list" id="colList"></div>
+          <div class="pop-actions"><button class="btn sm" id="colAll">Show all</button><button class="btn sm" id="colNone">Hide all</button><button class="btn sm" id="colReset">Reset</button></div>
+        </div>
+      </div>
+      <div class="views">
+        <select id="viewSelect" class="select" title="Saved views"></select>
+        <button class="icon-btn" id="viewSave" title="Save view"><svg class="i" viewBox="0 0 24 24"><path d="M5 3h11l3 3v15H5zM8 3v6h8V3M8 21v-7h8v7"/></svg></button>
+        <button class="icon-btn" id="viewDelete" title="Delete view"><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+      </div>
+    </div>
+    <div class="chips" id="chips"></div>
+  </section>
+
+  <!-- ===== Main content ===== -->
+  <main class="content">
+    <div class="panel" id="tablePanel">
+      <div class="table-wrap" id="tableWrap">
+        <div class="thead" id="thead"></div>
+        <div class="tbody" id="tbody"></div>
+      </div>
+      <div class="cards-wrap" id="cardsWrap" hidden><div class="cards" id="cards"></div></div>
+      <div class="activity-wrap" id="activityWrap" hidden><div id="activity"></div></div>
+      <div class="empty" id="empty" hidden></div>
+    </div>
+  </main>
+  <footer class="footer">
+    <span id="countText">0 records</span>
+    <span class="muted" id="footerRight"></span>
+  </footer>
+</div>
+
+<!-- ===== Record drawer ===== -->
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <div>
+      <div class="eyebrow">Record</div>
+      <h2 id="dTitle"></h2>
+      <div class="muted" id="dSub"></div>
+    </div>
+    <button class="icon-btn" id="dClose" title="Close (Esc)"><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  </div>
+  <div class="tabs"><button class="tab active" data-tab="fields">Fields</button><button class="tab" data-tab="history">History <span class="badge" id="dHistCount"></span></button></div>
+  <div class="drawer-body" id="dBody"></div>
+  <div class="drawer-foot">
+    <button class="btn" id="dCopy">Copy JSON</button>
+    <button class="btn danger ghost" id="dDelete">Delete record</button>
+  </div>
+</aside>
+
+<!-- ===== Modal ===== -->
+<div class="modal-back" id="modalBack" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <h3 id="mTitle"></h3>
+    <div id="mBody"></div>
+    <div class="modal-actions" id="mActions"></div>
+  </div>
+</div>
+
+<!-- ===== Selection bar ===== -->
+<div class="selbar" id="selbar">
+  <b id="selCount">0 selected</b>
+  <button class="btn sm" id="selAll">Select all matching</button>
+  <span class="sep"></span>
+  <button class="btn sm" id="selExport"><svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg>Export</button>
+  <button class="btn sm danger" id="selDelete"><svg class="i" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>Delete</button>
+  <button class="btn sm" id="selClear" title="Clear selection (Esc)"><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+</div>
+
+<!-- ===== Admin panel ===== -->
+<div class="admin-back" id="adminBack" hidden>
+  <div class="admin" role="dialog" aria-modal="true" aria-label="Administration">
+    <nav class="admin-nav">
+      <h2><svg class="i" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>Admin</h2>
+      <button data-tab="users"><svg class="i" viewBox="0 0 24 24"><circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M17 11a3 3 0 1 0 0-6M22 21a6 6 0 0 0-4-5.6"/></svg>Users</button>
+      <button data-tab="sso"><svg class="i" viewBox="0 0 24 24"><path d="M4 21V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v16M16 9h3a1 1 0 0 1 1 1v11M2 21h20M8 7h4M8 11h4M8 15h4"/></svg>Single sign-on</button>
+      <button data-tab="apikey"><svg class="i" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M16 7l3 3M14 9l2 2"/></svg>API key</button>
+      <div class="spacer"></div>
+      <button id="adminClose"><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>Close</button>
+    </nav>
+    <div class="admin-main">
+      <div class="admin-head"><div><h3 id="aTitle"></h3><p id="aSub"></p></div><div id="aHeadActions"></div></div>
+      <div class="admin-body" id="aBody"></div>
+      <div class="admin-foot" id="aFoot" hidden></div>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<script src="app.js"></script>
+<script src="admin.js"></script>
+</body>
+</html>

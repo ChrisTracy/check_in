@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Check-ins</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><path d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="stylesheet" href="styles.css">
+  <script>
+    (function () {
+      var t = 'auto';
+      try { t = (JSON.parse(localStorage.getItem('checkin.settings') || '{}').theme) || 'auto'; } catch (e) {}
+      var dark = t === 'dark' || (t === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    })();
+  </script>
+</head>
+<body class="auth-body">
+  <div class="auth">
+    <!-- Brand panel -->
+    <section class="auth-hero" aria-hidden="true">
+      <div class="auth-hero-inner">
+        <div class="brand light">
+          <div class="logo"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></div>
+          <span class="brand-name">Check-ins</span>
+        </div>
+        <div class="hero-copy">
+          <h2>Every device, every heartbeat, in one place.</h2>
+          <p>Live status, full change history and instant filtering for thousands of check-ins.</p>
+        </div>
+        <div class="hero-cards">
+          <div class="hcard"><i class="dot fresh"></i><b>edge-gw-014</b><span>just now</span><em class="pill good">ok</em></div>
+          <div class="hcard"><i class="dot fresh"></i><b>kiosk-dal-22</b><span>12s ago</span><em class="pill good">online</em></div>
+          <div class="hcard"><i class="dot aging"></i><b>db-replica-3</b><span>18m ago</span><em class="pill warn">degraded</em></div>
+          <div class="hcard"><i class="dot stale"></i><b>sensor-aus-07</b><span>2h ago</span><em class="pill bad">offline</em></div>
+        </div>
+        <div class="hero-foot">Secured with role-based access and single sign-on</div>
+      </div>
+    </section>
+
+    <!-- Form panel -->
+    <main class="auth-main">
+      <div class="auth-card" id="card">
+        <div class="brand mobile-only">
+          <div class="logo"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></div>
+          <span class="brand-name">Check-ins</span>
+        </div>
+        <h1 id="title">Sign in</h1>
+        <p class="auth-sub" id="subtitle">Welcome back. Sign in to view the dashboard.</p>
+
+        <div class="auth-error" id="error" role="alert" hidden></div>
+
+        <a class="btn sso-btn" id="ssoBtn" href="/auth/oidc/login" hidden>
+          <svg class="i" viewBox="0 0 24 24"><path d="M4 21V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v16M16 9h3a1 1 0 0 1 1 1v11M2 21h20M8 7h4M8 11h4M8 15h4"/></svg>
+          <span id="ssoLabel">Sign in with Microsoft</span>
+        </a>
+
+        <div class="divider" id="divider" hidden><span>or</span></div>
+
+        <form id="form" class="auth-form" novalidate hidden>
+          <label id="nameRow" hidden>Display name
+            <input class="input" id="name" autocomplete="name" placeholder="Jane Doe">
+          </label>
+          <label>Username
+            <input class="input" id="username" autocomplete="username" autocapitalize="off" spellcheck="false" required>
+          </label>
+          <label>Password
+            <span class="pw">
+              <input class="input" id="password" type="password" autocomplete="current-password" required>
+              <button type="button" class="pw-toggle" id="pwToggle" aria-label="Show password" title="Show password">
+                <svg class="i" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
+            </span>
+          </label>
+          <label id="confirmRow" hidden>Confirm password
+            <input class="input" id="confirm" type="password" autocomplete="new-password">
+          </label>
+          <div class="pw-hint" id="pwHint" hidden>At least 10 characters.</div>
+          <button class="btn primary block" id="submit" type="submit"><span id="submitText">Sign in</span></button>
+        </form>
+
+        <button class="link-btn" id="localToggle" type="button" hidden>Sign in with a password instead</button>
+      </div>
+      <div class="auth-legal">Check-in API · authorized users only</div>
+    </main>
+  </div>
+  <script src="login.js"></script>
+</body>
+</html>

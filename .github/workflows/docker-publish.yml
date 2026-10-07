@@ -1,0 +1,88 @@
+name: Publish Docker image
+
+# Builds a multi-architecture image (linux/amd64 + linux/arm64) and pushes it to Docker Hub.
+#
+# One-time setup in GitHub → Settings → Secrets and variables → Actions:
+#   Variables:  DOCKERHUB_USERNAME   your Docker Hub user or organization
+#               DOCKERHUB_IMAGE      (optional) full image name, default: <DOCKERHUB_USERNAME>/check-in-api
+#   Secrets:    DOCKERHUB_TOKEN      a Docker Hub access token with Read & Write scope
+#
+# Tags pushed:
+#   push to main      → latest, sha-<short>
+#   tag v1.2.3        → 1.2.3, 1.2, 1, sha-<short>
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ${{ vars.DOCKERHUB_IMAGE || format('{0}/check-in-api', vars.DOCKERHUB_USERNAME) }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check configuration
+        run: |
+          if [ -z "${{ vars.DOCKERHUB_USERNAME }}" ]; then
+            echo "::error::Set the DOCKERHUB_USERNAME repository variable and the DOCKERHUB_TOKEN secret (see the top of this workflow)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+
+      - name: Set up QEMU (for arm64 builds)
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,1405 @@
+/* Check-in dashboard — vanilla JS, no build step. */
+(() => {
+  'use strict';
+
+  // ------------------------------------------------------------------ utils
+  const $ = (s, el = document) => el.querySelector(s);
+  const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem('checkin.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem('checkin.' + k, JSON.stringify(v)); } catch { /* ignore */ } },
+  };
+  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+  const nf = new Intl.NumberFormat();
+  const SYS = ['id', 'created', 'modified'];
+  const STATUS_KEY = '__status';
+  const isNumeric = (v) => typeof v === 'number' || (typeof v === 'string' && v.trim() !== '' && !isNaN(v) && isFinite(v));
+  const show = (v) => (v === null || v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v));
+  const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+  const icon = (d, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24"><path d="${d}"/></svg>`;
+  const ICON = {
+    filter: 'M3 5h18l-7 8v6l-4 2v-8z', x: 'M6 6l12 12M18 6L6 18', chev: 'M6 9l6 6 6-6', grip: 'M9 6h.01M9 12h.01M9 18h.01M15 6h.01M15 12h.01M15 18h.01',
+    plus: 'M12 5v14M5 12h14', pulse: 'M3 12h4l3-8 4 16 3-8h4', edit: 'M4 20h4L19 9l-4-4L4 16zM14 6l4 4',
+    pause: 'M8 5v14M16 5v14', play: 'M7 4l13 8-13 8z',
+  };
+
+  function relTime(iso, now = Date.now()) {
+    const t = Date.parse(iso);
+    if (!t) return '';
+    const s = Math.round((now - t) / 1000);
+    if (s < 5) return 'just now';
+    if (s < 60) return s + 's ago';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + 'm ago';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + 'h ' + (m % 60 ? (m % 60) + 'm ' : '') + 'ago';
+    const d = Math.floor(h / 24);
+    if (d < 30) return d + 'd ago';
+    return new Date(t).toLocaleDateString();
+  }
+  const absTime = (iso) => (iso ? new Date(iso).toLocaleString() : '');
+  const shortTime = (iso) => {
+    const d = new Date(iso);
+    const today = new Date().toDateString() === d.toDateString();
+    return today ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })
+      : d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  };
+
+  const GOOD = /^(ok|okay|online|up|healthy|success|succeeded|pass|passed|active|running|true|yes|green|ready|complete|completed|done)$/i;
+  const WARN = /^(warn|warning|degraded|pending|slow|busy|yellow|amber|starting|partial|retry|retrying)$/i;
+  const BAD = /^(error|err|fail|failed|failure|down|offline|critical|crit|dead|false|no|red|stopped|unhealthy|fatal|timeout)$/i;
+  const INFO = /^(info|new|idle|maintenance|paused|unknown|blue)$/i;
+  function pillClass(v) {
+    if (typeof v !== 'string' && typeof v !== 'boolean') return '';
+    const s = String(v).trim();
+    if (s.length > 20) return '';
+    if (GOOD.test(s)) return 'good';
+    if (WARN.test(s)) return 'warn';
+    if (BAD.test(s)) return 'bad';
+    if (INFO.test(s)) return 'info';
+    return '';
+  }
+
+  // ------------------------------------------------------------------ state
+  const DEFAULT_VIEW = () => ({
+    search: '', filters: [], time: 0, status: 'all', sort: [{ key: 'modified', dir: 'desc' }],
+    hidden: [], order: [], widths: {}, groupBy: '', layout: 'table',
+  });
+  const S = {
+    records: new Map(), // id -> record
+    searchText: new Map(), // id -> lowercase haystack
+    rev: 0,
+    fieldCounts: new Map(),
+    fields: [],
+    view: Object.assign(DEFAULT_VIEW(), store.get('view', {})),
+    viewName: store.get('viewName', 'Default'),
+    views: store.get('views', {}),
+    settings: Object.assign({ theme: 'auto', compact: false }, store.get('settings', {}), { staleMinutes: 15 }),
+    me: null, // { user, role, caps, csrf }
+    checked: new Set(), // multi-selected record ids
+    lastChecked: null,
+    live: true,
+    pending: 0,
+    items: [], // flattened render list for table/cards
+    filtered: [], // filtered + sorted records
+    collapsed: new Set(),
+    selected: null,
+    flash: new Map(), // id -> timestamp of last change seen live
+    config: { historyLimit: 100, apiKeySet: false },
+    connected: false,
+  };
+
+  // ------------------------------------------------------------------ API
+  async function api(path, opts = {}) {
+    const headers = Object.assign({}, opts.headers || {});
+    const method = (opts.method || 'GET').toUpperCase();
+    if (method !== 'GET' && S.me?.csrf) headers['x-csrf-token'] = S.me.csrf;
+    const res = await fetch(path, Object.assign({}, opts, { headers, credentials: 'same-origin' }));
+    if (res.status === 401) {
+      location.href = '/login?returnTo=' + encodeURIComponent(location.pathname + location.search);
+      throw new Error('Signed out');
+    }
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).error || msg; } catch { /* ignore */ }
+      throw new Error(msg);
+    }
+    return res;
+  }
+  const apiJson = async (p, o) => (await api(p, o)).json();
+
+  // ------------------------------------------------------------------ data
+  function indexRecord(rec) {
+    const prev = S.records.get(rec.id);
+    if (prev) for (const k in prev) if (!SYS.includes(k) && k[0] !== '_') bumpField(k, -1);
+    for (const k in rec) if (!SYS.includes(k) && k[0] !== '_') bumpField(k, 1);
+    S.records.set(rec.id, rec);
+    let s = rec.id;
+    for (const k in rec) if (k[0] !== '_' && k !== 'created' && k !== 'modified' && k !== 'id') s += '\u0001' + show(rec[k]);
+    S.searchText.set(rec.id, s.toLowerCase());
+  }
+  function removeRecord(id) {
+    const prev = S.records.get(id);
+    if (!prev) return;
+    for (const k in prev) if (!SYS.includes(k) && k[0] !== '_') bumpField(k, -1);
+    S.records.delete(id);
+    S.searchText.delete(id);
+  }
+  function bumpField(k, d) {
+    const n = (S.fieldCounts.get(k) || 0) + d;
+    if (n <= 0) S.fieldCounts.delete(k); else S.fieldCounts.set(k, n);
+  }
+  function refreshFieldList() {
+    S.fields = [...S.fieldCounts.entries()].sort((a, b) => b[1] - a[1] || collator.compare(a[0], b[0])).map((e) => e[0]);
+  }
+
+  async function loadAll() {
+    const data = await apiJson('/api/records');
+    S.records.clear(); S.searchText.clear(); S.fieldCounts.clear();
+    for (const r of data.records) indexRecord(r);
+    S.rev = data.rev;
+    refreshFieldList();
+    scheduleRender(true);
+  }
+
+  let fetching = false;
+  let fetchAgain = false;
+  async function fetchChanges() {
+    if (fetching) { fetchAgain = true; return; }
+    fetching = true;
+    try {
+      do {
+        fetchAgain = false;
+        const data = await apiJson('/api/records?sinceRev=' + S.rev);
+        const now = Date.now();
+        for (const r of data.records) { indexRecord(r); S.flash.set(r.id, now); }
+        S.rev = Math.max(S.rev, data.rev);
+        if (data.records.length) {
+          refreshFieldList();
+          scheduleRender(true);
+          if (S.selected && data.records.some((r) => r.id === S.selected)) refreshDrawer();
+          if (S.view.layout === 'activity') loadActivity();
+        }
+      } while (fetchAgain);
+    } catch (e) { console.warn(e); } finally { fetching = false; }
+  }
+
+  // ------------------------------------------------------------------ live (SSE)
+  let es = null;
+  let everConnected = false;
+  function connect() {
+    if (es) es.close();
+    es = new EventSource('/api/events');
+    es.addEventListener('hello', () => {
+      S.connected = true;
+      updateLive();
+      if (everConnected) loadAll().catch(() => {}); // re-sync after reconnect
+      everConnected = true;
+    });
+    es.addEventListener('change', (e) => {
+      if (!S.live) { S.pending += JSON.parse(e.data).count || 1; updateLive(); return; }
+      fetchChanges();
+    });
+    es.addEventListener('delete', (e) => {
+      const { ids } = JSON.parse(e.data);
+      ids.forEach((id) => { removeRecord(id); S.checked.delete(id); });
+      refreshFieldList();
+      updateSelBar();
+      if (S.selected && ids.includes(S.selected)) closeDrawer();
+      scheduleRender(true);
+    });
+    es.addEventListener('reload', () => { S.checked.clear(); updateSelBar(); loadAll().catch(() => {}); });
+    es.addEventListener('settings', (e) => {
+      const st = JSON.parse(e.data);
+      S.settings.staleMinutes = st.staleMinutes;
+      scheduleRender(true);
+    });
+    es.addEventListener('clear', () => {
+      S.checked.clear(); updateSelBar();
+      S.records.clear(); S.searchText.clear(); S.fieldCounts.clear(); refreshFieldList();
+      closeDrawer();
+      scheduleRender(true);
+      if (S.view.layout === 'activity') loadActivity();
+    });
+    es.onerror = () => {
+      S.connected = false;
+      updateLive();
+      // If the session expired, EventSource keeps failing; check and bounce to login.
+      fetch('/api/auth/me').then((r) => { if (r.status === 401) location.href = '/login'; }).catch(() => {});
+    };
+  }
+
+  function updateLive() {
+    const el = $('#liveStatus');
+    el.className = 'live ' + (!S.connected ? 'off' : S.live ? 'on' : 'paused');
+    $('#liveText').textContent = !S.connected ? 'Reconnecting…'
+      : S.live ? 'Live' : S.pending ? `Paused · ${nf.format(S.pending)} new updates` : 'Paused';
+    $('#liveToggle').innerHTML = S.live ? icon(ICON.pause) + '<span>Pause</span>' : icon(ICON.play) + '<span>Resume</span>';
+  }
+
+  // ------------------------------------------------------------------ status
+  function statusOf(rec, now) {
+    const age = (now - Date.parse(rec.modified)) / 60000;
+    const m = S.settings.staleMinutes;
+    return age <= m ? 'fresh' : age <= m * 2 ? 'aging' : 'stale';
+  }
+
+  // ------------------------------------------------------------------ filtering & sorting
+  const OPS = {
+    contains: { label: 'contains', fn: (v, x) => show(v).toLowerCase().includes(x.toLowerCase()) },
+    ncontains: { label: 'does not contain', fn: (v, x) => !show(v).toLowerCase().includes(x.toLowerCase()) },
+    eq: { label: 'is', fn: (v, x) => show(v).toLowerCase() === x.toLowerCase() },
+    neq: { label: 'is not', fn: (v, x) => show(v).toLowerCase() !== x.toLowerCase() },
+    starts: { label: 'starts with', fn: (v, x) => show(v).toLowerCase().startsWith(x.toLowerCase()) },
+    gt: { label: '>', fn: (v, x) => cmpLoose(v, x) > 0 },
+    gte: { label: '≥', fn: (v, x) => cmpLoose(v, x) >= 0 },
+    lt: { label: '<', fn: (v, x) => cmpLoose(v, x) < 0 },
+    lte: { label: '≤', fn: (v, x) => cmpLoose(v, x) <= 0 },
+    regex: { label: 'matches regex', fn: (v, x, re) => re.test(show(v)) },
+    empty: { label: 'is empty', noValue: true, fn: (v) => v === undefined || v === null || v === '' },
+    nempty: { label: 'is not empty', noValue: true, fn: (v) => !(v === undefined || v === null || v === '') },
+  };
+  function cmpLoose(a, b) {
+    if (a === undefined || a === null || a === '') return NaN;
+    if (isNumeric(a) && isNumeric(b)) return Number(a) - Number(b);
+    return collator.compare(show(a), show(b));
+  }
+  function cmpSort(a, b) {
+    const ae = a === undefined || a === null || a === '';
+    const be = b === undefined || b === null || b === '';
+    if (ae || be) return ae && be ? 0 : ae ? 1 : -1; // empties last
+    if (isNumeric(a) && isNumeric(b)) return Number(a) - Number(b);
+    return collator.compare(show(a), show(b));
+  }
+  const STATUS_RANK = { fresh: 0, aging: 1, stale: 2 };
+  function getVal(rec, key, now) {
+    if (key === STATUS_KEY) return STATUS_RANK[statusOf(rec, now)];
+    return rec[key];
+  }
+
+  function computeView() {
+    const v = S.view;
+    const now = Date.now();
+    const q = v.search.trim().toLowerCase();
+    const terms = q ? q.split(/\s+/) : [];
+    const filters = v.filters.map((f) => {
+      let re = null;
+      if (f.op === 'regex') { try { re = new RegExp(f.value, 'i'); } catch { re = /$^/; } }
+      return { ...f, fn: OPS[f.op]?.fn || (() => true), re };
+    });
+    const timeMs = Math.abs(v.time) * 60000;
+    const counts = { all: 0, fresh: 0, aging: 0, stale: 0, rate: 0 };
+    const out = [];
+    for (const rec of S.records.values()) {
+      const st = statusOf(rec, now);
+      counts.all++; counts[st]++;
+      const mod = Date.parse(rec.modified);
+      if (now - mod <= 60000) counts.rate++;
+      if (v.status !== 'all' && st !== v.status) continue;
+      if (v.time > 0 && now - mod > timeMs) continue;
+      if (v.time < 0 && now - mod <= timeMs) continue;
+      if (terms.length) {
+        const hay = S.searchText.get(rec.id);
+        if (!terms.every((t) => hay.includes(t))) continue;
+      }
+      let ok = true;
+      for (const f of filters) {
+        if (f.field === '*') {
+          const keys = Object.keys(rec).filter((k) => k[0] !== '_');
+          if (f.op === 'ncontains' || f.op === 'neq' || f.op === 'empty') ok = keys.every((k) => f.fn(rec[k], f.value, f.re));
+          else ok = keys.some((k) => f.fn(rec[k], f.value, f.re));
+        } else ok = f.fn(getVal(rec, f.field, now), f.value, f.re);
+        if (!ok) break;
+      }
+      if (ok) out.push(rec);
+    }
+    const sorts = v.sort.filter((s) => s.key);
+    if (sorts.length) {
+      out.sort((a, b) => {
+        for (const s of sorts) {
+          const r = cmpSort(getVal(a, s.key, now), getVal(b, s.key, now));
+          if (r) return s.dir === 'desc' ? -r : r;
+        }
+        return collator.compare(a.id, b.id);
+      });
+    }
+    S.filtered = out;
+    S.counts = counts;
+
+    // grouping → flattened list of { g } and { r }
+    const items = [];
+    if (v.groupBy) {
+      const groups = new Map();
+      for (const r of out) {
+        const key = v.groupBy === STATUS_KEY ? statusOf(r, now) : show(r[v.groupBy]);
+        let g = groups.get(key);
+        if (!g) groups.set(key, (g = { key, rows: [], st: { fresh: 0, aging: 0, stale: 0 } }));
+        g.rows.push(r);
+        g.st[statusOf(r, now)]++;
+      }
+      const keys = [...groups.keys()].sort((a, b) => (a === '' ? 1 : b === '' ? -1 : collator.compare(a, b)));
+      for (const k of keys) {
+        const g = groups.get(k);
+        items.push({ g });
+        if (!S.collapsed.has(k)) for (const r of g.rows) items.push({ r });
+      }
+    } else {
+      for (const r of out) items.push({ r });
+    }
+    S.items = items;
+  }
+
+  // ------------------------------------------------------------------ columns
+  function allColumns() {
+    return [STATUS_KEY, 'id', ...S.fields, 'modified', 'created'];
+  }
+  function orderedColumns() {
+    const all = allColumns().filter((c) => c !== 'id');
+    const order = S.view.order.filter((c) => all.includes(c));
+    for (const c of all) if (!order.includes(c)) {
+      // new fields go before modified/created unless the user placed those
+      const idx = order.indexOf('modified');
+      if (c !== 'modified' && c !== 'created' && idx >= 0 && !S.view.order.includes(c)) order.splice(idx, 0, c);
+      else order.push(c);
+    }
+    return ['id', ...order];
+  }
+  function visibleColumns() {
+    const hidden = new Set(S.view.hidden);
+    return orderedColumns().filter((c) => c === 'id' || !hidden.has(c));
+  }
+  const colLabel = (c) => (c === STATUS_KEY ? 'Status' : c === 'id' ? 'ID' : c === 'created' ? 'Created' : c === 'modified' ? 'Modified' : c);
+  const SEL_KEY = '__sel';
+  const canSelect = () => can('delete') || can('export');
+  function renderCols() { return canSelect() ? [SEL_KEY, ...visibleColumns()] : visibleColumns(); }
+  function colWidth(c) {
+    if (c === SEL_KEY) return 40;
+    if (S.view.widths[c]) return S.view.widths[c];
+    if (c === STATUS_KEY) return 92;
+    if (c === 'id') return 180;
+    if (c === 'modified') return 130;
+    if (c === 'created') return 190;
+    return Math.min(260, Math.max(110, c.length * 9 + 50));
+  }
+
+  // ------------------------------------------------------------------ rendering
+  let renderQueued = false;
+  let activityDirty = false;
+  let needCompute = false;
+  function scheduleRender(compute) {
+    if (compute) needCompute = true;
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(() => {
+      renderQueued = false;
+      if (needCompute) { computeView(); needCompute = false; renderChrome(); activityDirty = true; if (S.checked.size) updateSelBar(); }
+      renderBody();
+    });
+  }
+
+  function renderChrome() {
+    const c = S.counts;
+    $('#statTotal').textContent = nf.format(c.all);
+    $('#statFields').textContent = `${S.fields.length} field${S.fields.length === 1 ? '' : 's'} · history ${S.config.historyLimit < 0 ? '∞' : S.config.historyLimit}/record`;
+    $('#statFresh').textContent = nf.format(c.fresh);
+    $('#statAging').textContent = nf.format(c.aging);
+    $('#statStale').textContent = nf.format(c.stale);
+    const m = S.settings.staleMinutes;
+    $('#statFreshSub').textContent = `checked in ≤ ${m}m ago`;
+    $('#statAgingSub').textContent = `${m}–${m * 2}m ago`;
+    $('#statStaleSub').textContent = `> ${m * 2}m ago`;
+    $('#statRate').textContent = nf.format(c.rate);
+    $$('.stat[data-status]').forEach((el) => el.classList.toggle('active', el.dataset.status === S.view.status && S.view.status !== 'all'));
+    const shown = S.filtered.length;
+    $('#countText').textContent = shown === c.all ? `${nf.format(c.all)} records` : `Showing ${nf.format(shown)} of ${nf.format(c.all)} records`;
+    $('#exportViewHint').textContent = `${nf.format(shown)} rows · ${visibleColumns().filter((x) => x !== STATUS_KEY).length} columns`;
+    renderChips();
+    renderGroupOptions();
+    renderHeader();
+    const empty = $('#empty');
+    if (S.view.layout === 'activity') empty.hidden = true;
+    else if (!c.all) {
+      empty.hidden = false;
+      const origin = location.origin;
+      empty.innerHTML = `<div><div class="big">No check-ins yet</div><div>Send a POST with an <b>id</b> and any fields you like:</div>
+        <code>curl -X POST "${esc(origin)}/api/checkin?id=device-1&amp;status=ok"${S.config.apiKeySet ? ' -H "X-API-Key: …"' : ''}</code></div>`;
+    } else if (!shown) {
+      empty.hidden = false;
+      empty.innerHTML = '<div><div class="big">No matching records</div><div>Try removing a filter or clearing the search.</div></div>';
+    } else empty.hidden = true;
+  }
+
+  function renderChips() {
+    const v = S.view;
+    const chips = [];
+    if (v.status !== 'all') chips.push(`<span class="chip"><span class="op">status</span><b>${esc(v.status)}</b><button data-rm="status">${icon(ICON.x)}</button></span>`);
+    v.filters.forEach((f, i) => {
+      const op = OPS[f.op];
+      chips.push(`<span class="chip" title="Click × to remove"><b>${esc(f.field === '*' ? 'Any field' : colLabel(f.field))}</b><span class="op">${esc(op ? op.label : f.op)}</span>${op && !op.noValue ? `<b>${esc(f.value)}</b>` : ''}<button data-rm="f${i}">${icon(ICON.x)}</button></span>`);
+    });
+    if (chips.length || v.search || v.time) chips.push('<span class="chip clear" data-rm="all">Clear filters</span>');
+    $('#chips').innerHTML = chips.join('');
+  }
+
+  function renderGroupOptions() {
+    const sel = $('#groupBy');
+    const opts = ['', STATUS_KEY, ...S.fields];
+    if (S.view.groupBy && !opts.includes(S.view.groupBy)) opts.push(S.view.groupBy);
+    const sig = opts.join('\u0001');
+    if (sel.dataset.sig !== sig) {
+      sel.innerHTML = opts.map((o) => `<option value="${esc(o)}">${o ? 'Group: ' + esc(colLabel(o)) : 'No grouping'}</option>`).join('');
+      sel.dataset.sig = sig;
+    }
+    sel.value = S.view.groupBy;
+  }
+
+  function gridTemplate(cols) {
+    return cols.map((c) => colWidth(c) + 'px').join(' ') + ' minmax(0,1fr)';
+  }
+  function totalWidth(cols) { return cols.reduce((a, c) => a + colWidth(c), 0); }
+
+  function renderHeader() {
+    const cols = renderCols();
+    const th = $('#thead');
+    th.style.gridTemplateColumns = gridTemplate(cols);
+    th.style.width = Math.max(totalWidth(cols), 0) + 'px';
+    th.style.minWidth = '100%';
+    const sortIdx = new Map(S.view.sort.map((s, i) => [s.key, i]));
+    const filtered = new Set(S.view.filters.map((f) => f.field));
+    th.innerHTML = cols.map((c) => {
+      if (c === SEL_KEY) return '<div class="th cbcell" title="Select all matching records"><input type="checkbox" class="cb" id="cbAll" aria-label="Select all"></div>';
+      const si = sortIdx.get(c);
+      const s = si !== undefined ? S.view.sort[si] : null;
+      const sortHtml = s ? `<span class="sort">${s.dir === 'asc' ? '▲' : '▼'}${S.view.sort.length > 1 ? `<sub>${si + 1}</sub>` : ''}</span>` : '';
+      return `<div class="th" data-col="${esc(c)}" draggable="${c !== 'id'}" title="Click to sort · Shift+click to add sort · Drag to reorder">
+        <span class="t">${esc(colLabel(c))}</span>${sortHtml}
+        <button class="fbtn ${filtered.has(c) ? 'on' : ''}" data-filter="${esc(c)}" title="Filter ${esc(colLabel(c))}">${icon(ICON.filter)}</button>
+        <span class="rz" data-rz="${esc(c)}"></span></div>`;
+    }).join('') + '<div class="th" style="cursor:default"></div>';
+    syncHeaderCheckbox();
+  }
+
+  function syncHeaderCheckbox() {
+    const cb = $('#cbAll');
+    if (!cb) return;
+    let n = 0;
+    for (const r of S.filtered) if (S.checked.has(r.id)) n++;
+    cb.checked = n > 0 && n === S.filtered.length;
+    cb.indeterminate = n > 0 && n < S.filtered.length;
+  }
+
+  function cellHtml(rec, c, now) {
+    if (c === SEL_KEY) return `<div class="td cbcell"><input type="checkbox" class="cb" tabindex="-1" aria-label="Select ${esc(rec.id)}" ${S.checked.has(rec.id) ? 'checked' : ''}></div>`;
+    if (c === STATUS_KEY) {
+      const st = statusOf(rec, now);
+      return `<div class="td"><span class="pill ${st === 'fresh' ? 'good' : st === 'aging' ? 'warn' : 'bad'}"><i class="dot ${st}" style="box-shadow:none;margin-right:6px"></i>${st}</span></div>`;
+    }
+    if (c === 'id') return `<div class="td id" title="${esc(rec.id)}">${esc(rec.id)}</div>`;
+    if (c === 'modified') return `<div class="td rel" title="${esc(absTime(rec.modified))}">${esc(relTime(rec.modified, now))}</div>`;
+    if (c === 'created') return `<div class="td" title="${esc(relTime(rec.created, now))}">${esc(absTime(rec.created))}</div>`;
+    const v = rec[c];
+    if (v === undefined || v === null || v === '') return '<div class="td empty-cell">—</div>';
+    if (typeof v === 'object') { const s = JSON.stringify(v); return `<div class="td obj" title="${esc(s)}">${esc(s)}</div>`; }
+    const s = String(v);
+    const pc = pillClass(v);
+    if (pc) return `<div class="td"><span class="pill ${pc}">${esc(s)}</span></div>`;
+    return `<div class="td${isNumeric(v) ? ' num' : ''}" title="${esc(s)}">${esc(s)}</div>`;
+  }
+
+  function renderBody() {
+    const layout = S.view.layout;
+    $('#tableWrap').hidden = layout !== 'table';
+    $('#cardsWrap').hidden = layout !== 'cards';
+    $('#activityWrap').hidden = layout !== 'activity';
+    $$('#layoutSeg button').forEach((b) => b.classList.toggle('active', b.dataset.layout === layout));
+    if (layout === 'table') renderTableRows();
+    else if (layout === 'cards') renderCards();
+    else if (layout === 'activity' && activityDirty) { activityDirty = false; renderActivity(); }
+  }
+
+  function rowHeight() { return S.settings.compact ? 32 : 40; }
+
+  function renderTableRows() {
+    const wrap = $('#tableWrap');
+    const body = $('#tbody');
+    const cols = renderCols();
+    const rh = rowHeight();
+    const tpl = gridTemplate(cols);
+    const width = totalWidth(cols);
+    body.style.height = S.items.length * rh + 'px';
+    body.style.width = width + 'px';
+    const headH = $('#thead').offsetHeight;
+    const top = Math.max(0, wrap.scrollTop - headH);
+    const start = Math.max(0, Math.floor(top / rh) - 8);
+    const end = Math.min(S.items.length, Math.ceil((top + wrap.clientHeight) / rh) + 8);
+    const now = Date.now();
+    let html = '';
+    for (let i = start; i < end; i++) {
+      const it = S.items[i];
+      const y = i * rh;
+      if (it.g) {
+        const g = it.g;
+        html += `<div class="gr ${S.collapsed.has(g.key) ? 'collapsed' : ''}" data-group="${esc(g.key)}" style="transform:translateY(${y}px)">${icon(ICON.chev)}
+          ${S.view.groupBy === STATUS_KEY ? `<i class="dot ${esc(g.key)}"></i>` : ''}<span>${g.key === '' ? '<span class="muted">(empty)</span>' : esc(g.key)}</span>
+          <span class="count">${nf.format(g.rows.length)}</span>
+          <span class="mini"><span><i class="dot fresh"></i>${g.st.fresh}</span><span><i class="dot aging"></i>${g.st.aging}</span><span><i class="dot stale"></i>${g.st.stale}</span></span></div>`;
+      } else {
+        const r = it.r;
+        const fl = S.flash.get(r.id);
+        const flash = fl && now - fl < 1200 ? ' flash' : '';
+        html += `<div class="tr${r.id === S.selected ? ' sel' : ''}${S.checked.has(r.id) ? ' checked' : ''}${flash}" data-id="${esc(r.id)}" style="transform:translateY(${y}px);grid-template-columns:${tpl}">${cols.map((c) => cellHtml(r, c, now)).join('')}<div></div></div>`;
+      }
+    }
+    body.innerHTML = html;
+    if (S.flash.size > 5000) S.flash.clear();
+  }
+
+  // cards (virtualised by rows)
+  const CARD_GAP = 12;
+  function renderCards() {
+    const wrap = $('#cardsWrap');
+    const box = $('#cards');
+    const width = wrap.clientWidth - 32;
+    const fieldCols = visibleColumns().filter((c) => !['id', STATUS_KEY, 'modified', 'created'].includes(c)).slice(0, 6);
+    const CARD_H = 52 + Math.max(1, fieldCols.length) * 22.5;
+    const perRow = Math.max(1, Math.floor((width + CARD_GAP) / (280 + CARD_GAP)));
+    const cw = (width - CARD_GAP * (perRow - 1)) / perRow;
+    // layout rows: group headers take a full row of 44px
+    const rows = [];
+    let y = 16;
+    let cur = null;
+    for (const it of S.items) {
+      if (it.g) { rows.push({ y, h: 44, g: it.g }); y += 44; cur = null; continue; }
+      if (!cur || cur.cards.length >= perRow) { cur = { y, h: CARD_H + CARD_GAP, cards: [] }; rows.push(cur); y += CARD_H + CARD_GAP; }
+      cur.cards.push(it.r);
+    }
+    box.style.height = y + 16 + 'px';
+    const top = wrap.scrollTop - 400;
+    const bottom = wrap.scrollTop + wrap.clientHeight + 400;
+    const now = Date.now();
+    const selectable = canSelect();
+    let html = '';
+    for (const row of rows) {
+      if (row.y + row.h < top || row.y > bottom) continue;
+      if (row.g) {
+        html += `<div class="card-group" style="top:${row.y}px;left:16px;right:16px">${S.view.groupBy === STATUS_KEY ? `<i class="dot ${esc(row.g.key)}"></i>` : ''}${row.g.key === '' ? '<span class="muted">(empty)</span>' : esc(row.g.key)} <span class="count">${row.g.rows.length}</span></div>`;
+        continue;
+      }
+      row.cards.forEach((r, i) => {
+        const st = statusOf(r, now);
+        const dl = fieldCols.map((c) => {
+          const v = r[c];
+          const pc = pillClass(v);
+          const val = v === undefined || v === null || v === '' ? '<span class="muted">—</span>' : pc ? `<span class="pill ${pc}">${esc(show(v))}</span>` : esc(show(v));
+          return `<dt title="${esc(c)}">${esc(c)}</dt><dd title="${esc(show(v))}">${val}</dd>`;
+        }).join('');
+        const ck = S.checked.has(r.id);
+        html += `<div class="card${ck ? ' checked' : ''}" data-id="${esc(r.id)}" style="top:${row.y}px;left:${16 + i * (cw + CARD_GAP)}px;width:${cw}px;height:${CARD_H}px">
+          <div class="card-head"><i class="dot ${st}"></i><span class="cid">${esc(r.id)}</span><span class="rel" title="${esc(absTime(r.modified))}">${esc(relTime(r.modified, now))}</span></div>
+          <dl>${dl || '<dt class="muted">No fields</dt><dd></dd>'}</dl>
+          ${selectable ? `<input type="checkbox" class="cb card-cb" aria-label="Select ${esc(r.id)}" ${ck ? 'checked' : ''}>` : ''}</div>`;
+      });
+    }
+    box.classList.toggle('selecting', S.checked.size > 0);
+    box.innerHTML = html;
+  }
+
+  // activity feed
+  let activity = [];
+  const loadActivity = debounce(async () => {
+    try {
+      const data = await apiJson('/api/history?limit=300');
+      activity = data.history;
+      renderActivity();
+    } catch (e) { console.warn(e); }
+  }, 300);
+  async function loadMoreActivity() {
+    const last = activity[activity.length - 1];
+    if (!last) return;
+    const data = await apiJson('/api/history?limit=300&before=' + last.hid);
+    activity = activity.concat(data.history);
+    renderActivity();
+  }
+  function changesHtml(changes, max = 12) {
+    const keys = Object.keys(changes);
+    if (!keys.length) return '<div class="none">Checked in — no field changes</div>';
+    const parts = keys.slice(0, max).map((k) => {
+      const [from, to] = changes[k];
+      return `<span class="chg" title="${esc(k)}: ${esc(show(from))} → ${esc(show(to))}"><span class="k">${esc(k)}</span> ${from !== null ? `<del>${esc(show(from))}</del> → ` : ''}${to !== null ? `<ins>${esc(show(to))}</ins>` : '<del>removed</del>'}</span>`;
+    });
+    if (keys.length > max) parts.push(`<span class="chg">+${keys.length - max} more</span>`);
+    return `<div class="changes">${parts.join('')}</div>`;
+  }
+  function renderActivity() {
+    const el = $('#activity');
+    if (!activity.length) {
+      el.innerHTML = `<div class="empty" style="position:static;padding:60px"><div><div class="big">No activity yet</div><div>${S.config.historyLimit === 0 ? 'History is disabled (HISTORY_LIMIT=0).' : 'Check-ins will appear here as they arrive.'}</div></div></div>`;
+      return;
+    }
+    const v = S.view;
+    const filtering = v.search || v.filters.length || v.status !== 'all' || v.time;
+    let list = activity;
+    if (filtering) {
+      const ids = new Set(S.filtered.map((r) => r.id));
+      list = activity.filter((h) => ids.has(h.id));
+    }
+    const note = filtering ? `<div class="muted" style="padding:8px 16px;font-size:12px">Showing activity for the ${nf.format(S.filtered.length)} records matching your filters.</div>` : '';
+    el.innerHTML = note + list.map((h) => `<div class="act" data-id="${esc(h.id)}">
+      <time title="${esc(absTime(h.at))}">${esc(shortTime(h.at))}</time>
+      <div class="ico ${h.action}">${icon(h.action === 'create' ? ICON.plus : Object.keys(h.changes).length ? ICON.edit : ICON.pulse)}</div>
+      <div class="what"><b>${esc(h.id)}</b> <span class="muted">${h.action === 'create' ? 'created' : 'v' + h.version}</span>${changesHtml(h.changes, 8)}</div></div>`).join('')
+      + (activity.length % 300 === 0 ? '<button class="btn load-more" id="moreActivity">Load older</button>' : '');
+  }
+
+  // ------------------------------------------------------------------ drawer
+  let drawerTab = 'fields';
+  let drawerData = null;
+  async function openDrawer(id) {
+    S.selected = id;
+    $('#drawer').classList.add('open');
+    $('#scrim').classList.add('open');
+    $('#drawer').setAttribute('aria-hidden', 'false');
+    $('#dTitle').textContent = id;
+    $('#dBody').innerHTML = '<div class="muted">Loading…</div>';
+    scheduleRender();
+    await refreshDrawer();
+  }
+  async function refreshDrawer() {
+    const id = S.selected;
+    if (!id) return;
+    try {
+      const data = await apiJson('/api/records/' + encodeURIComponent(id) + '/history?limit=1000');
+      if (S.selected !== id) return;
+      drawerData = data;
+      renderDrawer();
+    } catch (e) {
+      $('#dBody').innerHTML = `<div class="muted">${esc(e.message)}</div>`;
+    }
+  }
+  function renderDrawer() {
+    const { record, history } = drawerData;
+    const now = Date.now();
+    $('#dHistCount').textContent = history.length;
+    $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === drawerTab));
+    if (!record) { $('#dBody').innerHTML = '<div class="muted">Record no longer exists.</div>'; return; }
+    const st = statusOf(record, now);
+    $('#dSub').innerHTML = `<i class="dot ${st}"></i> ${st} · last check-in ${esc(relTime(record.modified, now))} · version ${record._version}`;
+    if (drawerTab === 'fields') {
+      const keys = Object.keys(record).filter((k) => !SYS.includes(k) && k[0] !== '_').sort(collator.compare);
+      const val = (v) => (typeof v === 'object' && v !== null ? `<pre>${esc(JSON.stringify(v, null, 2))}</pre>` : pillClass(v) ? `<span class="pill ${pillClass(v)}">${esc(show(v))}</span>` : esc(show(v)));
+      $('#dBody').innerHTML = `<table class="kv">
+        ${keys.map((k) => `<tr><td>${esc(k)}</td><td>${val(record[k])}</td></tr>`).join('') || '<tr><td colspan="2" class="muted">No custom fields</td></tr>'}
+        <tr class="sys"><td>created</td><td>${esc(absTime(record.created))} <span class="muted">(${esc(relTime(record.created, now))})</span></td></tr>
+        <tr class="sys"><td>modified</td><td>${esc(absTime(record.modified))} <span class="muted">(${esc(relTime(record.modified, now))})</span></td></tr>
+        <tr class="sys"><td>version</td><td>${record._version}</td></tr></table>`;
+    } else {
+      if (!history.length) {
+        $('#dBody').innerHTML = `<div class="muted">${S.config.historyLimit === 0 ? 'History is disabled (HISTORY_LIMIT=0).' : 'No history stored.'}</div>`;
+        return;
+      }
+      $('#dBody').innerHTML = `<div class="muted" style="margin-bottom:12px;font-size:12px">Showing ${history.length} most recent change${history.length === 1 ? '' : 's'}${S.config.historyLimit > 0 ? ` (keeps up to ${S.config.historyLimit})` : ''}.</div>
+        <ol class="timeline">${history.map((h) => `<li class="tl ${h.action === 'create' ? 'create' : Object.keys(h.changes).length ? 'changed' : ''}"><span class="node"></span>
+          <div class="tl-head"><b>${h.action === 'create' ? 'Created' : 'Version ' + h.version}</b><time title="${esc(absTime(h.at))}">${esc(absTime(h.at))} · ${esc(relTime(h.at, now))}</time></div>
+          ${changesHtml(h.changes, 50)}</li>`).join('')}</ol>`;
+    }
+  }
+  function closeDrawer() {
+    S.selected = null;
+    drawerData = null;
+    $('#drawer').classList.remove('open');
+    $('#scrim').classList.remove('open');
+    $('#drawer').setAttribute('aria-hidden', 'true');
+    scheduleRender();
+  }
+
+  // ------------------------------------------------------------------ modal & toast
+  function toast(msg, type = '') {
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    el.textContent = msg;
+    $('#toasts').appendChild(el);
+    setTimeout(() => el.remove(), type === 'error' ? 6000 : 3500);
+  }
+  function modal({ title, body, actions }) {
+    $('#mTitle').textContent = title;
+    $('#mBody').innerHTML = body;
+    const box = $('#mActions');
+    box.innerHTML = '';
+    for (const a of actions) {
+      const b = document.createElement('button');
+      b.className = 'btn ' + (a.cls || '');
+      b.textContent = a.label;
+      if (a.id) b.id = a.id;
+      b.onclick = async () => { if (a.onClick) { const keep = await a.onClick(); if (keep === false) return; } closeModal(); };
+      box.appendChild(b);
+    }
+    $('#modalBack').hidden = false;
+    const first = $('#mBody input');
+    if (first) setTimeout(() => first.focus(), 30);
+  }
+  function closeModal() { $('#modalBack').hidden = true; }
+
+  // ------------------------------------------------------------------ views
+  function saveState() {
+    store.set('view', S.view);
+    store.set('viewName', S.viewName);
+  }
+  function setView(patch, compute = true) {
+    Object.assign(S.view, patch);
+    saveState();
+    scheduleRender(compute);
+  }
+  function renderViewSelect() {
+    const names = ['Default', ...Object.keys(S.views).filter((n) => n !== 'Default').sort(collator.compare)];
+    $('#viewSelect').innerHTML = names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+    $('#viewSelect').value = names.includes(S.viewName) ? S.viewName : 'Default';
+    $('#viewDelete').disabled = S.viewName === 'Default';
+    $('#viewDelete').style.opacity = S.viewName === 'Default' ? .4 : 1;
+  }
+  function applyNamedView(name) {
+    S.viewName = name;
+    const saved = name === 'Default' ? (S.views.Default || DEFAULT_VIEW()) : S.views[name];
+    S.view = Object.assign(DEFAULT_VIEW(), JSON.parse(JSON.stringify(saved || {})));
+    syncControls();
+    saveState();
+    renderViewSelect();
+    scheduleRender(true);
+  }
+  function syncControls() {
+    $('#search').value = S.view.search;
+    $('#timeRange').value = String(S.view.time);
+  }
+
+  // ------------------------------------------------------------------ permissions & account
+  function can(cap) { return Boolean(S.me?.caps?.[cap]); }
+
+  function initials(u) {
+    const src = (u.name || u.username || '?').trim();
+    const parts = src.replace(/@.*/, '').split(/[\s._-]+/).filter(Boolean);
+    return ((parts[0]?.[0] || '?') + (parts[1]?.[0] || '')).toUpperCase();
+  }
+
+  function applyCaps() {
+    const u = S.me.user;
+    $('#importBtn').hidden = !can('import');
+    $('#exportBtn').parentElement.hidden = !can('export');
+    $('#clearBtn').hidden = !can('clearAll');
+    $('#liveToggle').hidden = !can('pause');
+    $('#dDelete').hidden = !can('delete');
+    $('#adminItem').hidden = !can('users');
+    $('#pwItem').hidden = S.me.kind !== 'session';
+    $('#selDelete').hidden = !can('delete');
+    $('#selExport').hidden = !can('export');
+    for (const el of [$('#userAvatar'), $('#userAvatar2')]) el.textContent = initials(u);
+    $('#userName').textContent = u.name || u.username;
+    $('#userName2').textContent = u.name || u.username;
+    $('#userRole').textContent = S.me.roleLabel;
+    $('#userSub').innerHTML = `<span>${esc(u.email || u.username)}</span><span class="role-badge r-${esc(S.me.role)}">${esc(S.me.roleLabel)}</span>`;
+    $('#liveStatus').style.cursor = can('pause') ? 'pointer' : 'default';
+    scheduleRender(true);
+  }
+
+  async function logout() {
+    try { await api('/api/auth/logout', { method: 'POST' }); } catch { /* ignore */ }
+    location.href = '/login';
+  }
+
+  function changePassword() {
+    const hasPw = S.me.user.hasPassword;
+    modal({
+      title: hasPw ? 'Change password' : 'Set a password',
+      body: `${hasPw ? '' : '<p>You sign in with single sign-on. Setting a password also lets you use HTTP Basic auth for scripts.</p>'}
+        ${hasPw ? '<label>Current password<input class="input" id="pwCur" type="password" autocomplete="current-password"></label>' : ''}
+        <label>New password<input class="input" id="pwNew" type="password" autocomplete="new-password"></label>
+        <label>Confirm new password<input class="input" id="pwNew2" type="password" autocomplete="new-password"></label>
+        <p style="font-size:12px">At least 10 characters. Your other sessions will be signed out.</p>`,
+      actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
+        const next = $('#pwNew').value;
+        if (next !== $('#pwNew2').value) { toast('Passwords do not match', 'error'); return false; }
+        try {
+          await apiJson('/api/auth/password', { method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ current: $('#pwCur')?.value || '', next }) });
+          S.me.user.hasPassword = true;
+          toast('Password updated');
+        } catch (e) { toast(e.message, 'error'); return false; }
+      } }],
+    });
+  }
+
+  // ------------------------------------------------------------------ multi-select
+  function toggleChecked(id, shift) {
+    const on = !S.checked.has(id);
+    if (shift && S.lastChecked !== null) {
+      const ids = S.filtered.map((r) => r.id);
+      const a = ids.indexOf(S.lastChecked);
+      const b = ids.indexOf(id);
+      if (a >= 0 && b >= 0) {
+        const [lo, hi] = a < b ? [a, b] : [b, a];
+        for (let i = lo; i <= hi; i++) { if (on) S.checked.add(ids[i]); else S.checked.delete(ids[i]); }
+      }
+    }
+    if (on) S.checked.add(id); else S.checked.delete(id);
+    S.lastChecked = id;
+    updateSelBar();
+    scheduleRender();
+  }
+
+  function setAllFiltered(on) {
+    for (const r of S.filtered) { if (on) S.checked.add(r.id); else S.checked.delete(r.id); }
+    updateSelBar();
+    scheduleRender();
+  }
+
+  function clearChecked() {
+    S.checked.clear();
+    S.lastChecked = null;
+    updateSelBar();
+    scheduleRender();
+  }
+
+  function updateSelBar() {
+    const n = S.checked.size;
+    $('#selbar').classList.toggle('show', n > 0);
+    $('#selCount').textContent = `${nf.format(n)} selected`;
+    let inView = 0;
+    for (const r of S.filtered) if (S.checked.has(r.id)) inView++;
+    const remaining = S.filtered.length - inView;
+    $('#selAll').hidden = remaining <= 0;
+    $('#selAll').textContent = `Select all ${nf.format(S.filtered.length)} matching`;
+    syncHeaderCheckbox();
+  }
+
+  function confirmDeleteChecked() {
+    const ids = [...S.checked];
+    if (!ids.length || !can('delete')) return;
+    const preview = ids.slice(0, 6).map((id) => `<code>${esc(id)}</code>`).join(' ');
+    modal({
+      title: `Delete ${nf.format(ids.length)} record${ids.length === 1 ? '' : 's'}?`,
+      body: `<div class="warn-box">The selected records and <b>all of their history</b> will be permanently deleted.</div>
+        <p style="line-height:1.9">${preview}${ids.length > 6 ? ` <span class="muted">and ${nf.format(ids.length - 6)} more</span>` : ''}</p>`,
+      actions: [{ label: 'Cancel' }, { label: `Delete ${nf.format(ids.length)}`, cls: 'danger solid', onClick: async () => {
+        let deleted = 0;
+        try {
+          for (let i = 0; i < ids.length; i += 50000) {
+            const r = await apiJson('/api/records/delete', { method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ ids: ids.slice(i, i + 50000) }) });
+            deleted += r.deleted;
+          }
+          clearChecked();
+          toast(`Deleted ${nf.format(deleted)} record${deleted === 1 ? '' : 's'}`);
+        } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
+      } }],
+    });
+  }
+
+  function exportChecked() {
+    const order = new Map(S.filtered.map((r, i) => [r.id, i]));
+    const rows = [...S.checked].map((id) => S.records.get(id)).filter(Boolean)
+      .sort((a, b) => (order.get(a.id) ?? 1e12) - (order.get(b.id) ?? 1e12));
+    exportRows(rows, 'checkins-selected');
+  }
+
+  // ------------------------------------------------------------------ export / import
+  function download(blob, name) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+  const stamp = () => new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+  function csvCell(v) {
+    let s = show(v);
+    if (/^[=+\-@\t\r]/.test(s) && !isNumeric(s)) s = "'" + s;
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  function exportRows(rows, name) {
+    const cols = visibleColumns().filter((c) => c !== STATUS_KEY);
+    const lines = [cols.map(csvCell).join(',')];
+    for (const r of rows) lines.push(cols.map((c) => csvCell(r[c])).join(','));
+    download(new Blob(['\ufeff' + lines.join('\r\n') + '\r\n'], { type: 'text/csv' }), `${name}-${stamp()}.csv`);
+    toast(`Exported ${nf.format(rows.length)} rows`);
+  }
+  function exportView() { exportRows(S.filtered, 'checkins-view'); }
+
+  async function exportServer(path, name) {
+    try {
+      const res = await api(path);
+      download(await res.blob(), `${name}-${stamp()}.csv`);
+    } catch (e) { toast('Export failed: ' + e.message, 'error'); }
+  }
+  async function importCsv(file) {
+    toast(`Uploading ${file.name}…`);
+    try {
+      const res = await api('/api/import', { method: 'POST', headers: { 'content-type': 'text/csv' }, body: file });
+      const r = await res.json();
+      if (r.failed) {
+        modal({
+          title: 'Import finished with errors',
+          body: `<p>${nf.format(r.imported)} rows imported (${nf.format(r.created)} created, ${nf.format(r.updated)} updated). ${nf.format(r.failed)} rows failed:</p>
+            <div class="err-list">${r.errors.map((e) => `Row ${e.row}: ${esc(e.error)}`).join('<br>')}</div>`,
+          actions: [{ label: 'OK', cls: 'primary' }],
+        });
+      } else toast(`Imported ${nf.format(r.imported)} rows · ${nf.format(r.created)} created · ${nf.format(r.updated)} updated`);
+    } catch (e) { toast('Import failed: ' + e.message, 'error'); }
+  }
+
+  function confirmClearAll() {
+    const total = S.records.size;
+    modal({
+      title: 'Clear all records?',
+      body: `<div class="warn-box">This permanently deletes <b>all ${nf.format(total)} records and their entire history</b>. It cannot be undone.</div>
+        <p>Consider exporting first. Type <b>CLEAR</b> to confirm.</p>
+        <label>Confirmation<input class="input" id="clearConfirm" autocomplete="off" placeholder="CLEAR"></label>`,
+      actions: [
+        { label: 'Cancel' },
+        { label: 'Delete everything', cls: 'danger solid', id: 'clearGo', onClick: async () => {
+          if ($('#clearConfirm').value.trim() !== 'CLEAR') return false;
+          try {
+            const r = await apiJson('/api/records?confirm=true', { method: 'DELETE' });
+            toast(`Cleared ${nf.format(r.deleted.records)} records and ${nf.format(r.deleted.history)} history entries`);
+          } catch (e) { toast('Clear failed: ' + e.message, 'error'); }
+        } },
+      ],
+    });
+    const go = $('#clearGo');
+    go.disabled = true;
+    $('#clearConfirm').addEventListener('input', (e) => { go.disabled = e.target.value.trim() !== 'CLEAR'; });
+    $('#clearConfirm').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !go.disabled) go.click(); });
+  }
+
+  function openSettings() {
+    const canThreshold = can('threshold');
+    modal({
+      title: 'Settings',
+      body: `<div class="row">
+          <label>Fresh threshold (minutes)<input class="input" id="setStale" type="number" min="1" value="${S.settings.staleMinutes}" ${canThreshold ? '' : 'disabled title="Requires the Power user role"'}></label>
+          <label>Theme<select class="select" id="setTheme">
+            ${['auto', 'light', 'dark'].map((t) => `<option ${S.settings.theme === t ? 'selected' : ''} value="${t}">${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}</select></label>
+        </div>
+        <p style="font-size:12px">Records are <b>fresh</b> within the threshold, <b>aging</b> up to 2×, and <b>stale</b> after that.
+        ${canThreshold ? 'The threshold applies to everyone.' : 'Only power users and admins can change the threshold.'}</p>
+        <p style="font-size:12px">Server keeps <b>${S.config.historyLimit < 0 ? 'unlimited' : S.config.historyLimit}</b> history entries per record (HISTORY_LIMIT).</p>`,
+      actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
+        S.settings.theme = $('#setTheme').value;
+        store.set('settings', { theme: S.settings.theme, compact: S.settings.compact });
+        applyTheme();
+        const m = Math.max(1, Number($('#setStale').value) || 15);
+        if (canThreshold && m !== S.settings.staleMinutes) {
+          try {
+            const r = await apiJson('/api/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ staleMinutes: m }) });
+            S.settings.staleMinutes = r.staleMinutes;
+            toast('Fresh threshold updated for everyone');
+          } catch (e) { toast(e.message, 'error'); return false; }
+        }
+        scheduleRender(true);
+      } }],
+    });
+  }
+
+  function applyTheme() {
+    const t = S.settings.theme;
+    const dark = t === 'dark' || (t === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    document.body.classList.toggle('compact', !!S.settings.compact);
+    $('#densityBtn').classList.toggle('active', !!S.settings.compact);
+  }
+
+  // ------------------------------------------------------------------ filter popover
+  function fieldOptions() { return [STATUS_KEY, 'id', ...S.fields, 'modified', 'created']; }
+  function openFilterPop(field) {
+    closeMenus();
+    const pop = $('#filterPop');
+    const fsel = $('#fField');
+    fsel.innerHTML = `<option value="*">Any field</option>` + fieldOptions().filter((f) => f !== STATUS_KEY)
+      .map((f) => `<option value="${esc(f)}">${esc(colLabel(f))}</option>`).join('');
+    $('#fOp').innerHTML = Object.entries(OPS).map(([k, o]) => `<option value="${k}">${esc(o.label)}</option>`).join('');
+    if (field === STATUS_KEY) {
+      pop.classList.add('open');
+      fsel.value = '*';
+      $('#fFacets').innerHTML = ['fresh', 'aging', 'stale'].map((s) => `<button class="facet" data-status="${s}">${s} <span>${S.counts[s]}</span></button>`).join('');
+      return;
+    }
+    fsel.value = field && fieldOptions().includes(field) ? field : '*';
+    $('#fOp').value = 'contains';
+    $('#fValue').value = '';
+    updateFacets();
+    pop.classList.add('open');
+    setTimeout(() => $('#fValue').focus(), 20);
+  }
+  function updateFacets() {
+    const field = $('#fField').value;
+    const op = OPS[$('#fOp').value];
+    $('#fValueWrap').hidden = !!op?.noValue;
+    const counts = new Map();
+    if (field !== '*' && field !== 'created' && field !== 'modified') {
+      for (const r of S.records.values()) {
+        const v = show(r[field]);
+        if (v === '') continue;
+        counts.set(v, (counts.get(v) || 0) + 1);
+        if (counts.size > 2000) break;
+      }
+    }
+    const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 30);
+    $('#fValues').innerHTML = top.map(([v]) => `<option value="${esc(v)}">`).join('');
+    $('#fFacets').innerHTML = top.length && counts.size > 1
+      ? top.map(([v, n]) => `<button class="facet" data-value="${esc(v)}" title="${esc(v)}">${esc(v.length > 30 ? v.slice(0, 30) + '…' : v)}<span>${n}</span></button>`).join('') : '';
+  }
+  function addFilter(field, op, value) {
+    if (!OPS[op]?.noValue && value === '') return;
+    setView({ filters: [...S.view.filters, { field, op, value }] });
+    closeMenus();
+  }
+
+  // ------------------------------------------------------------------ columns popover
+  function renderColumnList() {
+    const q = $('#colSearch').value.trim().toLowerCase();
+    const hidden = new Set(S.view.hidden);
+    $('#colList').innerHTML = orderedColumns().filter((c) => c !== 'id' && (!q || colLabel(c).toLowerCase().includes(q))).map((c) => `
+      <div class="col-item" draggable="true" data-col="${esc(c)}">${icon(ICON.grip, 'i grip')}
+        <input type="checkbox" ${hidden.has(c) ? '' : 'checked'} data-col="${esc(c)}">
+        <span class="name">${esc(colLabel(c))}</span><span class="cnt">${SYS.includes(c) || c === STATUS_KEY ? '' : nf.format(S.fieldCounts.get(c) || 0)}</span></div>`).join('');
+  }
+  function moveColumn(from, to, before = true) {
+    if (from === to || from === 'id' || to === 'id') return;
+    const order = orderedColumns().filter((c) => c !== 'id' && c !== from);
+    let idx = order.indexOf(to);
+    if (!before) idx++;
+    order.splice(idx, 0, from);
+    setView({ order }, false);
+    scheduleRender(true);
+  }
+
+  function closeMenus() { $$('.menu.open').forEach((m) => m.classList.remove('open')); }
+
+  // ------------------------------------------------------------------ events
+  function bind() {
+    $('#search').addEventListener('input', debounce((e) => setView({ search: e.target.value }), 120));
+    $('#timeRange').addEventListener('change', (e) => setView({ time: Number(e.target.value) }));
+    $('#groupBy').addEventListener('change', (e) => { S.collapsed.clear(); setView({ groupBy: e.target.value }); });
+    $$('#layoutSeg button').forEach((b) => b.addEventListener('click', () => {
+      setView({ layout: b.dataset.layout });
+      if (b.dataset.layout === 'activity') loadActivity();
+    }));
+    $('#densityBtn').addEventListener('click', () => { S.settings.compact = !S.settings.compact; store.set('settings', S.settings); applyTheme(); scheduleRender(); });
+    $('#themeBtn').addEventListener('click', () => {
+      const cur = document.documentElement.dataset.theme;
+      S.settings.theme = cur === 'dark' ? 'light' : 'dark';
+      store.set('settings', S.settings);
+      applyTheme();
+    });
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+    $('#liveToggle').addEventListener('click', () => {
+      S.live = !S.live;
+      if (S.live && S.pending) { S.pending = 0; fetchChanges(); }
+      updateLive();
+    });
+    $('#liveStatus').addEventListener('click', () => { if (can('pause')) $('#liveToggle').click(); });
+
+    // account menu
+    $('#userBtn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      const open = $('#userMenu').classList.contains('open');
+      closeMenus();
+      if (!open) $('#userMenu').classList.add('open');
+    });
+    $('#userMenu').addEventListener('click', (e) => {
+      const act = e.target.closest('[data-act]')?.dataset.act;
+      if (!act) return;
+      closeMenus();
+      if (act === 'logout') logout();
+      if (act === 'settings') openSettings();
+      if (act === 'password') changePassword();
+      if (act === 'admin') window.CheckinAdmin?.open('users');
+    });
+
+    // selection bar
+    $('#selAll').addEventListener('click', () => setAllFiltered(true));
+    $('#selClear').addEventListener('click', clearChecked);
+    $('#selDelete').addEventListener('click', confirmDeleteChecked);
+    $('#selExport').addEventListener('click', exportChecked);
+    $('#thead').addEventListener('click', (e) => {
+      if (!e.target.closest('.th.cbcell')) return;
+      e.stopPropagation();
+      let n = 0;
+      for (const r of S.filtered) if (S.checked.has(r.id)) n++;
+      setAllFiltered(!(n > 0 && n === S.filtered.length));
+    }, true);
+
+    $$('.stat[data-status]').forEach((el) => el.addEventListener('click', () => {
+      const s = el.dataset.status;
+      setView({ status: S.view.status === s ? 'all' : s });
+    }));
+
+    $('#chips').addEventListener('click', (e) => {
+      const rm = e.target.closest('[data-rm]')?.dataset.rm;
+      if (!rm) return;
+      if (rm === 'all') { setView({ filters: [], status: 'all', search: '', time: 0 }); syncControls(); }
+      else if (rm === 'status') setView({ status: 'all' });
+      else setView({ filters: S.view.filters.filter((_, i) => 'f' + i !== rm) });
+    });
+
+    // menus
+    const toggle = (btn, menu, onOpen) => $(btn).addEventListener('click', (e) => {
+      e.stopPropagation();
+      const open = $(menu).classList.contains('open');
+      closeMenus();
+      if (!open) { $(menu).classList.add('open'); onOpen && onOpen(); }
+    });
+    toggle('#exportBtn', '#exportMenu');
+    toggle('#columnsBtn', '#columnsPop', () => { $('#colSearch').value = ''; renderColumnList(); });
+    $('#filterBtn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      if ($('#filterPop').classList.contains('open')) closeMenus(); else openFilterPop();
+    });
+    document.addEventListener('click', (e) => { if (!e.target.closest('.menu')) closeMenus(); });
+
+    $('#exportMenu').addEventListener('click', (e) => {
+      const k = e.target.closest('[data-export]')?.dataset.export;
+      if (!k) return;
+      closeMenus();
+      if (k === 'view') exportView();
+      if (k === 'all') exportServer('/api/export.csv', 'checkins');
+      if (k === 'history') exportServer('/api/history/export.csv', 'checkin-history');
+    });
+    $('#importBtn').addEventListener('click', () => $('#importFile').click());
+    $('#importFile').addEventListener('change', (e) => {
+      const f = e.target.files[0];
+      if (f) importCsv(f);
+      e.target.value = '';
+    });
+    // drag & drop CSV anywhere
+    document.addEventListener('dragover', (e) => { if (e.dataTransfer?.types?.includes('Files')) e.preventDefault(); });
+    document.addEventListener('drop', (e) => {
+      if (!can('import')) return;
+      const f = e.dataTransfer?.files?.[0];
+      if (f) { e.preventDefault(); if (/\.csv$/i.test(f.name) || f.type.includes('csv')) importCsv(f); else toast('Drop a .csv file to import', 'error'); }
+    });
+    $('#clearBtn').addEventListener('click', confirmClearAll);
+
+    // filter popover
+    $('#fField').addEventListener('change', updateFacets);
+    $('#fOp').addEventListener('change', updateFacets);
+    $('#fAdd').addEventListener('click', () => addFilter($('#fField').value, $('#fOp').value, $('#fValue').value));
+    $('#fValue').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#fAdd').click(); });
+    $('#fFacets').addEventListener('click', (e) => {
+      const b = e.target.closest('.facet');
+      if (!b) return;
+      if (b.dataset.status) { setView({ status: b.dataset.status }); closeMenus(); return; }
+      addFilter($('#fField').value, 'eq', b.dataset.value);
+    });
+
+    // columns popover
+    $('#colSearch').addEventListener('input', renderColumnList);
+    $('#colList').addEventListener('change', (e) => {
+      const c = e.target.dataset.col;
+      const hidden = new Set(S.view.hidden);
+      if (e.target.checked) hidden.delete(c); else hidden.add(c);
+      setView({ hidden: [...hidden] });
+    });
+    $('#colAll').addEventListener('click', () => { setView({ hidden: [] }); renderColumnList(); });
+    $('#colNone').addEventListener('click', () => { setView({ hidden: orderedColumns().filter((c) => c !== 'id') }); renderColumnList(); });
+    $('#colReset').addEventListener('click', () => { setView({ hidden: [], order: [], widths: {} }); renderColumnList(); });
+    let dragCol = null;
+    $('#colList').addEventListener('dragstart', (e) => { dragCol = e.target.closest('.col-item')?.dataset.col; e.dataTransfer.effectAllowed = 'move'; });
+    $('#colList').addEventListener('dragover', (e) => {
+      const it = e.target.closest('.col-item');
+      if (!it || !dragCol) return;
+      e.preventDefault();
+      $$('.col-item.drag-over').forEach((x) => x.classList.remove('drag-over'));
+      it.classList.add('drag-over');
+    });
+    $('#colList').addEventListener('drop', (e) => {
+      const it = e.target.closest('.col-item');
+      if (it && dragCol) { e.preventDefault(); moveColumn(dragCol, it.dataset.col); renderColumnList(); }
+      dragCol = null;
+    });
+
+    // table header: sort, filter, resize, reorder
+    const thead = $('#thead');
+    thead.addEventListener('click', (e) => {
+      if (e.target.closest('.rz')) return;
+      const fb = e.target.closest('[data-filter]');
+      if (fb) { e.stopPropagation(); openFilterPop(fb.dataset.filter); return; }
+      const th = e.target.closest('.th[data-col]');
+      if (!th) return;
+      const key = th.dataset.col;
+      let sort = S.view.sort.slice();
+      const i = sort.findIndex((s) => s.key === key);
+      if (e.shiftKey) {
+        if (i < 0) sort.push({ key, dir: 'asc' });
+        else if (sort[i].dir === 'asc') sort[i] = { key, dir: 'desc' };
+        else sort.splice(i, 1);
+      } else {
+        const cur = i >= 0 ? sort[i].dir : null;
+        sort = cur === null ? [{ key, dir: key === 'modified' || key === 'created' ? 'desc' : 'asc' }]
+          : cur === (key === 'modified' || key === 'created' ? 'desc' : 'asc') ? [{ key, dir: cur === 'asc' ? 'desc' : 'asc' }] : [];
+      }
+      setView({ sort });
+    });
+    let resizing = null;
+    thead.addEventListener('pointerdown', (e) => {
+      const rz = e.target.closest('.rz');
+      if (!rz) return;
+      e.preventDefault();
+      e.stopPropagation();
+      rz.classList.add('active');
+      resizing = { col: rz.dataset.rz, x: e.clientX, w: colWidth(rz.dataset.rz), el: rz };
+      rz.setPointerCapture(e.pointerId);
+    });
+    thead.addEventListener('pointermove', (e) => {
+      if (!resizing) return;
+      const w = Math.max(60, Math.min(900, resizing.w + e.clientX - resizing.x));
+      S.view.widths = { ...S.view.widths, [resizing.col]: w };
+      renderHeaderWidthsOnly();
+    });
+    thead.addEventListener('pointerup', () => {
+      if (!resizing) return;
+      resizing.el.classList.remove('active');
+      resizing = null;
+      saveState();
+      scheduleRender(true);
+    });
+    thead.addEventListener('dblclick', (e) => {
+      const rz = e.target.closest('.rz');
+      if (!rz) return;
+      const w = { ...S.view.widths };
+      delete w[rz.dataset.rz];
+      setView({ widths: w });
+    });
+    let dragTh = null;
+    thead.addEventListener('dragstart', (e) => {
+      const th = e.target.closest('.th[data-col]');
+      if (!th || resizing) { e.preventDefault(); return; }
+      dragTh = th.dataset.col;
+      th.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    thead.addEventListener('dragover', (e) => {
+      const th = e.target.closest('.th[data-col]');
+      if (!th || !dragTh || th.dataset.col === 'id') return;
+      e.preventDefault();
+      $$('.th.drag-over').forEach((x) => x.classList.remove('drag-over'));
+      th.classList.add('drag-over');
+    });
+    thead.addEventListener('drop', (e) => {
+      const th = e.target.closest('.th[data-col]');
+      if (th && dragTh) { e.preventDefault(); moveColumn(dragTh, th.dataset.col); }
+    });
+    thead.addEventListener('dragend', () => { dragTh = null; $$('.th.dragging, .th.drag-over').forEach((x) => x.classList.remove('dragging', 'drag-over')); });
+
+    // body interactions
+    $('#tableWrap').addEventListener('scroll', () => scheduleRender(), { passive: true });
+    $('#cardsWrap').addEventListener('scroll', () => scheduleRender(), { passive: true });
+    window.addEventListener('resize', () => scheduleRender());
+    $('#tbody').addEventListener('click', (e) => {
+      const g = e.target.closest('.gr');
+      if (g) {
+        const k = g.dataset.group;
+        if (S.collapsed.has(k)) S.collapsed.delete(k); else S.collapsed.add(k);
+        scheduleRender(true);
+        return;
+      }
+      const tr = e.target.closest('.tr');
+      if (!tr) return;
+      if (e.target.closest('.cbcell')) { e.preventDefault(); toggleChecked(tr.dataset.id, e.shiftKey); return; }
+      openDrawer(tr.dataset.id);
+    });
+    $('#cards').addEventListener('click', (e) => {
+      const c = e.target.closest('.card');
+      if (!c) return;
+      if (e.target.closest('.card-cb')) { e.preventDefault(); toggleChecked(c.dataset.id, e.shiftKey); return; }
+      openDrawer(c.dataset.id);
+    });
+    $('#activity').addEventListener('click', (e) => {
+      if (e.target.id === 'moreActivity') { loadMoreActivity(); return; }
+      const a = e.target.closest('.act');
+      if (a) openDrawer(a.dataset.id);
+    });
+
+    // drawer
+    $('#dClose').addEventListener('click', closeDrawer);
+    $('#scrim').addEventListener('click', closeDrawer);
+    $$('.tab').forEach((t) => t.addEventListener('click', () => { drawerTab = t.dataset.tab; if (drawerData) renderDrawer(); }));
+    $('#dCopy').addEventListener('click', async () => {
+      const rec = drawerData?.record;
+      if (!rec) return;
+      const clean = Object.fromEntries(Object.entries(rec).filter(([k]) => k[0] !== '_'));
+      try { await navigator.clipboard.writeText(JSON.stringify(clean, null, 2)); toast('Copied JSON'); } catch { toast('Clipboard unavailable', 'error'); }
+    });
+    $('#dDelete').addEventListener('click', () => {
+      const id = S.selected;
+      modal({
+        title: 'Delete record?',
+        body: `<p>Delete <b>${esc(id)}</b> and all of its history? This cannot be undone.</p>`,
+        actions: [{ label: 'Cancel' }, { label: 'Delete', cls: 'danger solid', onClick: async () => {
+          try { await api('/api/records/' + encodeURIComponent(id), { method: 'DELETE' }); toast('Deleted ' + id); closeDrawer(); } catch (e) { toast(e.message, 'error'); }
+        } }],
+      });
+    });
+
+    // views
+    $('#viewSelect').addEventListener('change', (e) => applyNamedView(e.target.value));
+    $('#viewSave').addEventListener('click', () => {
+      modal({
+        title: 'Save view',
+        body: `<p>Saves the current filters, search, sorting, grouping, layout and columns.</p>
+          <label>View name<input class="input" id="viewName" value="${esc(S.viewName === 'Default' ? '' : S.viewName)}" placeholder="e.g. Stale devices"></label>`,
+        actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: () => {
+          const name = $('#viewName').value.trim() || 'Default';
+          S.views[name] = JSON.parse(JSON.stringify(S.view));
+          store.set('views', S.views);
+          S.viewName = name;
+          saveState();
+          renderViewSelect();
+          toast(`Saved view “${name}”`);
+        } }],
+      });
+      $('#viewName').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#mActions .primary').click(); });
+    });
+    $('#viewDelete').addEventListener('click', () => {
+      if (S.viewName === 'Default') return;
+      const name = S.viewName;
+      delete S.views[name];
+      store.set('views', S.views);
+      applyNamedView('Default');
+      toast(`Deleted view “${name}”`);
+    });
+
+    // keyboard
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        if (!$('#modalBack').hidden) closeModal();
+        else if (!$('#adminBack').hidden) window.CheckinAdmin?.close();
+        else if ($('.menu.open')) closeMenus();
+        else if (S.selected) closeDrawer();
+        else if (S.checked.size) clearChecked();
+      }
+      const typing = /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName) && document.activeElement.type !== 'checkbox';
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !typing && S.checked.size && $('#modalBack').hidden && $('#adminBack').hidden) {
+        e.preventDefault();
+        confirmDeleteChecked();
+      }
+      if (e.key === '/' && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) { e.preventDefault(); $('#search').focus(); }
+    });
+    $('#modalBack').addEventListener('click', (e) => { if (e.target.id === 'modalBack') closeModal(); });
+
+    // keep relative times and fresh/aging/stale buckets current
+    setInterval(() => {
+      scheduleRender(true);
+      if (S.selected && drawerData) renderDrawer();
+    }, 10_000);
+  }
+
+  function renderHeaderWidthsOnly() {
+    const cols = renderCols();
+    const tpl = gridTemplate(cols);
+    const w = totalWidth(cols) + 'px';
+    $('#thead').style.gridTemplateColumns = tpl;
+    $('#thead').style.width = w;
+    $('#tbody').style.width = w;
+    $$('#tbody .tr').forEach((r) => { r.style.gridTemplateColumns = tpl; });
+  }
+
+  // ------------------------------------------------------------------ init
+  async function init() {
+    applyTheme();
+    bind();
+    syncControls();
+    renderViewSelect();
+    updateLive();
+    try {
+      S.me = await apiJson('/api/auth/me');
+    } catch { return; }
+    try { S.config = await apiJson('/api/config'); } catch { /* ignore */ }
+    try { S.settings.staleMinutes = (await apiJson('/api/settings')).staleMinutes; } catch { /* ignore */ }
+    applyCaps();
+    connect();
+    try { await loadAll(); } catch (e) { if (e.message !== 'API key required') toast('Could not load records: ' + e.message, 'error'); }
+    if (S.view.layout === 'activity') loadActivity();
+  }
+  window.CheckinUI = { api, apiJson, modal, closeModal, toast, esc, nf, relTime, absTime, initials, state: S, can };
+  init();
+})();

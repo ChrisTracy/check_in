@@ -1,0 +1,5 @@
+# Normalize line endings in the repo; Dockerfile and shell-related files must stay LF.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary

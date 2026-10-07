@@ -1,0 +1,30 @@
+# docker compose up -d --build
+# Settings come from a .env file next to this one (see .env.example) or from the environment.
+services:
+  checkin:
+    build: .
+    image: check-in-api:latest
+    container_name: check-in
+    restart: unless-stopped
+    init: true                 # forwards SIGTERM so pending writes are flushed on stop
+    stop_grace_period: 20s
+    ports:
+      - "${PUBLISH_PORT:-3000}:3000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Fixed inside the container; change the published port above instead.
+      HOST: 0.0.0.0
+      PORT: 3000
+      DB_PATH: /app/data/checkin.db
+    volumes:
+      # Use a named volume (not a Windows folder bind mount): SQLite's WAL locking
+      # is unreliable on bind-mounted host folders under Docker Desktop.
+      - checkin-data:/app/data
+    # Run exactly ONE replica: SQLite is a single-writer, file-based database.
+    # deploy:
+    #   replicas: 1
+
+volumes:
+  checkin-data:
