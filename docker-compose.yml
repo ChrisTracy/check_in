@@ -3,7 +3,7 @@
 services:
   checkin:
     build: .
-    image: check-in-api:latest
+    image: check-in:latest
     container_name: check-in
     restart: unless-stopped
     init: true                 # forwards SIGTERM so pending writes are flushed on stop

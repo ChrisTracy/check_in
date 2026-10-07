@@ -63,7 +63,7 @@
 
   // ------------------------------------------------------------------ state
   const DEFAULT_VIEW = () => ({
-    search: '', filters: [], time: 0, status: 'all', sort: [{ key: 'modified', dir: 'desc' }],
+    search: '', filters: [], match: 'all', time: 0, status: 'all', sort: [{ key: 'modified', dir: 'desc' }],
     hidden: [], order: [], widths: {}, groupBy: '', layout: 'table',
   });
   const S = {
@@ -73,8 +73,8 @@
     fieldCounts: new Map(),
     fields: [],
     view: Object.assign(DEFAULT_VIEW(), store.get('view', {})),
-    viewName: store.get('viewName', 'Default'),
-    views: store.get('views', {}),
+    viewRef: store.get('viewRef', ''), // '' = Default, 'p:<id>' = personal view, 't:<id>' = team view
+    views: { personal: [], team: [] }, // saved views from the server
     settings: Object.assign({ theme: 'auto', compact: false }, store.get('settings', {}), { staleMinutes: 15 }),
     me: null, // { user, role, caps, csrf }
     checked: new Set(), // multi-selected record ids
@@ -187,6 +187,7 @@
       if (S.selected && ids.includes(S.selected)) closeDrawer();
       scheduleRender(true);
     });
+    es.addEventListener('views', () => loadViews());
     es.addEventListener('ingest', (e) => { S.ingest = JSON.parse(e.data); updateLive(); });
     es.addEventListener('reload', () => { S.checked.clear(); updateSelBar(); loadAll().catch(() => {}); });
     es.addEventListener('settings', (e) => {
@@ -254,20 +255,70 @@
   }
 
   // ------------------------------------------------------------------ filtering & sorting
+  // Filter conditions. `kinds` says which field types offer the condition:
+  //   text   – custom fields, ID and "Any field"
+  //   status – the computed Status column (active / aging / stale)
+  //   date   – Created and Modified
+  // fn(value, preparedFilter) → boolean. See prepareFilter() for the prepared values.
+  const isBlank = (v) => v === undefined || v === null || v === '';
   const OPS = {
-    contains: { label: 'contains', fn: (v, x) => show(v).toLowerCase().includes(x.toLowerCase()) },
-    ncontains: { label: 'does not contain', fn: (v, x) => !show(v).toLowerCase().includes(x.toLowerCase()) },
-    eq: { label: 'is', fn: (v, x) => show(v).toLowerCase() === x.toLowerCase() },
-    neq: { label: 'is not', fn: (v, x) => show(v).toLowerCase() !== x.toLowerCase() },
-    starts: { label: 'starts with', fn: (v, x) => show(v).toLowerCase().startsWith(x.toLowerCase()) },
-    gt: { label: '>', fn: (v, x) => cmpLoose(v, x) > 0 },
-    gte: { label: '≥', fn: (v, x) => cmpLoose(v, x) >= 0 },
-    lt: { label: '<', fn: (v, x) => cmpLoose(v, x) < 0 },
-    lte: { label: '≤', fn: (v, x) => cmpLoose(v, x) <= 0 },
-    regex: { label: 'matches regex', fn: (v, x, re) => re.test(show(v)) },
-    empty: { label: 'is empty', noValue: true, fn: (v) => v === undefined || v === null || v === '' },
-    nempty: { label: 'is not empty', noValue: true, fn: (v) => !(v === undefined || v === null || v === '') },
+    contains: { label: 'contains', kinds: ['text'], fn: (v, f) => show(v).toLowerCase().includes(f.lc) },
+    ncontains: { label: 'does not contain', kinds: ['text'], fn: (v, f) => !show(v).toLowerCase().includes(f.lc) },
+    eq: { label: 'is', kinds: ['text', 'status'], fn: (v, f) => show(v).toLowerCase() === f.lc },
+    neq: { label: 'is not', kinds: ['text', 'status'], fn: (v, f) => show(v).toLowerCase() !== f.lc },
+    starts: { label: 'starts with', kinds: ['text'], fn: (v, f) => show(v).toLowerCase().startsWith(f.lc) },
+    gt: { label: '>', kinds: ['text'], fn: (v, f) => cmpLoose(v, f.value) > 0 },
+    gte: { label: '≥', kinds: ['text'], fn: (v, f) => cmpLoose(v, f.value) >= 0 },
+    lt: { label: '<', kinds: ['text'], fn: (v, f) => cmpLoose(v, f.value) < 0 },
+    lte: { label: '≤', kinds: ['text'], fn: (v, f) => cmpLoose(v, f.value) <= 0 },
+    regex: { label: 'matches regex', kinds: ['text'], fn: (v, f) => f.re.test(show(v)) },
+    empty: { label: 'is empty', kinds: ['text'], noValue: true, fn: (v) => isBlank(v) },
+    nempty: { label: 'is not empty', kinds: ['text'], noValue: true, fn: (v) => !isBlank(v) },
+    within: { label: 'in the last', kinds: ['date'], value: 'duration', fn: (v, f) => Date.parse(v) >= f.now - f.ms },
+    older: { label: 'more than … ago', chip: 'more than', suffix: 'ago', kinds: ['date'], value: 'duration', fn: (v, f) => Date.parse(v) < f.now - f.ms },
+    after: { label: 'after', kinds: ['date'], value: 'datetime', fn: (v, f) => Date.parse(v) > f.t },
+    before: { label: 'before', kinds: ['date'], value: 'datetime', fn: (v, f) => Date.parse(v) < f.t },
+    on: { label: 'on', kinds: ['date'], value: 'date', fn: (v, f) => { const t = Date.parse(v); return t >= f.t && t < f.t2; } },
   };
+  const DATE_FIELDS = new Set(['created', 'modified']);
+  const fieldKind = (field) => (field === STATUS_KEY ? 'status' : DATE_FIELDS.has(field) ? 'date' : 'text');
+  const DEFAULT_OP = { text: 'contains', status: 'eq', date: 'within' };
+  const UNITS = { m: ['minute', 60000], h: ['hour', 3600000], d: ['day', 86400000] };
+  function parseDuration(s) {
+    const m = /^(\d+(?:\.\d+)?)([mhd])$/.exec(String(s ?? '').trim());
+    return m ? { n: Number(m[1]), unit: m[2], ms: Number(m[1]) * UNITS[m[2]][1] } : null;
+  }
+  const durationLabel = (s) => { const d = parseDuration(s); return d ? `${d.n} ${UNITS[d.unit][0]}${d.n === 1 ? '' : 's'}` : s; };
+  function localDayRange(ymd) {
+    const [y, m, d] = String(ymd).split('-').map(Number);
+    return [new Date(y, m - 1, d).getTime(), new Date(y, m - 1, d + 1).getTime()];
+  }
+
+  /** Precompute what a filter needs once per render. Returns null for an unusable filter (it's then ignored). */
+  function prepareFilter(f, now) {
+    const op = OPS[f.op];
+    if (!op) return null;
+    const p = { ...f, fn: op.fn, lc: String(f.value ?? '').toLowerCase(), now };
+    if (f.op === 'regex') { try { p.re = new RegExp(f.value, 'i'); } catch { return null; } }
+    if (op.value === 'duration') { const d = parseDuration(f.value); if (!d) return null; p.ms = d.ms; }
+    if (op.value === 'datetime') { p.t = new Date(f.value).getTime(); if (!Number.isFinite(p.t)) return null; }
+    if (op.value === 'date') { [p.t, p.t2] = localDayRange(f.value); if (!Number.isFinite(p.t)) return null; }
+    return p;
+  }
+
+  /** Human-readable pieces of a filter for chips: [field, condition, value]. */
+  function describeFilter(f) {
+    const op = OPS[f.op];
+    const field = f.field === '*' ? 'Any field' : colLabel(f.field);
+    if (!op) return [field, f.op, f.value];
+    if (op.noValue) return [field, op.label, ''];
+    let value = f.value;
+    if (f.field === STATUS_KEY) value = statusLabel(f.value);
+    else if (op.value === 'duration') value = durationLabel(f.value) + (op.suffix ? ' ' + op.suffix : '');
+    else if (op.value === 'datetime') value = new Date(f.value).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+    else if (op.value === 'date') value = new Date(localDayRange(f.value)[0]).toLocaleDateString([], { dateStyle: 'medium' });
+    return [field, op.chip || op.label, value];
+  }
   function cmpLoose(a, b) {
     if (a === undefined || a === null || a === '') return NaN;
     if (isNumeric(a) && isNumeric(b)) return Number(a) - Number(b);
@@ -281,8 +332,17 @@
     return collator.compare(show(a), show(b));
   }
   const STATUS_RANK = { fresh: 0, aging: 1, stale: 2 };
+  // Internal status keys stay the same (saved views use them); this is what people see.
+  const STATUS_LABEL = { fresh: 'active', aging: 'aging', stale: 'stale' };
+  const statusLabel = (k) => STATUS_LABEL[k] || k;
+  const cap = (t) => t.charAt(0).toUpperCase() + t.slice(1);
+  // Sorting uses the status rank (active < aging < stale); filtering uses the status key.
   function getVal(rec, key, now) {
     if (key === STATUS_KEY) return STATUS_RANK[statusOf(rec, now)];
+    return rec[key];
+  }
+  function getFilterVal(rec, key, now) {
+    if (key === STATUS_KEY) return statusOf(rec, now);
     return rec[key];
   }
 
@@ -291,11 +351,7 @@
     const now = Date.now();
     const q = v.search.trim().toLowerCase();
     const terms = q ? q.split(/\s+/) : [];
-    const filters = v.filters.map((f) => {
-      let re = null;
-      if (f.op === 'regex') { try { re = new RegExp(f.value, 'i'); } catch { re = /$^/; } }
-      return { ...f, fn: OPS[f.op]?.fn || (() => true), re };
-    });
+    const filters = v.filters.map((f) => prepareFilter(f, now)).filter(Boolean);
     const timeMs = Math.abs(v.time) * 60000;
     const counts = { all: 0, fresh: 0, aging: 0, stale: 0, rate: 0 };
     const out = [];
@@ -311,15 +367,17 @@
         const hay = S.searchText.get(rec.id);
         if (!terms.every((t) => hay.includes(t))) continue;
       }
-      let ok = true;
-      for (const f of filters) {
+      // Filter chips: "all" = every chip must match (AND), "any" = at least one (OR).
+      // Search, the status card and the time filter always narrow the results.
+      const test = (f) => {
         if (f.field === '*') {
-          const keys = Object.keys(rec).filter((k) => k[0] !== '_');
-          if (f.op === 'ncontains' || f.op === 'neq' || f.op === 'empty') ok = keys.every((k) => f.fn(rec[k], f.value, f.re));
-          else ok = keys.some((k) => f.fn(rec[k], f.value, f.re));
-        } else ok = f.fn(getVal(rec, f.field, now), f.value, f.re);
-        if (!ok) break;
-      }
+          const keys = Object.keys(rec).filter((k) => k[0] !== '_' && k !== 'created' && k !== 'modified');
+          if (f.op === 'ncontains' || f.op === 'neq' || f.op === 'empty') return keys.every((k) => f.fn(rec[k], f));
+          return keys.some((k) => f.fn(rec[k], f));
+        }
+        return f.fn(getFilterVal(rec, f.field, now), f);
+      };
+      const ok = !filters.length || (v.match === 'any' ? filters.some(test) : filters.every(test));
       if (ok) out.push(rec);
     }
     const sorts = v.sort.filter((s) => s.key);
@@ -377,7 +435,9 @@
     const hidden = new Set(S.view.hidden);
     return orderedColumns().filter((c) => c === 'id' || !hidden.has(c));
   }
-  const colLabel = (c) => (c === STATUS_KEY ? 'Status' : c === 'id' ? 'ID' : c === 'created' ? 'Created' : c === 'modified' ? 'Modified' : c);
+  // If the data has its own "status" field, label the built-in one distinctly.
+  const builtinStatusLabel = () => (S.fields.some((f) => f.toLowerCase() === 'status') ? 'Status (check-in)' : 'Status');
+  const colLabel = (c) => (c === STATUS_KEY ? builtinStatusLabel() : c === 'id' ? 'ID' : c === 'created' ? 'Created' : c === 'modified' ? 'Modified' : c);
   const SEL_KEY = '__sel';
   const canSelect = () => can('delete') || can('export');
   function renderCols() { return canSelect() ? [SEL_KEY, ...visibleColumns()] : visibleColumns(); }
@@ -441,10 +501,16 @@
   function renderChips() {
     const v = S.view;
     const chips = [];
-    if (v.status !== 'all') chips.push(`<span class="chip"><span class="op">status</span><b>${esc(v.status)}</b><button data-rm="status">${icon(ICON.x)}</button></span>`);
+    if (v.status !== 'all') chips.push(`<span class="chip"><span class="op">status</span><b>${esc(statusLabel(v.status))}</b><button data-rm="status">${icon(ICON.x)}</button></span>`);
+    const anyMode = v.match === 'any';
+    if (v.filters.length > 1) {
+      chips.push(`<span class="seg text match-seg" title="How filter chips combine"><button data-match="all" class="${anyMode ? '' : 'active'}">Match all</button><button data-match="any" class="${anyMode ? 'active' : ''}">Match any</button></span>`);
+    }
     v.filters.forEach((f, i) => {
-      const op = OPS[f.op];
-      chips.push(`<span class="chip" title="Click × to remove"><b>${esc(f.field === '*' ? 'Any field' : colLabel(f.field))}</b><span class="op">${esc(op ? op.label : f.op)}</span>${op && !op.noValue ? `<b>${esc(f.value)}</b>` : ''}<button data-rm="f${i}">${icon(ICON.x)}</button></span>`);
+      if (i > 0) chips.push(`<span class="chip-join">${anyMode ? 'or' : 'and'}</span>`);
+      const [fl, ol, vl] = describeFilter(f);
+      const bad = !prepareFilter(f, Date.now());
+      chips.push(`<span class="chip${bad ? ' bad' : ''}" data-edit="${i}" title="${bad ? 'This filter is invalid and is ignored. ' : ''}Click to edit · × to remove"><b>${esc(fl)}</b><span class="op">${esc(ol)}</span>${vl !== '' ? `<b>${esc(vl)}</b>` : ''}<button data-rm="f${i}" title="Remove filter">${icon(ICON.x)}</button></span>`);
     });
     if (chips.length || v.search || v.time) chips.push('<span class="chip clear" data-rm="all">Clear filters</span>');
     $('#chips').innerHTML = chips.join('');
@@ -501,7 +567,7 @@
     if (c === SEL_KEY) return `<div class="td cbcell"><input type="checkbox" class="cb" tabindex="-1" aria-label="Select ${esc(rec.id)}" ${S.checked.has(rec.id) ? 'checked' : ''}></div>`;
     if (c === STATUS_KEY) {
       const st = statusOf(rec, now);
-      return `<div class="td"><span class="pill ${st === 'fresh' ? 'good' : st === 'aging' ? 'warn' : 'bad'}"><i class="dot ${st}" style="box-shadow:none;margin-right:6px"></i>${st}</span></div>`;
+      return `<div class="td"><span class="pill ${st === 'fresh' ? 'good' : st === 'aging' ? 'warn' : 'bad'}"><i class="dot ${st}" style="box-shadow:none;margin-right:6px"></i>${statusLabel(st)}</span></div>`;
     }
     if (c === 'id') return `<div class="td id" title="${esc(rec.id)}">${esc(rec.id)}</div>`;
     if (c === 'modified') return `<div class="td rel" title="${esc(absTime(rec.modified))}">${esc(relTime(rec.modified, now))}</div>`;
@@ -549,7 +615,7 @@
       if (it.g) {
         const g = it.g;
         html += `<div class="gr ${S.collapsed.has(g.key) ? 'collapsed' : ''}" data-group="${esc(g.key)}" style="transform:translateY(${y}px)">${icon(ICON.chev)}
-          ${S.view.groupBy === STATUS_KEY ? `<i class="dot ${esc(g.key)}"></i>` : ''}<span>${g.key === '' ? '<span class="muted">(empty)</span>' : esc(g.key)}</span>
+          ${S.view.groupBy === STATUS_KEY ? `<i class="dot ${esc(g.key)}"></i>` : ''}<span>${g.key === '' ? '<span class="muted">(empty)</span>' : esc(S.view.groupBy === STATUS_KEY ? statusLabel(g.key) : g.key)}</span>
           <span class="count">${nf.format(g.rows.length)}</span>
           <span class="mini"><span><i class="dot fresh"></i>${g.st.fresh}</span><span><i class="dot aging"></i>${g.st.aging}</span><span><i class="dot stale"></i>${g.st.stale}</span></span></div>`;
       } else {
@@ -591,7 +657,7 @@
     for (const row of rows) {
       if (row.y + row.h < top || row.y > bottom) continue;
       if (row.g) {
-        html += `<div class="card-group" style="top:${row.y}px;left:16px;right:16px">${S.view.groupBy === STATUS_KEY ? `<i class="dot ${esc(row.g.key)}"></i>` : ''}${row.g.key === '' ? '<span class="muted">(empty)</span>' : esc(row.g.key)} <span class="count">${row.g.rows.length}</span></div>`;
+        html += `<div class="card-group" style="top:${row.y}px;left:16px;right:16px">${S.view.groupBy === STATUS_KEY ? `<i class="dot ${esc(row.g.key)}"></i>` : ''}${row.g.key === '' ? '<span class="muted">(empty)</span>' : esc(S.view.groupBy === STATUS_KEY ? statusLabel(row.g.key) : row.g.key)} <span class="count">${row.g.rows.length}</span></div>`;
         continue;
       }
       row.cards.forEach((r, i) => {
@@ -692,7 +758,7 @@
     $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === drawerTab));
     if (!record) { $('#dBody').innerHTML = '<div class="muted">Record no longer exists.</div>'; return; }
     const st = statusOf(record, now);
-    $('#dSub').innerHTML = `<i class="dot ${st}"></i> ${st} · last check-in ${esc(relTime(record.modified, now))} · version ${record._version}`;
+    $('#dSub').innerHTML = `<i class="dot ${st}"></i> ${statusLabel(st)} · last check-in ${esc(relTime(record.modified, now))} · version ${record._version}`;
     if (drawerTab === 'fields') {
       const keys = Object.keys(record).filter((k) => !SYS.includes(k) && k[0] !== '_').sort(collator.compare);
       const val = (v) => (typeof v === 'object' && v !== null ? `<pre>${esc(JSON.stringify(v, null, 2))}</pre>` : pillClass(v) ? `<span class="pill ${pillClass(v)}">${esc(show(v))}</span>` : esc(show(v)));
@@ -749,30 +815,158 @@
   function closeModal() { $('#modalBack').hidden = true; }
 
   // ------------------------------------------------------------------ views
+  // Saved views live on the server: personal views belong to your account,
+  // team views are shared with everyone and managed by power users and admins.
   function saveState() {
     store.set('view', S.view);
-    store.set('viewName', S.viewName);
+    store.set('viewRef', S.viewRef);
   }
   function setView(patch, compute = true) {
     Object.assign(S.view, patch);
     saveState();
+    updateViewDirty();
     scheduleRender(compute);
   }
-  function renderViewSelect() {
-    const names = ['Default', ...Object.keys(S.views).filter((n) => n !== 'Default').sort(collator.compare)];
-    $('#viewSelect').innerHTML = names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
-    $('#viewSelect').value = names.includes(S.viewName) ? S.viewName : 'Default';
-    $('#viewDelete').disabled = S.viewName === 'Default';
-    $('#viewDelete').style.opacity = S.viewName === 'Default' ? .4 : 1;
+  const viewRef = (v) => (v.scope === 'team' ? 't:' : 'p:') + v.id;
+  function findView(ref) {
+    if (!ref) return null;
+    const list = ref[0] === 't' ? S.views.team : S.views.personal;
+    return list.find((v) => viewRef(v) === ref) || null;
   }
-  function applyNamedView(name) {
-    S.viewName = name;
-    const saved = name === 'Default' ? (S.views.Default || DEFAULT_VIEW()) : S.views[name];
-    S.view = Object.assign(DEFAULT_VIEW(), JSON.parse(JSON.stringify(saved || {})));
+  const canWriteView = (v) => Boolean(v) && (v.scope === 'personal' || can('teamViews'));
+  // Comparable form of a view state (fills in defaults so old and new states line up).
+  const viewKey = (st) => JSON.stringify(Object.assign(DEFAULT_VIEW(), JSON.parse(JSON.stringify(st || {}))));
+  function updateViewDirty() {
+    const saved = findView(S.viewRef);
+    const dirty = saved ? viewKey(saved.state) !== viewKey(S.view) : false;
+    $('#viewSave').classList.toggle('dirty', dirty);
+    $('#viewSave').title = dirty ? 'Save view (you have unsaved changes)' : 'Save view';
+  }
+  function renderViewSelect() {
+    if (S.viewsLoaded && S.viewRef && !findView(S.viewRef)) { S.viewRef = ''; saveState(); }
+    const opt = (v) => `<option value="${viewRef(v)}" title="${esc(v.scope === 'team' ? `Updated by ${v.updatedBy || 'unknown'}` : 'Only you can see this view')}">${esc(v.name)}</option>`;
+    const { personal, team } = S.views;
+    $('#viewSelect').innerHTML = '<option value="">Default</option>'
+      + (personal.length ? `<optgroup label="My views">${personal.map(opt).join('')}</optgroup>` : '')
+      + (team.length ? `<optgroup label="Team views">${team.map(opt).join('')}</optgroup>` : '');
+    $('#viewSelect').value = findView(S.viewRef) ? S.viewRef : '';
+    const del = canWriteView(findView(S.viewRef));
+    $('#viewDelete').disabled = !del;
+    $('#viewDelete').style.opacity = del ? 1 : .4;
+    $('#viewDelete').title = del ? 'Delete view' : S.viewRef ? 'Only power users and admins can delete team views' : 'Delete view';
+    updateViewDirty();
+  }
+  function applyNamedView(ref) {
+    S.viewRef = ref;
+    const saved = findView(ref);
+    S.view = Object.assign(DEFAULT_VIEW(), JSON.parse(JSON.stringify(saved ? saved.state : {})));
+    S.collapsed.clear();
     syncControls();
     saveState();
     renderViewSelect();
     scheduleRender(true);
+  }
+  async function loadViews() {
+    try {
+      const r = await apiJson('/api/views');
+      S.views = { personal: r.personal || [], team: r.team || [] };
+      S.viewsLoaded = true;
+    } catch { /* keep what we have */ }
+    renderViewSelect();
+  }
+  // One-time move of views saved in this browser (older versions) to the account.
+  async function migrateLocalViews() {
+    let legacy;
+    try { legacy = JSON.parse(localStorage.getItem('checkin.views') || 'null'); } catch { legacy = null; }
+    if (!legacy || typeof legacy !== 'object' || S.me?.kind !== 'session') return;
+    const oldName = store.get('viewName', '');
+    let moved = 0;
+    for (const [name, state] of Object.entries(legacy)) {
+      const n = name.toLowerCase() === 'default' ? 'My default' : name;
+      if (S.views.personal.some((v) => v.name.toLowerCase() === n.toLowerCase())) continue;
+      try {
+        const r = await apiJson('/api/views', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ scope: 'personal', name: n, state }) });
+        S.views.personal.push(r.view);
+        if (name === oldName) S.viewRef = viewRef(r.view);
+        moved++;
+      } catch { /* skip invalid entries */ }
+    }
+    try { localStorage.removeItem('checkin.views'); localStorage.removeItem('checkin.viewName'); } catch { /* ignore */ }
+    S.views.personal.sort((a, b) => collator.compare(a.name, b.name));
+    saveState();
+    renderViewSelect();
+    if (moved) toast(`Moved ${moved} saved view${moved === 1 ? '' : 's'} from this browser to your account`);
+  }
+  function openSaveView() {
+    const cur = findView(S.viewRef);
+    const teamOk = can('teamViews');
+    const personalOk = S.me?.kind === 'session' || Boolean(S.me?.user?.id);
+    let scope = cur && canWriteView(cur) ? cur.scope : (personalOk ? 'personal' : 'team');
+    let confirmReplace = null;
+    modal({
+      title: 'Save view',
+      body: `<p>Saves the current filters, search, sorting, grouping, layout and columns.</p>
+        <label>View name<input class="input" id="viewName" maxlength="80" value="${esc(cur ? cur.name : '')}" placeholder="e.g. Stale devices"></label>
+        <div class="scope-label">Save to</div>
+        <div class="scope-pick" id="viewScope">
+          <button type="button" data-scope="personal" ${personalOk ? '' : 'disabled'}><b>My views</b><small>Only you can see it</small></button>
+          <button type="button" data-scope="team" ${teamOk ? '' : 'disabled title="Requires the Power user role"'}><b>Team views</b><small>${teamOk ? 'Everyone can see it' : 'Power users and admins only'}</small></button>
+        </div>
+        <div class="pop-error" id="viewErr" hidden></div>`,
+      actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', id: 'viewSaveBtn', onClick: async () => {
+        const name = $('#viewName').value.trim();
+        const err = $('#viewErr');
+        const fail = (m) => { err.textContent = m; err.hidden = false; return false; };
+        if (!name) return fail('Enter a name for the view.');
+        if (name.toLowerCase() === 'default') return fail('“Default” is reserved. Pick another name.');
+        const clash = S.views[scope].find((v) => v.name.toLowerCase() === name.toLowerCase());
+        if (clash && clash !== cur && confirmReplace !== clash) {
+          confirmReplace = clash;
+          $('#viewSaveBtn').textContent = 'Replace';
+          return fail(`${scope === 'team' ? 'A team view' : 'One of your views'} is already called “${clash.name}”. Click Replace to overwrite it.`);
+        }
+        try {
+          const r = await apiJson('/api/views', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ scope, name, state: S.view }) });
+          const list = S.views[scope].filter((v) => v.id !== r.view.id);
+          list.push(r.view);
+          list.sort((a, b) => collator.compare(a.name, b.name));
+          S.views[scope] = list;
+          S.viewRef = viewRef(r.view);
+          saveState();
+          renderViewSelect();
+          toast(scope === 'team' ? `Saved team view “${r.view.name}” for everyone` : `Saved view “${r.view.name}”`);
+        } catch (e) { return fail(e.message); }
+      } }],
+    });
+    const paint = () => $$('#viewScope button').forEach((b) => b.classList.toggle('active', b.dataset.scope === scope));
+    paint();
+    $('#viewScope').addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-scope]');
+      if (!b || b.disabled) return;
+      scope = b.dataset.scope; confirmReplace = null;
+      $('#viewSaveBtn').textContent = 'Save'; $('#viewErr').hidden = true;
+      paint();
+    });
+    $('#viewName').addEventListener('input', () => { confirmReplace = null; $('#viewSaveBtn').textContent = 'Save'; $('#viewErr').hidden = true; });
+    $('#viewName').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#viewSaveBtn').click(); });
+  }
+  function deleteCurrentView() {
+    const v = findView(S.viewRef);
+    if (!canWriteView(v)) return;
+    modal({
+      title: v.scope === 'team' ? 'Delete team view?' : 'Delete view?',
+      body: `<p>Delete <b>${esc(v.name)}</b>?${v.scope === 'team' ? ' It will be removed for everyone.' : ''} Your current filters stay as they are.</p>`,
+      actions: [{ label: 'Cancel' }, { label: 'Delete', cls: 'danger', onClick: async () => {
+        try {
+          await apiJson(`/api/views/${v.id}`, { method: 'DELETE' });
+          S.views[v.scope] = S.views[v.scope].filter((x) => x.id !== v.id);
+          S.viewRef = '';
+          saveState();
+          renderViewSelect();
+          toast(`Deleted view “${v.name}”`);
+        } catch (e) { toast(e.message, 'error'); return false; }
+      } }],
+    });
   }
   function syncControls() {
     $('#search').value = S.view.search;
@@ -983,11 +1177,11 @@
     modal({
       title: 'Settings',
       body: `<div class="row">
-          <label>Fresh threshold (minutes)<input class="input" id="setStale" type="number" min="1" value="${S.settings.staleMinutes}" ${canThreshold ? '' : 'disabled title="Requires the Power user role"'}></label>
+          <label>Active threshold (minutes)<input class="input" id="setStale" type="number" min="1" value="${S.settings.staleMinutes}" ${canThreshold ? '' : 'disabled title="Requires the Power user role"'}></label>
           <label>Theme<select class="select" id="setTheme">
             ${['auto', 'light', 'dark'].map((t) => `<option ${S.settings.theme === t ? 'selected' : ''} value="${t}">${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}</select></label>
         </div>
-        <p style="font-size:12px">Records are <b>fresh</b> within the threshold, <b>aging</b> up to 2×, and <b>stale</b> after that.
+        <p style="font-size:12px">Records are <b>active</b> within the threshold, <b>aging</b> up to 2×, and <b>stale</b> after that.
         ${canThreshold ? 'The threshold applies to everyone.' : 'Only power users and admins can change the threshold.'}</p>
         <p style="font-size:12px">Server keeps <b>${S.config.historyLimit < 0 ? 'unlimited' : S.config.historyLimit}</b> history entries per record (HISTORY_LIMIT).</p>`,
       actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
@@ -999,7 +1193,7 @@
           try {
             const r = await apiJson('/api/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ staleMinutes: m }) });
             S.settings.staleMinutes = r.staleMinutes;
-            toast('Fresh threshold updated for everyone');
+            toast('Active threshold updated for everyone');
           } catch (e) { toast(e.message, 'error'); return false; }
         }
         scheduleRender(true);
@@ -1016,49 +1210,128 @@
   }
 
   // ------------------------------------------------------------------ filter popover
+  let editIndex = null; // index of the filter being edited, or null when adding
   function fieldOptions() { return [STATUS_KEY, 'id', ...S.fields, 'modified', 'created']; }
-  function openFilterPop(field) {
+
+  function openFilterPop(field, index = null) {
     closeMenus();
-    const pop = $('#filterPop');
+    editIndex = index;
+    const existing = index !== null ? S.view.filters[index] : null;
     const fsel = $('#fField');
-    fsel.innerHTML = `<option value="*">Any field</option>` + fieldOptions().filter((f) => f !== STATUS_KEY)
-      .map((f) => `<option value="${esc(f)}">${esc(colLabel(f))}</option>`).join('');
-    $('#fOp').innerHTML = Object.entries(OPS).map(([k, o]) => `<option value="${k}">${esc(o.label)}</option>`).join('');
-    if (field === STATUS_KEY) {
-      pop.classList.add('open');
-      fsel.value = '*';
-      $('#fFacets').innerHTML = ['fresh', 'aging', 'stale'].map((s) => `<button class="facet" data-status="${s}">${s} <span>${S.counts[s]}</span></button>`).join('');
-      return;
-    }
-    fsel.value = field && fieldOptions().includes(field) ? field : '*';
-    $('#fOp').value = 'contains';
-    $('#fValue').value = '';
-    updateFacets();
-    pop.classList.add('open');
-    setTimeout(() => $('#fValue').focus(), 20);
+    const opts = fieldOptions();
+    if (existing && existing.field !== '*' && !opts.includes(existing.field)) opts.push(existing.field);
+    fsel.innerHTML = '<option value="*">Any field</option>' + opts.map((f) => `<option value="${esc(f)}">${esc(colLabel(f))}</option>`).join('');
+    fsel.value = existing ? existing.field : (field && opts.includes(field) ? field : '*');
+    $('#fTitle').textContent = existing ? 'Edit filter' : 'Add filter';
+    $('#fAdd').textContent = existing ? 'Update filter' : 'Add filter';
+    renderOps(existing?.op);
+    renderValue(existing?.value);
+    $('#filterPop').classList.add('open');
+    setTimeout(() => $('#fValueBox input, #fValueBox select')?.focus(), 20);
   }
-  function updateFacets() {
+
+  function currentKind() { const f = $('#fField').value; return f === '*' ? 'text' : fieldKind(f); }
+
+  function renderOps(preferred) {
+    const kind = currentKind();
+    const ops = Object.entries(OPS).filter(([, o]) => o.kinds.includes(kind));
+    $('#fOp').innerHTML = ops.map(([k, o]) => `<option value="${k}">${esc(o.label)}</option>`).join('');
+    $('#fOp').value = preferred && OPS[preferred]?.kinds.includes(kind) ? preferred : DEFAULT_OP[kind];
+  }
+
+  function renderValue(preset) {
     const field = $('#fField').value;
+    const kind = currentKind();
     const op = OPS[$('#fOp').value];
-    $('#fValueWrap').hidden = !!op?.noValue;
-    const counts = new Map();
-    if (field !== '*' && field !== 'created' && field !== 'modified') {
-      for (const r of S.records.values()) {
-        const v = show(r[field]);
-        if (v === '') continue;
-        counts.set(v, (counts.get(v) || 0) + 1);
-        if (counts.size > 2000) break;
+    const box = $('#fValueBox');
+    $('#fError').hidden = true;
+    $('#fValueWrap').hidden = Boolean(op?.noValue);
+    let facets = '';
+    if (kind === 'status') {
+      const val = preset || 'fresh';
+      box.innerHTML = `<select class="select" id="fStatus">${['fresh', 'aging', 'stale'].map((k) => `<option value="${k}" ${k === val ? 'selected' : ''}>${cap(statusLabel(k))} (${nf.format(S.counts[k] || 0)})</option>`).join('')}</select>`;
+      facets = ['fresh', 'aging', 'stale'].map((k) => `<button class="facet" data-op="eq" data-value="${k}"><i class="dot ${k}"></i> ${statusLabel(k)}<span>${nf.format(S.counts[k] || 0)}</span></button>`).join('');
+    } else if (op?.value === 'duration') {
+      const d = parseDuration(preset) || { n: 15, unit: 'm' };
+      box.innerHTML = `<div class="fv-row"><input class="input" id="fNum" type="number" min="1" step="1" value="${d.n}">
+        <select class="select" id="fUnit">${Object.entries(UNITS).map(([u, [l]]) => `<option value="${u}" ${u === d.unit ? 'selected' : ''}>${l}s</option>`).join('')}</select>
+        ${op.suffix ? `<span class="muted">${op.suffix}</span>` : ''}</div>`;
+    } else if (op?.value === 'datetime') {
+      const pad = (n) => String(n).padStart(2, '0');
+      const d = new Date();
+      const def = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      box.innerHTML = `<input class="input" id="fDateTime" type="datetime-local" value="${esc(preset || def)}">`;
+    } else if (op?.value === 'date') {
+      const d = new Date();
+      const def = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      box.innerHTML = `<input class="input" id="fDate" type="date" value="${esc(preset || def)}">`;
+    } else {
+      box.innerHTML = `<input class="input" id="fValue" list="fValues" autocomplete="off" value="${esc(preset ?? '')}" placeholder="${op?.label === 'matches regex' ? 'e.g. ^(Dallas|Austin)$' : ''}"><datalist id="fValues"></datalist>`;
+      if (field !== '*') {
+        const counts = new Map();
+        for (const r of S.records.values()) {
+          const v = show(r[field]);
+          if (v === '') continue;
+          counts.set(v, (counts.get(v) || 0) + 1);
+          if (counts.size > 2000) break;
+        }
+        const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 30);
+        $('#fValues').innerHTML = top.map(([v]) => `<option value="${esc(v)}">`).join('');
+        if (top.length && counts.size > 1) {
+          facets = top.map(([v, n]) => `<button class="facet" data-op="eq" data-value="${esc(v)}" title="${esc(v)}">${esc(v.length > 30 ? v.slice(0, 30) + '…' : v)}<span>${n}</span></button>`).join('');
+        }
       }
     }
-    const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 30);
-    $('#fValues').innerHTML = top.map(([v]) => `<option value="${esc(v)}">`).join('');
-    $('#fFacets').innerHTML = top.length && counts.size > 1
-      ? top.map(([v, n]) => `<button class="facet" data-value="${esc(v)}" title="${esc(v)}">${esc(v.length > 30 ? v.slice(0, 30) + '…' : v)}<span>${n}</span></button>`).join('') : '';
+    if (kind === 'date') {
+      const presets = [['within', '15m', 'Last 15 min'], ['within', '1h', 'Last hour'], ['within', '24h', 'Last 24 hours'], ['within', '7d', 'Last 7 days'], ['older', '1h', 'Over an hour ago'], ['older', '1d', 'Over a day ago']];
+      facets = presets.map(([o, v, l]) => `<button class="facet" data-op="${o}" data-value="${v}">${l}</button>`).join('');
+    }
+    $('#fFacets').innerHTML = facets;
+    box.querySelectorAll('input').forEach((el) => el.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitFilter(); }));
   }
-  function addFilter(field, op, value) {
-    if (!OPS[op]?.noValue && value === '') return;
-    setView({ filters: [...S.view.filters, { field, op, value }] });
+
+  /** Read the value control. Returns the value string, or throws an Error with a message for the user. */
+  function readValue() {
+    const op = OPS[$('#fOp').value];
+    if (!op) throw new Error('Choose a condition');
+    if (op.noValue) return '';
+    if (currentKind() === 'status') return $('#fStatus').value;
+    if (op.value === 'duration') {
+      const n = Number($('#fNum').value);
+      if (!(n > 0)) throw new Error('Enter a number greater than 0');
+      return `${n}${$('#fUnit').value}`;
+    }
+    if (op.value === 'datetime') {
+      const v = $('#fDateTime').value;
+      if (!v || !Number.isFinite(new Date(v).getTime())) throw new Error('Pick a date and time');
+      return v;
+    }
+    if (op.value === 'date') {
+      const v = $('#fDate').value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) throw new Error('Pick a date');
+      return v;
+    }
+    const v = $('#fValue').value;
+    if (v === '') throw new Error('Enter a value');
+    if ($('#fOp').value === 'regex') { try { new RegExp(v, 'i'); } catch (e) { throw new Error('Invalid regex: ' + e.message); } }
+    return v;
+  }
+
+  function saveFilter(f) {
+    const filters = S.view.filters.slice();
+    if (editIndex !== null && filters[editIndex]) filters[editIndex] = f; else filters.push(f);
+    editIndex = null;
+    setView({ filters });
     closeMenus();
+  }
+
+  function submitFilter() {
+    try {
+      saveFilter({ field: $('#fField').value, op: $('#fOp').value, value: readValue() });
+    } catch (e) {
+      $('#fError').textContent = e.message;
+      $('#fError').hidden = false;
+    }
   }
 
   // ------------------------------------------------------------------ columns popover
@@ -1139,9 +1412,13 @@
     }));
 
     $('#chips').addEventListener('click', (e) => {
+      const m = e.target.closest('[data-match]')?.dataset.match;
+      if (m) { if (m !== S.view.match) setView({ match: m }); return; }
       const rm = e.target.closest('[data-rm]')?.dataset.rm;
+      const edit = e.target.closest('[data-edit]')?.dataset.edit;
+      if (!rm && edit !== undefined) { e.stopPropagation(); openFilterPop(null, Number(edit)); return; }
       if (!rm) return;
-      if (rm === 'all') { setView({ filters: [], status: 'all', search: '', time: 0 }); syncControls(); }
+      if (rm === 'all') { setView({ filters: [], match: 'all', status: 'all', search: '', time: 0 }); syncControls(); }
       else if (rm === 'status') setView({ status: 'all' });
       else setView({ filters: S.view.filters.filter((_, i) => 'f' + i !== rm) });
     });
@@ -1185,15 +1462,18 @@
     $('#clearBtn').addEventListener('click', confirmClearAll);
 
     // filter popover
-    $('#fField').addEventListener('change', updateFacets);
-    $('#fOp').addEventListener('change', updateFacets);
-    $('#fAdd').addEventListener('click', () => addFilter($('#fField').value, $('#fOp').value, $('#fValue').value));
-    $('#fValue').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#fAdd').click(); });
+    $('#fField').addEventListener('change', () => { renderOps(); renderValue(); });
+    $('#fOp').addEventListener('change', () => {
+      // Keep what was typed when switching between conditions of the same value type.
+      const prev = $('#fValue')?.value;
+      renderValue(OPS[$('#fOp').value]?.value ? undefined : prev);
+    });
+    $('#fAdd').addEventListener('click', submitFilter);
+    $('#fCancel').addEventListener('click', () => { editIndex = null; closeMenus(); });
     $('#fFacets').addEventListener('click', (e) => {
       const b = e.target.closest('.facet');
       if (!b) return;
-      if (b.dataset.status) { setView({ status: b.dataset.status }); closeMenus(); return; }
-      addFilter($('#fField').value, 'eq', b.dataset.value);
+      saveFilter({ field: $('#fField').value, op: b.dataset.op, value: b.dataset.value });
     });
 
     // columns popover
@@ -1347,31 +1627,8 @@
 
     // views
     $('#viewSelect').addEventListener('change', (e) => applyNamedView(e.target.value));
-    $('#viewSave').addEventListener('click', () => {
-      modal({
-        title: 'Save view',
-        body: `<p>Saves the current filters, search, sorting, grouping, layout and columns.</p>
-          <label>View name<input class="input" id="viewName" value="${esc(S.viewName === 'Default' ? '' : S.viewName)}" placeholder="e.g. Stale devices"></label>`,
-        actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: () => {
-          const name = $('#viewName').value.trim() || 'Default';
-          S.views[name] = JSON.parse(JSON.stringify(S.view));
-          store.set('views', S.views);
-          S.viewName = name;
-          saveState();
-          renderViewSelect();
-          toast(`Saved view “${name}”`);
-        } }],
-      });
-      $('#viewName').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#mActions .primary').click(); });
-    });
-    $('#viewDelete').addEventListener('click', () => {
-      if (S.viewName === 'Default') return;
-      const name = S.viewName;
-      delete S.views[name];
-      store.set('views', S.views);
-      applyNamedView('Default');
-      toast(`Deleted view “${name}”`);
-    });
+    $('#viewSave').addEventListener('click', openSaveView);
+    $('#viewDelete').addEventListener('click', deleteCurrentView);
 
     // keyboard
     document.addEventListener('keydown', (e) => {
@@ -1422,6 +1679,7 @@
     try { S.config = await apiJson('/api/config'); } catch { /* ignore */ }
     try { S.settings.staleMinutes = (await apiJson('/api/settings')).staleMinutes; } catch { /* ignore */ }
     applyCaps();
+    loadViews().then(migrateLocalViews);
     await loadIngest();
     connect();
     try { await loadAll(); } catch (e) { if (e.message !== 'API key required') toast('Could not load records: ' + e.message, 'error'); }

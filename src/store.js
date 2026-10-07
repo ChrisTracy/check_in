@@ -212,7 +212,7 @@ export class Store extends EventEmitter {
    * Query records.
    * filters: { field: value } exact match (string compare); q: free-text over id + data.
    */
-  list({ sinceRev, q, filters = {}, sort, order, limit, offset } = {}) {
+  list({ sinceRev, q, filters = {}, match = 'all', ranges = [], sort, order, limit, offset } = {}) {
     const where = [];
     const params = [];
     if (sinceRev !== undefined && sinceRev !== null && sinceRev !== '') {
@@ -224,11 +224,29 @@ export class Store extends EventEmitter {
       where.push("(id LIKE ? ESCAPE '\\' OR data LIKE ? ESCAPE '\\')");
       params.push(like, like);
     }
+    // Field filters combine with AND (match=all, default) or OR (match=any).
+    const fw = [];
     for (const [field, value] of Object.entries(filters)) {
-      if (field.toLowerCase() === 'id') { where.push('id = ?'); params.push(String(value)); continue; }
-      if (field === 'created' || field === 'modified') { where.push(`${field} >= ?`); params.push(String(value)); continue; }
-      where.push('CAST(json_extract(data, ?) AS TEXT) = ?');
+      if (field.toLowerCase() === 'id') { fw.push('id = ?'); params.push(String(value)); continue; }
+      if (field === 'created' || field === 'modified') { fw.push(`${field} >= ?`); params.push(String(value)); continue; }
+      fw.push('CAST(json_extract(data, ?) AS TEXT) = ?');
       params.push(jsonPath(field), String(value));
+    }
+    if (fw.length) where.push('(' + fw.join(String(match).toLowerCase() === 'any' ? ' OR ' : ' AND ') + ')');
+    // Time ranges / status: always ANDed. Each entry is a group of OR'd
+    // conditions: [[{ field, op: '>=' | '<', value }...], ...].
+    for (const group of ranges) {
+      const parts = [];
+      for (const conds of group) {
+        const and = [];
+        for (const { field, op, value } of conds) {
+          if (!['created', 'modified'].includes(field) || !['>=', '<'].includes(op)) continue;
+          and.push(`${field} ${op} ?`);
+          params.push(String(value));
+        }
+        if (and.length) parts.push('(' + and.join(' AND ') + ')');
+      }
+      if (parts.length) where.push('(' + parts.join(' OR ') + ')');
     }
     let sql = 'SELECT id, data, created, modified, version, rev FROM records';
     let countSql = 'SELECT COUNT(*) AS n FROM records';

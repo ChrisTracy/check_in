@@ -1,0 +1,54 @@
+name: PROD - Deploy to Komodo
+ 
+# Runs after "Publish Docker image" finishes successfully for a push to main
+# (the build that updates the :latest tag), then tells Komodo to redeploy the stack.
+# Uses a self-hosted runner because Komodo is only reachable from the private network.
+#
+# One-time setup in GitHub → Settings → Secrets and variables → Actions:
+#   Repository secrets:
+#     KOMODO_ENDPOINT
+#     KOMODO_API_KEY      Komodo → Settings → API Keys
+#     KOMODO_API_SECRET   (shown once when the key is created)
+#
+# Run it by hand from the Actions tab with "Run workflow" to redeploy without a new build.
+ 
+on:
+  workflow_run:
+    workflows: ["Publish Docker image"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+ 
+permissions:
+  contents: read
+ 
+concurrency:
+  group: deploy-komodo
+  cancel-in-progress: false
+ 
+jobs:
+  deploy:
+    # Only after a successful publish triggered by a push to main (not tag builds or failures).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: self-hosted   # or your specific runner label
+    timeout-minutes: 10
+    steps:
+      - name: Trigger Komodo deploy
+        env:
+          KOMODO_ENDPOINT: ${{ secrets.KOMODO_ENDPOINT }}
+          KOMODO_API_KEY: ${{ secrets.KOMODO_API_KEY }}
+          KOMODO_API_SECRET: ${{ secrets.KOMODO_API_SECRET }}
+        run: |
+          curl --fail-with-body --silent --show-error --max-time 60 \
+            --request POST "$KOMODO_ENDPOINT" \
+            --header "Content-Type: application/json" \
+            --header "X-Api-Key: $KOMODO_API_KEY" \
+            --header "X-Api-Secret: $KOMODO_API_SECRET" \
+            --data '{"stack": "6a96ef2bd57097ba6065653d"}'
+          echo
+          echo "Komodo deploy requested for the check-in stack."
+ 

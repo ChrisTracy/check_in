@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { HttpError } from '../store.js';
 import { hashPassword, verifyPassword, passwordProblem, randomToken, sha256, encrypt, decrypt } from './security.js';
 
@@ -19,6 +20,7 @@ export const CAPS = {
   clearAll: 'power',
   pause: 'power',
   threshold: 'power',
+  teamViews: 'power',
   apiKey: 'admin',
   sso: 'admin',
   users: 'admin',
@@ -76,7 +78,9 @@ export class Accounts {
     this.s = {
       byId: db.prepare('SELECT * FROM users WHERE id = ?'),
       byName: db.prepare('SELECT * FROM users WHERE username = ?'),
-      byEmail: db.prepare("SELECT * FROM users WHERE email = ? AND email <> '' ORDER BY id LIMIT 1"),
+      // Pre-created, not-yet-linked, single-sign-on-only accounts (no password) matching a sign-in name.
+      ssoLinkCandidate: db.prepare(`SELECT * FROM users WHERE (username = ?1 OR (email = ?1 COLLATE NOCASE AND email <> ''))
+        AND sso_sub IS NULL AND password_hash IS NULL ORDER BY (username = ?1) DESC, id LIMIT 1`),
       bySub: db.prepare('SELECT * FROM users WHERE sso_sub = ?'),
       session: db.prepare(`SELECT s.id AS sid, s.csrf, s.expires, s.method, u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ?`),
       touch: db.prepare('UPDATE sessions SET expires = ? WHERE id = ?'),
@@ -292,28 +296,44 @@ export class Accounts {
     return best;
   }
 
-  /** Find, link or create the local user for an SSO login. Throws a user-facing error if not allowed. */
+  /**
+   * Find, link or create the local user for an SSO login. Throws a user-facing error if not allowed.
+   *
+   * Identity is the immutable tenant + object ID (tid:oid). An existing local account is only
+   * linked on first sign-in when ALL of these hold, so a spoofable claim can never take over an
+   * account:
+   *   - it was created by an admin as "single sign-on only" (it has no password),
+   *   - it isn't already linked to another identity,
+   *   - the sign-in name (preferred_username / upn, never the mutable `email` claim) matches its
+   *     username or email,
+   *   - the person is a member of the tenant, not a guest from another identity provider.
+   */
   ssoLogin(claims) {
     const sso = this.sso();
     const sub = claims.tid && claims.oid ? `${claims.tid}:${claims.oid}` : `sub:${claims.iss}:${claims.sub}`;
-    const email = String(claims.email || claims.preferred_username || claims.upn || '').trim();
+    const signInName = String(claims.preferred_username || claims.upn || '').trim();
+    const email = String(claims.email || signInName || '').trim(); // display/contact only
     const name = String(claims.name || '').trim();
+    const isGuest = Boolean(claims.idp && claims.iss && claims.idp !== claims.iss);
     const mapped = this.mapRole(claims);
     const fallback = sso.defaultRole === 'none' ? null : sso.defaultRole;
     const now = new Date().toISOString();
 
     let u = this.s.bySub.get(sub);
-    if (!u && email) {
-      u = this.s.byName.get(email) || this.s.byEmail.get(email);
-      if (u && u.sso_sub && u.sso_sub !== sub) u = null; // already linked to a different identity
-      if (u) this.db.prepare('UPDATE users SET sso_sub = ?, updated = ? WHERE id = ?').run(sub, now, u.id);
+    if (!u && signInName && !isGuest) {
+      const candidate = this.s.ssoLinkCandidate.get(signInName);
+      if (candidate) {
+        this.db.prepare('UPDATE users SET sso_sub = ?, updated = ? WHERE id = ?').run(sub, now, candidate.id);
+        u = this.get(candidate.id);
+      }
     }
     if (!u) {
       if (!sso.autoCreate) throw new HttpError(403, 'Your account has not been added to this app. Ask an administrator for access.');
       const role = mapped || fallback;
       if (!role) throw new HttpError(403, 'You have not been assigned a role for this app. Ask an administrator for access.');
-      let username = email || name || sub;
-      if (this.s.byName.get(username)) username = `${username}-${sub.slice(-6)}`;
+      // Never reuse an existing username: a clash gets a unique suffix instead of being linked.
+      let username = signInName || email || name || sub;
+      while (this.s.byName.get(username)) username = `${signInName || email || name || 'user'}-${crypto.randomBytes(3).toString('hex')}`;
       const info = this.db.prepare(
         'INSERT INTO users (username, name, email, role, sso_sub, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?)'
       ).run(username, name, email, role, sub, now, now);

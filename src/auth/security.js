@@ -100,3 +100,20 @@ export class RateLimiter {
   }
   clear(key) { this.hits.delete(key); }
 }
+
+/**
+ * Only allow redirects to a path on this site. Rejects absolute URLs, protocol-relative
+ * paths ("//evil"), backslashes ("/\evil", which browsers treat as "//"), and control
+ * characters (browsers strip tabs/newlines, so "/\t/evil" would become "//evil").
+ */
+export function safeReturnTo(value, fallback = '/') {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.length > 2048) return fallback;
+  if (value.startsWith('//') || /[\\\x00-\x1f\x7f]/.test(value)) return fallback;
+  try {
+    const u = new URL(value, 'http://this.host');
+    if (u.origin !== 'http://this.host') return fallback;
+    return u.pathname + u.search + u.hash;
+  } catch {
+    return fallback;
+  }
+}

@@ -1,3 +1,4 @@
+import { SavedViews, registerViews } from './views.js';
 import path from 'node:path';
 import http from 'node:http';
 import querystring from 'node:querystring';
@@ -26,6 +27,47 @@ function flattenParams(obj) {
 
 function stamp() {
   return new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+}
+
+const DURATION = /^(\d+(?:\.\d+)?)\s*(s|m|h|d|w)$/i;
+const UNIT_MS = { s: 1e3, m: 6e4, h: 36e5, d: 864e5, w: 6048e5 };
+
+/** Parse an ISO date/time or a relative duration ("15m", "2h", "7d" = that long ago). */
+export function parseTimeParam(value, now = Date.now()) {
+  const v = String(value).trim();
+  const rel = DURATION.exec(v);
+  if (rel) return new Date(now - Number(rel[1]) * UNIT_MS[rel[2].toLowerCase()]).toISOString();
+  const t = Date.parse(v);
+  if (!v || Number.isNaN(t)) throw new Error(`Invalid date/time: ${v}`);
+  return new Date(t).toISOString();
+}
+
+/** Build the always-ANDed time/status conditions for /api/records. */
+export function timeRanges(q, staleMinutes, now = Date.now()) {
+  const ranges = [];
+  for (const field of ['created', 'modified']) {
+    const after = q[`${field}After`];
+    const before = q[`${field}Before`];
+    if (after !== undefined && after !== '') ranges.push([[{ field, op: '>=', value: parseTimeParam(after, now) }]]);
+    if (before !== undefined && before !== '') ranges.push([[{ field, op: '<', value: parseTimeParam(before, now) }]]);
+  }
+  if (q.status !== undefined && q.status !== '') {
+    const fresh = new Date(now - staleMinutes * 6e4).toISOString();
+    const aging = new Date(now - staleMinutes * 2 * 6e4).toISOString();
+    const map = {
+      active: [{ field: 'modified', op: '>=', value: fresh }],
+      aging: [{ field: 'modified', op: '<', value: fresh }, { field: 'modified', op: '>=', value: aging }],
+      stale: [{ field: 'modified', op: '<', value: aging }],
+    };
+    map.fresh = map.active;
+    const group = [];
+    for (const name of String(q.status).toLowerCase().split(',').map((x) => x.trim()).filter(Boolean)) {
+      if (!map[name]) throw new Error(`Invalid status: ${name} (use active, aging or stale)`);
+      group.push(map[name]);
+    }
+    if (group.length) ranges.push(group);
+  }
+  return ranges;
 }
 
 export function buildApp({ config, store, accounts, oidc }) {
@@ -104,7 +146,9 @@ export function buildApp({ config, store, accounts, oidc }) {
   };
 
   // ---- auth --------------------------------------------------------------
-  registerAuth(app, { accounts, oidc, config, broadcast });
+  const views = new SavedViews(accounts.db);
+  registerAuth(app, { accounts, oidc, config, broadcast, views });
+  registerViews(app, { views, broadcast });
 
   // ---- admin: HTTPS / TLS --------------------------------------------------
   const tlsCap = { config: { cap: 'tls' } };
@@ -180,14 +224,17 @@ export function buildApp({ config, store, accounts, oidc }) {
 
   // ---- read --------------------------------------------------------------
   const view = { config: { cap: 'view' } };
-  app.get('/api/records', view, async (req) => {
+  app.get('/api/records', view, async (req, reply) => {
     const q = req.query;
     const filters = {};
     for (const [k, v] of Object.entries(flattenParams(q))) {
       if (k.startsWith('f.') && k.length > 2) filters[k.slice(2)] = v;
     }
+    let ranges;
+    try { ranges = timeRanges(q, accounts.staleMinutes); }
+    catch (err) { return reply.code(400).send({ ok: false, error: err.message }); }
     return store.list({
-      sinceRev: q.sinceRev, q: q.q, filters, sort: q.sort, order: q.order, limit: q.limit, offset: q.offset,
+      sinceRev: q.sinceRev, q: q.q, filters, match: q.match, ranges, sort: q.sort, order: q.order, limit: q.limit, offset: q.offset,
     });
   });
 

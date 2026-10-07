@@ -9,7 +9,7 @@
 
   const ROLES = [
     ['admin', 'Admin', 'Everything, including users, single sign-on and the API key'],
-    ['power', 'Power user', 'User rights plus Clear all, pausing check-ins and the fresh threshold'],
+    ['power', 'Power user', 'User rights plus Clear all, pausing check-ins and the active threshold'],
     ['user', 'User', 'View, import, export and delete records'],
     ['reader', 'Reader', 'View records and history only'],
   ];
@@ -141,7 +141,7 @@
     $('#nuSso').addEventListener('change', (e) => {
       $('#nuPwRow').hidden = e.target.checked;
       $('#nuHint').textContent = e.target.checked
-        ? 'On their first Microsoft sign-in, the account is linked by matching the username or email to their Entra sign-in name.'
+        ? 'On their first Microsoft sign-in, the account is linked when their Entra sign-in name (UPN) matches this username or email. Guests from other tenants are never linked.'
         : 'The user signs in with this username and password, or with HTTP Basic auth from scripts.';
     });
   }
@@ -160,7 +160,8 @@
       title: u.hasPassword ? `Reset password for ${u.username}` : `Set a password for ${u.username}`,
       body: `<label>New password<input class="input" id="rpPw" type="password" autocomplete="new-password" placeholder="At least 10 characters"></label>
         <p style="font-size:12px">The user's existing sessions will be signed out.</p>
-        ${u.hasPassword && u.sso ? '<label class="switch" style="font-weight:500"><input type="checkbox" id="rpRemove"><span class="track"></span>Remove password (SSO only)</label>' : ''}`,
+        ${u.hasPassword ? `<label class="switch" style="font-weight:500"><input type="checkbox" id="rpRemove"><span class="track"></span>Remove password (single sign-on only)</label>
+          ${u.sso ? '' : '<p style="font-size:12px">Accounts with a password are never linked to Microsoft sign-in automatically. Removing the password lets this account be linked on the user\'s next Microsoft sign-in.</p>'}` : ''}`,
       actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
         if ($('#rpRemove')?.checked) return patchUser(u.id, { removePassword: true }, 'Password removed');
         const pw = $('#rpPw').value;

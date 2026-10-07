@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Check-in Dashboard</title>
+  <title>Check-In Dashboard</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><path d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -14,7 +14,7 @@
     <div class="brand">
       <div class="logo"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></div>
       <div>
-        <h1>Check-ins</h1>
+        <h1>Check-In</h1>
         <div class="live" id="liveStatus"><span class="pulse"></span><span id="liveText">Connecting…</span></div>
       </div>
     </div>
@@ -55,7 +55,7 @@
   <!-- ===== Stat cards (click to filter by status) ===== -->
   <section class="stats" id="stats">
     <button class="stat" data-status="all"><span class="label">Total records</span><span class="value" id="statTotal">0</span><span class="sub" id="statFields">0 fields</span></button>
-    <button class="stat" data-status="fresh"><span class="label"><i class="dot fresh"></i>Fresh</span><span class="value" id="statFresh">0</span><span class="sub" id="statFreshSub"></span></button>
+    <button class="stat" data-status="fresh"><span class="label"><i class="dot fresh"></i>Active</span><span class="value" id="statFresh">0</span><span class="sub" id="statFreshSub"></span></button>
     <button class="stat" data-status="aging"><span class="label"><i class="dot aging"></i>Aging</span><span class="value" id="statAging">0</span><span class="sub" id="statAgingSub"></span></button>
     <button class="stat" data-status="stale"><span class="label"><i class="dot stale"></i>Stale</span><span class="value" id="statStale">0</span><span class="sub" id="statStaleSub"></span></button>
     <div class="stat static"><span class="label">Check-ins / min</span><span class="value" id="statRate">0</span><span class="sub">records updated in last 60s</span></div>
@@ -71,12 +71,13 @@
       <div class="dropdown">
         <button class="btn" id="filterBtn"><svg class="i" viewBox="0 0 24 24"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg><span>Filter</span></button>
         <div class="menu pop" id="filterPop">
-          <div class="pop-title">Add filter</div>
+          <div class="pop-title" id="fTitle">Add filter</div>
           <label>Field<select id="fField" class="select"></select></label>
           <label>Condition<select id="fOp" class="select"></select></label>
-          <label id="fValueWrap">Value<input id="fValue" list="fValues" autocomplete="off"><datalist id="fValues"></datalist></label>
+          <div class="fv" id="fValueWrap"><span class="fv-label">Value</span><div class="fv-box" id="fValueBox"></div></div>
+          <div class="pop-error" id="fError" hidden></div>
           <div class="facets" id="fFacets"></div>
-          <div class="pop-actions"><button class="btn primary" id="fAdd">Add filter</button></div>
+          <div class="pop-actions"><button class="btn" id="fCancel">Cancel</button><button class="btn primary" id="fAdd">Add filter</button></div>
         </div>
       </div>
       <select id="timeRange" class="select" title="Last check-in within">

@@ -498,3 +498,36 @@ body.compact .td { font-size: 13px; }
 .field-label { display: flex; align-items: baseline; gap: 6px; }
 .field-label small { font-weight: 400; color: var(--muted); }
 .install-form { display: flex; flex-direction: column; gap: 14px; }
+
+.match-seg { margin-right: 4px; }
+.match-seg button { height: 22px; font-size: 12px; padding: 0 10px; }
+.chip-join { align-self: center; font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); padding: 0 2px; }
+.chips { align-items: center; }
+
+/* Typed filter editor */
+.fv { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.fv-label { font-size: 12px; font-weight: 500; color: var(--muted); }
+.fv-box > .input, .fv-box > .select { width: 100%; color: var(--text); font-size: 14px; }
+.fv-row { display: flex; gap: 6px; }
+.fv-row .input { flex: 1 1 0; width: auto; }
+.fv-row .select { flex: 1.4 1 0; color: var(--text); font-size: 14px; }
+.pop-error { color: var(--stale); background: var(--stale-soft); border-radius: 6px; padding: 6px 8px; font-size: 12px; margin-bottom: 8px; }
+.facet { display: inline-flex; align-items: center; }
+.facet .dot { width: 8px; height: 8px; margin-right: 6px; box-shadow: none; }
+.chip[data-edit] { cursor: pointer; }
+.chip[data-edit]:hover { border-color: var(--accent); }
+.chip.bad { background: var(--stale-soft); color: var(--stale); border-color: color-mix(in srgb, var(--stale) 35%, transparent); text-decoration: line-through; text-decoration-thickness: 1px; }
+.chip.bad button { text-decoration: none; }
+
+/* Saved views: personal vs team */
+.scope-label { font-size: 12px; font-weight: 500; color: var(--muted); margin-bottom: 4px; }
+.scope-pick { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+.scope-pick button { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; text-align: left; font: inherit; }
+.scope-pick button b { font-size: 14px; font-weight: 600; }
+.scope-pick button small { font-size: 12px; color: var(--muted); }
+.scope-pick button:hover:not(:disabled) { border-color: var(--accent); }
+.scope-pick button.active { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); }
+.scope-pick button.active b { color: var(--accent); }
+.scope-pick button:disabled { opacity: .5; cursor: not-allowed; }
+#viewSave { position: relative; }
+#viewSave.dirty::after { content: ''; position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 50%; background: var(--aging); box-shadow: 0 0 0 2px var(--surface); }

@@ -25,9 +25,8 @@ A high-throughput check-in API with dynamic fields, per-record change history, C
 | **Filters and multi-select:** delete or export the selection | **Record history:** every change, old value → new value |
 | ![Sign-in page with Microsoft Entra ID](docs/screenshots/login.png) | ![User management](docs/screenshots/admin-users-dark.png) |
 | **Sign-in** with a password or Microsoft Entra ID | **User management** with four roles |
-
-![Single sign-on settings](docs/screenshots/admin-sso.png)
-<p align="center"><b>Entra ID single sign-on settings</b>, with setup steps and the redirect URI to copy</p>
+| ![Single sign-on settings](docs/screenshots/admin-sso.png) | ![Built-in HTTPS settings](docs/screenshots/admin-https.png) |
+| **Entra ID single sign-on** settings, with setup steps | **Built-in HTTPS:** certificate details, upload or self-signed |
 
 ## Quick start
 
@@ -160,13 +159,14 @@ Notes:
 | | Reader | User | Power user | Admin |
 |---|:-:|:-:|:-:|:-:|
 | View records, history and activity | ✓ | ✓ | ✓ | ✓ |
+| Save personal views; use team views | ✓ | ✓ | ✓ | ✓ |
 | Check in (API) | | ✓ | ✓ | ✓ |
 | Import CSV, export CSV | | ✓ | ✓ | ✓ |
 | Delete records (single or multi-select) | | ✓ | ✓ | ✓ |
-| **Clear all**, pause/resume check-ins, change the fresh threshold | | | ✓ | ✓ |
+| **Clear all**, pause/resume check-ins, change the active threshold, create/edit/delete team views | | | ✓ | ✓ |
 | Manage users, single sign-on and the API key | | | | ✓ |
 
-The fresh threshold is now a shared, server-side setting. When a power user changes it, every open dashboard updates. Permissions are enforced by the server; the dashboard also hides what your role can't do.
+The active threshold is now a shared, server-side setting. When a power user changes it, every open dashboard updates. Permissions are enforced by the server; the dashboard also hides what your role can't do.
 
 ### Ways to authenticate
 
@@ -183,7 +183,8 @@ Failed sign-ins are rate-limited (10 attempts per 15 minutes per IP and username
 
 ### Managing users (Admin → Users)
 
-- **Add user**: give them a username, role and password. Or choose *Single sign-on only*: the account is linked on their first Microsoft sign-in by matching the username or email to their Entra sign-in name.
+- **Add user**: give them a username, role and password. Or choose *Single sign-on only*: the account is linked on their first Microsoft sign-in when their Entra sign-in name (UPN) matches its username or email. From then on the account is tied to their Entra object ID.
+- **How accounts are linked:** only *single sign-on only* accounts (no password) that aren't already linked are ever linked automatically. Accounts with a password are never linked, guests from other tenants are never linked, and the user-editable `email` claim is never used for matching. A Microsoft sign-in that doesn't match gets its own new account (if auto-create is on) instead. To move an existing password user to Microsoft sign-in, remove their password in **Reset password**.
 - Change a role from the drop-down, reset or set a password, disable or enable, or delete.
 - You can't delete or disable yourself, or remove the last active admin.
 - Anyone signed in can change their own password from the account menu.
@@ -262,7 +263,7 @@ curl -X POST http://localhost:3000/api/checkin -H "Content-Type: application/jso
 
 | Method & path | Description |
 |---|---|
-| `GET /api/records` | All records. Optional parameters: `q` (text search), `f.<field>=<value>` (exact match), `sort=<field>`, `order=asc\|desc`, `limit`, `offset`, `sinceRev=<n>` (only records changed since that revision) |
+| `GET /api/records` | All records. Optional parameters: `q` (text search), `f.<field>=<value>` (exact match; several are combined with AND, or with OR when you add `match=any`), `sort=<field>`, `order=asc\|desc`, `limit`, `offset`, `sinceRev=<n>` (only records changed since that revision), `status=active\|aging\|stale` (comma-separate for several), `createdAfter`, `createdBefore`, `modifiedAfter`, `modifiedBefore` (an ISO date/time such as `2026-10-01T09:00:00Z`, or a relative age such as `15m`, `2h`, `7d`, `1w`). Status and date parameters always combine with AND, even with `match=any` |
 | `GET /api/records/:id` | One record |
 | `GET /api/records/:id/history?limit=500` | One record and its history, newest first. Each entry includes `changes: { field: [old, new] }` and a full snapshot in `data` |
 | `GET /api/history?limit=200&before=<hid>` | Recent activity across all records |
@@ -300,6 +301,9 @@ curl -X POST http://localhost:3000/api/checkin -H "Content-Type: application/jso
 
 | Method & path | Role | Description |
 |---|---|---|
+| `GET /api/views` | any signed-in user | `{ "personal": [...], "team": [...] }`. Each view has `id`, `scope`, `name`, `state`, `updated` and `updatedBy` |
+| `POST /api/views` | any signed-in user (team: Power user or Admin) | `{ "scope": "personal" \| "team", "name": "…", "state": {…} }`. Saving under an existing name in the same scope overwrites that view. Personal views need a user account, not the API key |
+| `PUT /api/views/:id`, `DELETE /api/views/:id` | owner (personal) or Power user/Admin (team) | Rename or update `state`, or delete |
 | `GET /api/status` | public | `{ "accepting": true, "paused": false, "since": "…" }`. Signed-in callers also get `by` (who paused it) |
 | `PUT /api/status` | Power user or Admin | `{ "paused": true }` to stop accepting check-ins, `{ "paused": false }` to resume |
 
@@ -330,15 +334,24 @@ The dashboard's export menu can also download the **current view**: only the fil
 
 ## Dashboard
 
-- **Status cards:** Fresh, Aging and Stale are based on time since the last check-in. The threshold is set in Settings (default 15 minutes; Aging runs up to 2× the threshold). Click a card to filter by that status.
+- **Status cards:** Active, Aging and Stale are based on time since the last check-in. The threshold is set in Settings (default 15 minutes; Aging runs up to 2× the threshold). Click a card to filter by that status.
 - **Search** across every field. Press `/` to jump to the search box.
-- **Filters:** use the **Filter** button or the funnel icon on any column header. Conditions include contains, is, is not, starts with, greater/less than, regex, and empty/not empty. The filter panel shows the most common values for one-click filtering.
+- **Filters:** use the **Filter** button or the funnel icon on any column header. The conditions offered depend on the field:
+  - **Text fields** (custom fields, ID, Any field): contains, does not contain, is, is not, starts with, greater/less than, matches regex, is empty, is not empty. The panel shows the most common values for one-click filtering.
+  - **Status:** is / is not Active, Aging or Stale, with live counts. If your data has its own `status` field, the built-in one is labelled **Status (check-in)**.
+  - **Created and Modified:** in the last N minutes, hours or days, more than N ago, after or before a date and time, or on a given day, plus presets such as "Last 15 min" and "Over a day ago". Relative conditions move with the clock.
+
+  Click a filter chip to edit it. With two or more filters, switch between **Match all** (every filter must match) and **Match any** (at least one must match). Search, the status cards and the time filter always narrow the results further. An invalid filter (for example a broken regex in an old saved view) is shown in red and ignored.
 - **Time filter:** for example "Last 15 min" or "Not in last 24 hours".
 - **Group by** any field or by status. Click a group header to collapse it.
 - **Layouts:** Table, Cards, or an Activity feed of recent changes.
 - **Columns:** show or hide, drag to reorder (in the header or the Columns panel), and drag a column edge to resize it (double-click the edge to reset).
 - **Sort:** click a header to sort. Shift+click adds a secondary sort.
-- **Saved views:** save the current filters, sort, grouping, columns and layout under a name. Views are stored in your browser.
+- **Saved views:** save the current filters, search, sort, grouping, columns and layout under a name. Views are stored on the server:
+  - **My views** belong to your account. Only you can see them, and they follow you to any browser.
+  - **Team views** are visible to everyone. Only power users and admins can create, overwrite or delete them, and changes show up on every open dashboard straight away.
+
+  A dot on the save button means you've changed the view since it was saved. Readers and users can open a team view, adjust it, and save their own copy under **My views**. Views saved in the browser by older versions are moved to your account the first time you sign in. Deleting a user also deletes their personal views.
 - **Record drawer:** click a row to see every field and a timeline of changes.
 - **Multi-select:** tick the checkboxes in the table (Shift+click selects a range) or on cards. The header checkbox selects every matching row. A bar appears where you can **Delete** or **Export** the selection; the Delete key works too. Esc clears the selection.
 - **Live updates:** changes stream in as they happen.
@@ -366,6 +379,28 @@ From PowerShell (Windows PowerShell 5.1 or PowerShell 7), this fires 500 simulta
 .\scripts\loadtest.ps1 -Count 2000 -Rounds 5 -ApiKey ck_xxx
 ```
 
+## Linux agent
+
+`scripts/checkin-agent.sh` reports a Linux machine to the server. It first asks `GET /api/status` whether check-ins are being accepted and, if they are, posts the machine's details with the short hostname as the ID. It needs only bash and curl.
+
+Fields sent: `hostname`, `fqdn`, `os`, `kernel`, `arch`, `cpu_model`, `cpu_cores`, `virtualization`, `vendor`, `model`, `cpu_pct` (measured over 1 second), `load_1m/5m/15m`, `ram_total_mb`, `ram_used_mb`, `ram_pct`, `swap_pct`, `disk_root_pct`, `disk_root_free_gb`, `disk_root_size_gb`, `disk_max_pct` and `disk_max_mount` (the fullest filesystem), `system_time`, `timezone`, `time_synced`, `boot_time`, `uptime`, `uptime_h`, `ip`, `interface`, `mac`, `gateway`, `processes`, `users_logged_in`, `failed_services`, `reboot_required`, `cpu_temp_c` and `agent_version`. A field is left out when the machine can't provide it.
+
+```bash
+# Try it: print what would be sent
+./scripts/checkin-agent.sh --dry-run
+
+# Check in once
+./scripts/checkin-agent.sh --url https://checkin.example.com --key ck_xxx
+
+# Install: copies itself to /usr/local/bin/checkin-agent, saves settings to
+# /etc/check-in/agent.conf (root-only) and runs every 5 minutes
+# (systemd timer, or cron when there is no systemd)
+sudo ./scripts/checkin-agent.sh --install --url https://checkin.example.com --key ck_xxx --every 5
+sudo ./scripts/checkin-agent.sh --uninstall
+```
+
+Add your own static fields with `CHECKIN_EXTRA="site=Dallas,owner=it-infra"` (in the environment or the config file). Use `--id` to override the record ID, and `--insecure` for a self-signed certificate. Exit codes: `0` sent, `2` the server is paused so nothing was sent, `1` error.
+
 ## Tests
 
 ```bash
@@ -389,7 +424,7 @@ src/
     oidc.js      Microsoft Entra ID (OIDC, code flow + PKCE)
     security.js  scrypt hashing, encryption, rate limiting
 public/       dashboard and login page (index.html, login.html, app.js, admin.js, login.js, styles.css; no build step)
-scripts/      seed.js, loadtest.js
+scripts/      seed.js, loadtest.js, loadtest.ps1, checkin-agent.sh
 test/         API tests (node:test)
 ```
 

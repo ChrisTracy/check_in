@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { HttpError } from '../store.js';
 import { ROLES, CAPS, can, capsFor, roleLevel } from './accounts.js';
-import { RateLimiter, sha256, encrypt, decrypt, verifyPassword } from './security.js';
+import { RateLimiter, sha256, encrypt, decrypt, verifyPassword, safeReturnTo } from './security.js';
 import { ROOT } from '../config.js';
 
 const SESSION_COOKIE = 'ci_session';
@@ -20,7 +20,7 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
  *
  * Routes declare the capability they need with `config: { cap: '...' }`.
  */
-export function registerAuth(app, { accounts, oidc, config, broadcast }) {
+export function registerAuth(app, { accounts, oidc, config, broadcast, views }) {
   const loginLimiter = new RateLimiter({ max: 10, windowMs: 15 * 60_000 });
   const basicCache = new Map(); // sha256(header) -> { userId, exp }
 
@@ -190,7 +190,7 @@ export function registerAuth(app, { accounts, oidc, config, broadcast }) {
     if (!accounts.ssoReady()) return reply.redirect('/login?error=' + encodeURIComponent('Single sign-on is not configured'));
     try {
       const { url, tx } = await oidc.authorizationUrl(redirectUri(req));
-      const returnTo = typeof req.query.returnTo === 'string' && req.query.returnTo.startsWith('/') && !req.query.returnTo.startsWith('//') ? req.query.returnTo : '/';
+      const returnTo = safeReturnTo(req.query.returnTo);
       reply.setCookie(OIDC_COOKIE, encrypt(accounts.secret, JSON.stringify({ ...tx, returnTo, exp: Date.now() + 10 * 60_000 })), {
         path: '/auth/oidc', httpOnly: true, sameSite: 'lax', secure: secureCookie(req), maxAge: 600,
       });
@@ -223,7 +223,7 @@ export function registerAuth(app, { accounts, oidc, config, broadcast }) {
     const { token } = accounts.createSession(u.id, 'sso');
     reply.clearCookie(OIDC_COOKIE, { path: '/auth/oidc' });
     setSessionCookie(req, reply, token);
-    return reply.redirect(tx.returnTo || '/');
+    return reply.redirect(safeReturnTo(tx.returnTo));
   });
 
   // ---------------------------------------------------------------- check-in pause
@@ -283,6 +283,7 @@ export function registerAuth(app, { accounts, oidc, config, broadcast }) {
   });
   app.delete('/api/admin/users/:id', { config: { cap: 'users' } }, async (req) => {
     accounts.remove(Number(req.params.id), req.auth.userId);
+    views?.removeOwner(Number(req.params.id));
     basicCache.clear();
     return { ok: true };
   });

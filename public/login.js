@@ -4,6 +4,16 @@
   const params = new URLSearchParams(location.search);
   let mode = 'login'; // login | setup
 
+  // Only allow redirects to a path on this site (see safeReturnTo in src/auth/security.js).
+  function safeReturnTo(value) {
+    if (typeof value !== 'string' || !value.startsWith('/') || value.length > 2048) return '/';
+    if (value.startsWith('//') || /[\\\x00-\x1f\x7f]/.test(value)) return '/';
+    try {
+      const u = new URL(value, location.origin);
+      return u.origin === location.origin ? u.pathname + u.search + u.hash : '/';
+    } catch { return '/'; }
+  }
+
   function showError(msg) {
     const el = $('#error');
     el.textContent = msg;
@@ -41,7 +51,7 @@
       return;
     }
 
-    const returnTo = params.get('returnTo') || '/';
+    const returnTo = safeReturnTo(params.get('returnTo'));
     if (st.sso.enabled) {
       $('#ssoBtn').hidden = false;
       $('#ssoLabel').textContent = st.sso.label;
@@ -93,8 +103,7 @@
       const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || 'Sign-in failed');
-      const rt = params.get('returnTo');
-      location.replace(rt && rt.startsWith('/') && !rt.startsWith('//') ? rt : '/');
+      location.replace(safeReturnTo(params.get('returnTo')));
     } catch (err) {
       showError(err.message);
       busy(false);

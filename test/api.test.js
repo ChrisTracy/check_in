@@ -322,3 +322,122 @@ test('HTTPS: TLS_DISABLE forces HTTP only', async (t) => {
   assert.deepEqual([s2.mode, s2.savedMode, s2.disabledByEnv, s2.listening], ['off', 'redirect', true, false]);
   assert.equal((await app.inject({ url: '/api/auth/status' })).statusCode, 200);
 });
+
+test('SSO never links an existing account through a spoofable claim', async () => {
+  const { accounts } = await setup();
+  accounts.updateSso({ tenantId: 'tenant-1', clientId: 'c', defaultRole: 'reader', autoCreate: true, syncRoles: false });
+  const claims = (oid, extra) => ({ tid: 'tenant-1', oid, iss: 'https://login.microsoftonline.com/tenant-1/v2.0', sub: oid,
+    name: oid, preferred_username: `${oid}@contoso.com`, ...extra });
+  await accounts.create({ username: 'boss@contoso.com', role: 'admin', password: 'boss-password-12' });
+  await accounts.create({ username: 'jordan', email: 'jordan@contoso.com', role: 'power' }); // SSO-only, pre-created
+
+  // 1. Attacker sets their email claim to the admin's username: gets a new reader account, not the admin.
+  const m = accounts.ssoLogin(claims('mallory', { email: 'boss@contoso.com' }));
+  assert.equal(m.role, 'reader');
+  assert.notEqual(m.username, 'boss@contoso.com');
+  // 2. Even a matching sign-in name never links an account that has a password.
+  const b = accounts.ssoLogin(claims('boss'));
+  assert.equal(b.role, 'reader');
+  assert.notEqual(b.username, 'boss@contoso.com');
+  assert.equal(accounts.list().find((u) => u.username === 'boss@contoso.com').sso, false);
+  // 3. A guest from another identity provider can't claim a pre-created SSO-only account.
+  const g = accounts.ssoLogin(claims('guest1', { preferred_username: 'jordan@contoso.com', idp: 'https://sts.windows.net/other-tenant/' }));
+  assert.equal(g.role, 'reader');
+  // 4. A tenant member whose sign-in name matches the pre-created SSO-only account is linked, once.
+  const j = accounts.ssoLogin(claims('jordan', { email: 'whatever@evil.example' }));
+  assert.deepEqual([j.username, j.role], ['jordan', 'power']);
+  const j2 = accounts.ssoLogin(claims('jordan-impostor', { preferred_username: 'jordan@contoso.com' }));
+  assert.notEqual(j2.id, j.id); // already linked to a different identity
+  assert.equal(accounts.ssoLogin(claims('jordan')).id, j.id); // same oid signs into the same account
+});
+
+test('returnTo only allows same-site paths', async () => {
+  const { safeReturnTo } = await import('../src/auth/security.js');
+  for (const bad of ['/\\evil.com', '//evil.com', '/\t/evil.com', '/\n/evil.com', 'https://evil.com', 'javascript:alert(1)', '\\/evil.com', ' /x', null, 5]) {
+    assert.equal(safeReturnTo(bad), '/', JSON.stringify(bad));
+  }
+  assert.equal(safeReturnTo('/admin?x=1#h'), '/admin?x=1#h');
+  assert.equal(safeReturnTo('/a/../../b'), '/b');
+});
+
+test('API field filters support match=any (OR)', async () => {
+  const { call } = await setup();
+  await call({ method: 'POST', url: '/api/checkin', payload: [
+    { id: 'a', site: 'Dallas', owner: 'ops' }, { id: 'b', site: 'Austin', owner: 'it' }, { id: 'c', site: 'Denver', owner: 'ops' }] });
+  const ids = async (qs) => (await call({ url: '/api/records?sort=id&' + qs })).json().records.map((r) => r.id);
+  assert.deepEqual(await ids('f.site=Dallas&f.owner=ops'), ['a']);
+  assert.deepEqual(await ids('f.site=Austin&f.owner=ops&match=any'), ['a', 'b', 'c']);
+  assert.deepEqual(await ids('f.site=Austin&f.site=Denver&match=any'), ['c']); // repeated key: last value wins
+  assert.deepEqual(await ids('q=Den&f.site=Austin&f.owner=ops&match=any'), ['c']); // search still narrows
+});
+
+test('API time range and status filters', async () => {
+  const { call, store, accounts } = await setup();
+  accounts.setSetting('staleMinutes', 15);
+  for (const id of ['now', 'mid', 'old']) await call({ method: 'POST', url: '/api/checkin', payload: { id, kind: 'x' } });
+  const ago = (min) => new Date(Date.now() - min * 60000).toISOString();
+  const set = store.db.prepare('UPDATE records SET created = ?, modified = ? WHERE id = ?');
+  set.run(ago(60 * 24 * 10), ago(1), 'now');   // created 10 days ago, active
+  set.run(ago(60 * 24 * 2), ago(20), 'mid');   // aging
+  set.run(ago(60), ago(45), 'old');            // stale, created 1 hour ago
+  const ids = async (qs) => {
+    const r = await call({ url: '/api/records?sort=id&' + qs });
+    assert.equal(r.statusCode, 200, r.body);
+    return r.json().records.map((x) => x.id);
+  };
+  assert.deepEqual(await ids('status=active'), ['now']);
+  assert.deepEqual(await ids('status=aging'), ['mid']);
+  assert.deepEqual(await ids('status=stale'), ['old']);
+  assert.deepEqual(await ids('status=active,stale'), ['now', 'old']);
+  assert.deepEqual(await ids('modifiedAfter=30m'), ['mid', 'now']);
+  assert.deepEqual(await ids('modifiedBefore=15m'), ['mid', 'old']);
+  assert.deepEqual(await ids('createdAfter=3d'), ['mid', 'old']);
+  assert.deepEqual(await ids(`createdBefore=${encodeURIComponent(ago(60 * 24 * 5))}`), ['now']);
+  // Ranges always AND with field filters, even with match=any.
+  assert.deepEqual(await ids('status=stale&match=any&f.kind=x&f.id=now'), ['old']);
+  assert.equal((await call({ url: '/api/records?status=bogus' })).statusCode, 400);
+  assert.equal((await call({ url: '/api/records?modifiedAfter=yesterdayish' })).statusCode, 400);
+});
+
+test('saved views: personal views are private, team views need power user', async () => {
+  const { admin, accounts, as, call, app } = await setup();
+  await accounts.create({ username: 'pu', password: 'powerpass123', role: 'power' });
+  await accounts.create({ username: 'u1', password: 'userpass1234', role: 'user' });
+  const u2 = await accounts.create({ username: 'u2', password: 'userpass1234', role: 'reader' });
+  const pu = as('pu', 'powerpass123'); const u1 = as('u1', 'userpass1234'); const r2 = as('u2', 'userpass1234');
+  const state = { filters: [{ field: 'site', op: 'eq', value: 'Dallas' }], layout: 'cards', evil: 'dropped' };
+
+  // Personal: any signed-in role, readers included; private to the owner.
+  let r = await u1({ method: 'POST', url: '/api/views', payload: { name: 'Mine', scope: 'personal', state } });
+  assert.equal(r.statusCode, 201, r.body);
+  const mine = r.json().view;
+  assert.equal(mine.state.evil, undefined);
+  assert.equal((await r2({ method: 'POST', url: '/api/views', payload: { name: 'Mine', state } })).statusCode, 201);
+  assert.deepEqual((await u1({ url: '/api/views' })).json().personal.map((v) => v.name), ['Mine']);
+  assert.equal((await r2({ url: '/api/views' })).json().personal.length, 1);
+  assert.equal((await r2({ method: 'DELETE', url: `/api/views/${mine.id}` })).statusCode, 404);
+  assert.equal((await pu({ method: 'PUT', url: `/api/views/${mine.id}`, payload: { name: 'x' } })).statusCode, 404);
+  // Saving the same name overwrites.
+  r = await u1({ method: 'POST', url: '/api/views', payload: { name: 'mine', state: { layout: 'table' } } });
+  assert.equal(r.statusCode, 200);
+  assert.equal(r.json().view.id, mine.id);
+  // API keys have no account, so no personal views.
+  assert.equal((await call({ method: 'POST', url: '/api/views', payload: { name: 'k', state } })).statusCode, 400);
+
+  // Team: power and admin only; visible to everyone.
+  assert.equal((await u1({ method: 'POST', url: '/api/views', payload: { name: 'Ops', scope: 'team', state } })).statusCode, 403);
+  r = await pu({ method: 'POST', url: '/api/views', payload: { name: 'Ops', scope: 'team', state } });
+  assert.equal(r.statusCode, 201);
+  const team = r.json().view;
+  assert.equal(team.updatedBy, 'pu');
+  assert.deepEqual((await r2({ url: '/api/views' })).json().team.map((v) => v.name), ['Ops']);
+  assert.equal((await u1({ method: 'PUT', url: `/api/views/${team.id}`, payload: { state } })).statusCode, 403);
+  assert.equal((await u1({ method: 'DELETE', url: `/api/views/${team.id}` })).statusCode, 403);
+  assert.equal((await admin({ method: 'PUT', url: `/api/views/${team.id}`, payload: { name: 'Ops 2' } })).json().view.name, 'Ops 2');
+  assert.equal((await pu({ method: 'POST', url: '/api/views', payload: { name: 'Default', scope: 'team', state } })).statusCode, 400);
+  assert.equal((await admin({ method: 'DELETE', url: `/api/views/${team.id}` })).statusCode, 200);
+
+  // Deleting a user removes their personal views.
+  await admin({ method: 'DELETE', url: `/api/admin/users/${u2.id}` });
+  assert.equal(app && accounts.db.prepare('SELECT COUNT(*) AS n FROM views WHERE owner_id = ?').get(u2.id).n, 0);
+});
