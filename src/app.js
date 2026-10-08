@@ -1,4 +1,5 @@
 import { SavedViews, registerViews } from './views.js';
+import { registerAgentRoutes, siteUrl } from './agents.js';
 import path from 'node:path';
 import http from 'node:http';
 import querystring from 'node:querystring';
@@ -168,6 +169,9 @@ export function buildApp({ config, store, accounts, oidc }) {
   // ---- static assets -----------------------------------------------------
   app.register(fastifyStatic, { root: path.join(ROOT, 'public'), prefix: '/', index: false });
 
+  // ---- agent downloads and one-line installers (see src/agents.js) -------
+  registerAgentRoutes(app);
+
   app.get('/health', async () => ({ ok: true, accepting: !accounts.ingest().paused }));
 
   // Reject new data while a power user has paused check-ins.
@@ -180,10 +184,12 @@ export function buildApp({ config, store, accounts, oidc }) {
     });
     return true;
   }
-  app.get('/api/config', { config: { cap: 'public' } }, async () => ({
-    historyLimit: config.historyLimit,
-    apiKeySet: accounts.apiKeyInfo().set,
-  }));
+  app.get('/api/config', { config: { cap: 'public' } }, async (req) => {
+    let site = null;
+    try { site = siteUrl(req); } catch { /* unusual Host header */ }
+    const k = accounts.apiKeyInfo();
+    return { historyLimit: config.historyLimit, apiKeySet: k.set, apiKeyRequired: k.required, siteUrl: site };
+  });
 
   // ---- check-in (create or update) --------------------------------------
   app.post('/api/checkin', { config: { cap: 'checkin' } }, async (req, reply) => {

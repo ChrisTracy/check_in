@@ -86,7 +86,7 @@
     collapsed: new Set(),
     selected: null,
     flash: new Map(), // id -> timestamp of last change seen live
-    config: { historyLimit: 100, apiKeySet: false },
+    config: { historyLimit: 100, apiKeySet: false, apiKeyRequired: true },
     connected: false,
   };
 
@@ -491,8 +491,9 @@
     else if (!c.all) {
       empty.hidden = false;
       const origin = location.origin;
-      empty.innerHTML = `<div><div class="big">No check-ins yet</div><div>Send a POST with an <b>id</b> and any fields you like:</div>
-        <code>curl -X POST "${esc(origin)}/api/checkin?id=device-1&amp;status=ok"${S.config.apiKeySet ? ' -H "X-API-Key: …"' : ''}</code></div>`;
+      empty.innerHTML = `<div><div class="big">No check-ins yet</div>
+        ${can('checkin') ? '<div>Install the agent on your Windows and Linux machines with one command:</div><button class="btn primary empty-action" data-open-agents>Add Device</button><div style="margin-top:14px">or send a POST with an <b>id</b> and any fields you like:</div>' : '<div>Send a POST with an <b>id</b> and any fields you like:</div>'}
+        <code>curl -X POST "${esc(origin)}/api/checkin?id=device-1&amp;status=ok"${S.config.apiKeyRequired !== false ? ' -H "X-API-Key: …"' : ''}</code></div>`;
     } else if (!shown) {
       empty.hidden = false;
       empty.innerHTML = '<div><div class="big">No matching records</div><div>Try removing a filter or clearing the search.</div></div>';
@@ -730,6 +731,7 @@
   // ------------------------------------------------------------------ drawer
   let drawerTab = 'fields';
   let drawerData = null;
+  const graphHidden = new Set(); // metrics switched off in the Graph tab
   async function openDrawer(id) {
     S.selected = id;
     $('#drawer').classList.add('open');
@@ -756,6 +758,12 @@
     const { record, history } = drawerData;
     const now = Date.now();
     $('#dHistCount').textContent = history.length;
+    // Graph tab: only when the record has CPU / RAM / disk percentages (now or in its history).
+    const chart = window.CheckinChart ? window.CheckinChart.extract(record, history) : null;
+    const gTab = $('#dGraphTab');
+    gTab.disabled = !chart;
+    gTab.title = chart ? 'CPU %, RAM % and disk space used % over time' : 'No CPU, RAM or disk space % fields on this record (e.g. cpu_pct, ram_pct, disk_pct)';
+    if (!chart && drawerTab === 'graph') drawerTab = 'fields';
     $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === drawerTab));
     if (!record) { $('#dBody').innerHTML = '<div class="muted">Record no longer exists.</div>'; return; }
     const st = statusOf(record, now);
@@ -768,6 +776,17 @@
         <tr class="sys"><td>created</td><td>${esc(absTime(record.created))} <span class="muted">(${esc(relTime(record.created, now))})</span></td></tr>
         <tr class="sys"><td>modified</td><td>${esc(absTime(record.modified))} <span class="muted">(${esc(relTime(record.modified, now))})</span></td></tr>
         <tr class="sys"><td>version</td><td>${record._version}</td></tr></table>`;
+    } else if (drawerTab === 'graph') {
+      const n = chart.times.length;
+      const df = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+      $('#dBody').innerHTML = `<div class="muted mc-caption">${n === 1 ? 'Only one check-in so far: the graph fills in as more arrive.' : `${nf.format(n)} check-ins, ${esc(df.format(chart.times[0]))} – ${esc(df.format(chart.times[n - 1]))}.`}
+        ${S.config.historyLimit > 0 ? ` History keeps the last ${nf.format(S.config.historyLimit)} per record (HISTORY_LIMIT).` : S.config.historyLimit === 0 ? ' History is off (HISTORY_LIMIT=0), so only the latest values are shown.' : ''}</div>
+        <div class="mc" id="dChart"></div>`;
+      const draw = () => window.CheckinChart.render($('#dChart'), chart, {
+        hidden: graphHidden,
+        onToggle: (k) => { if (graphHidden.has(k)) graphHidden.delete(k); else graphHidden.add(k); draw(); },
+      });
+      draw();
     } else {
       if (!history.length) {
         $('#dBody').innerHTML = `<div class="muted">${S.config.historyLimit === 0 ? 'History is disabled (HISTORY_LIMIT=0).' : 'No history stored.'}</div>`;
@@ -991,6 +1010,7 @@
     $('#liveToggle').hidden = !can('pause');
     $('#dDelete').hidden = !can('delete');
     $('#adminItem').hidden = !can('users');
+    $('#agentsItem').hidden = !can('checkin');
     $('#pwItem').hidden = S.me.kind !== 'session';
     $('#selDelete').hidden = !can('delete');
     $('#selExport').hidden = !can('export');
@@ -1392,6 +1412,7 @@
         $('#userMenu').classList.add('open');
       }
     });
+    $('#empty').addEventListener('click', (e) => { if (e.target.closest('[data-open-agents]')) window.CheckinAgents?.open(); });
     $('#userMenu').addEventListener('click', (e) => {
       const act = e.target.closest('[data-act]')?.dataset.act;
       if (!act) return;
@@ -1400,6 +1421,7 @@
       if (act === 'settings') openSettings();
       if (act === 'password') changePassword();
       if (act === 'admin') window.CheckinAdmin?.open('users');
+      if (act === 'agents') window.CheckinAgents?.open();
       // Phone-only shortcuts for the header buttons hidden on small screens
       if (act === 'm-pause') togglePause();
       if (act === 'm-import') $('#importFile').click();
@@ -1595,6 +1617,7 @@
     $('#tableWrap').addEventListener('scroll', () => scheduleRender(), { passive: true });
     $('#cardsWrap').addEventListener('scroll', () => scheduleRender(), { passive: true });
     window.addEventListener('resize', () => scheduleRender());
+    window.addEventListener('resize', debounce(() => { if (drawerData && drawerTab === 'graph') renderDrawer(); }, 150));
     $('#tbody').addEventListener('click', (e) => {
       const g = e.target.closest('.gr');
       if (g) {

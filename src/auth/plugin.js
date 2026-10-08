@@ -94,7 +94,8 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
     }
     if (cap === 'public') return;
     // Check-ins are open when no API key has been configured (backwards compatible).
-    if (cap === 'checkin' && a.kind === 'anon' && !accounts.apiKeyInfo().set) return;
+    // Check-ins need the API key (or a signed-in user) unless an admin turned that requirement off.
+    if (cap === 'checkin' && a.kind === 'anon' && !accounts.apiKeyRequired) return;
     if (a.kind === 'anon') return reply.code(401).send({ ok: false, error: 'Sign in or supply an API key' });
     if (!can(a.role, cap)) {
       return reply.code(403).send({ ok: false, error: `Your role (${ROLES[a.role]?.label || a.role}) is not allowed to do this` });
@@ -314,14 +315,23 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
   });
 
   // ---------------------------------------------------------------- admin: API key
-  app.get('/api/admin/apikey', { config: { cap: 'apiKey' } }, async () => accounts.apiKeyInfo());
-  app.post('/api/admin/apikey', { config: { cap: 'apiKey' } }, async (req) => {
-    const { action, key } = req.body || {};
+  // Power users and admins can see and regenerate the key; only admins can supply their own
+  // key or stop requiring one.
+  app.get('/api/admin/apikey', { config: { cap: 'apiKey' } }, async (req, reply) => {
+    reply.header('cache-control', 'no-store');
+    return { ...accounts.apiKeyInfo(), key: accounts.revealApiKey() };
+  });
+  app.post('/api/admin/apikey', { config: { cap: 'apiKey' } }, async (req, reply) => {
+    reply.header('cache-control', 'no-store');
+    const { action, key, required } = req.body || {};
     const by = req.auth.user?.username || req.auth.name;
+    const adminOnly = () => {
+      if (!can(req.auth.role, 'apiKeyPolicy')) throw new HttpError(403, 'Only admins can do this');
+    };
     if (action === 'generate') { const k = accounts.generateApiKey(by); return { ...accounts.apiKeyInfo(), key: k }; }
-    if (action === 'set') return accounts.setApiKey(String(key || ''), by);
-    if (action === 'disable') return accounts.setApiKey('', by);
-    throw new HttpError(400, 'action must be generate, set or disable');
+    if (action === 'set') { adminOnly(); accounts.setApiKey(String(key || ''), by); return { ...accounts.apiKeyInfo(), key: accounts.revealApiKey() }; }
+    if (action === 'require') { adminOnly(); accounts.setApiKeyRequired(required !== false); return { ...accounts.apiKeyInfo(), key: accounts.revealApiKey() }; }
+    throw new HttpError(400, 'action must be generate, set or require');
   });
 
   return { CAPS, roleLevel };

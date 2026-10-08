@@ -18,7 +18,7 @@ const accounts = new Accounts(db, {
 });
 
 // First-run bootstrap from environment variables.
-if (config.apiKey && !accounts.apiKeyInfo().set) accounts.setApiKey(config.apiKey, 'environment');
+for (const note of accounts.bootstrapApiKey({ envKey: config.apiKey, hasRecords: store.summary().records > 0 })) console.log(`API key: ${note}`);
 if (config.adminUsername && config.adminPassword && accounts.count() === 0) {
   await accounts.create({ username: config.adminUsername, password: config.adminPassword, name: 'Administrator', role: 'admin' });
   console.log(`Created admin user "${config.adminUsername}" from ADMIN_USERNAME / ADMIN_PASSWORD`);
@@ -49,7 +49,7 @@ try {
   console.log(`  Database:      ${config.dbPath} (${s.records} records, ${s.history} history rows)`);
   console.log(`  History limit: ${config.historyLimit < 0 ? 'unlimited' : config.historyLimit} per record`);
   console.log(`  Users:         ${accounts.count() || 'none yet: open the dashboard to create the first admin'}`);
-  console.log(`  API key:       ${accounts.apiKeyInfo().set ? 'set (required for anonymous check-ins)' : 'not set (check-ins are open)'}`);
+  console.log(`  API key:       ${accounts.apiKeyRequired ? 'required for check-ins (see Add Device)' : 'not required (check-ins are open to anyone who can reach the server)'}`);
   console.log(`  Entra SSO:     ${accounts.ssoReady() ? 'enabled' : 'off'}`);
   if (config.tlsDisable) console.log('  HTTPS:         disabled by TLS_DISABLE');
   else if (t.listening) console.log(`  HTTPS:         https://localhost:${t.listeningPort}/ (${t.mode === 'redirect' ? 'HTTP redirects to HTTPS' : 'HTTP also served'})${t.cert?.daysLeft < 30 ? `  ⚠ certificate expires in ${t.cert.daysLeft} days` : ''}`);

@@ -115,18 +115,78 @@ test('role permissions are enforced', async () => {
   assert.equal((await power({ method: 'PUT', url: '/api/settings', payload: { staleMinutes: 5 } })).json().staleMinutes, 5);
   assert.equal((await power({ method: 'DELETE', url: '/api/records?confirm=true' })).statusCode, 200);
   assert.equal((await power({ url: '/api/admin/users' })).statusCode, 403);
-  assert.equal((await power({ url: '/api/admin/apikey' })).statusCode, 403);
+  assert.equal((await user({ url: '/api/admin/apikey' })).statusCode, 403);
+  assert.equal((await power({ url: '/api/admin/apikey' })).statusCode, 200);
   assert.equal((await power({ url: '/api/admin/sso' })).statusCode, 403);
 
   assert.equal((await as('user', 'wrong-password')({ url: '/api/records' })).statusCode, 401);
 });
 
-test('check-ins are open only when no API key is set', async () => {
+test('check-ins require the API key by default; only admins can turn that off', async () => {
   const withKey = await setup();
   assert.equal((await withKey.app.inject({ method: 'POST', url: '/api/checkin?id=a' })).statusCode, 401);
   const noKey = await setup({}, { apiKey: false });
+  assert.equal((await noKey.app.inject({ method: 'POST', url: '/api/checkin?id=a' })).statusCode, 401);
+  await noKey.accounts.create({ username: 'pu', password: 'password1234', role: 'power' });
+  const pu = noKey.as('pu', 'password1234');
+  assert.equal((await pu({ method: 'POST', url: '/api/admin/apikey', payload: { action: 'require', required: false } })).statusCode, 403);
+  const r = await noKey.admin({ method: 'POST', url: '/api/admin/apikey', payload: { action: 'require', required: false } });
+  assert.equal(r.json().required, false);
   assert.equal((await noKey.app.inject({ method: 'POST', url: '/api/checkin?id=a' })).statusCode, 201);
   assert.equal((await noKey.app.inject({ url: '/api/records' })).statusCode, 401);
+  assert.equal((await noKey.app.inject({ url: '/api/config' })).json().apiKeyRequired, false);
+});
+
+test('power users and admins can view and regenerate the API key', async () => {
+  const { accounts, as, admin, app, key } = await setup();
+  for (const role of ['user', 'power']) await accounts.create({ username: role, password: 'password1234', role });
+  const user = as('user', 'password1234');
+  const power = as('power', 'password1234');
+  let r = await power({ url: '/api/admin/apikey' });
+  assert.equal(r.json().key, key);
+  assert.equal(r.json().revealable, true);
+  assert.equal(r.headers['cache-control'], 'no-store');
+  assert.equal((await user({ method: 'POST', url: '/api/admin/apikey', payload: { action: 'generate' } })).statusCode, 403);
+  r = await power({ method: 'POST', url: '/api/admin/apikey', payload: { action: 'generate' } });
+  const fresh = r.json().key;
+  assert.match(fresh, /^ck_/);
+  assert.notEqual(fresh, key);
+  assert.equal((await app.inject({ method: 'POST', url: '/api/checkin?id=k', headers: { 'x-api-key': key } })).statusCode, 401);
+  assert.equal((await app.inject({ method: 'POST', url: '/api/checkin?id=k', headers: { 'x-api-key': fresh } })).statusCode, 201);
+  // a custom key is admin-only
+  assert.equal((await power({ method: 'POST', url: '/api/admin/apikey', payload: { action: 'set', key: 'my-own-key-1234567890' } })).statusCode, 403);
+  r = await admin({ method: 'POST', url: '/api/admin/apikey', payload: { action: 'set', key: 'my-own-key-1234567890' } });
+  assert.equal(r.json().key, 'my-own-key-1234567890');
+});
+
+test('API key start-up: generated for new installs, older setups keep working', async () => {
+  const mk = () => new Accounts(openDb(':memory:'), { secret: crypto.randomBytes(32), sessionTtlHours: 1 });
+  // brand new install: a key is created and required
+  let a = mk();
+  a.bootstrapApiKey({ hasRecords: false });
+  assert.equal(a.apiKeyInfo().set, true);
+  assert.equal(a.apiKeyRequired, true);
+  assert.match(a.revealApiKey(), /^ck_/);
+  // API_KEY from the environment is used as-is
+  a = mk();
+  a.bootstrapApiKey({ envKey: 'env-key-1234567890abcd' });
+  assert.equal(a.revealApiKey(), 'env-key-1234567890abcd');
+  // an older hash-only key becomes viewable when API_KEY matches it
+  a = mk();
+  a.setSetting('apiKey', { hash: crypto.createHash('sha256').update('old-key-1234567890abcd').digest('hex'), prefix: 'old-ke', created: 'x', by: 'admin' });
+  assert.equal(a.apiKeyInfo().revealable, false);
+  a.bootstrapApiKey({ envKey: 'old-key-1234567890abcd', hasRecords: true });
+  assert.equal(a.revealApiKey(), 'old-key-1234567890abcd');
+  assert.equal(a.apiKeyRequired, true);
+  // an older install that ran without a key and has data stays open, but gets a key ready
+  a = mk();
+  a.bootstrapApiKey({ hasRecords: true });
+  assert.equal(a.apiKeyRequired, false);
+  assert.equal(a.apiKeyInfo().set, true);
+  // the policy is decided once; later starts don't change it
+  a.setApiKeyRequired(true);
+  a.bootstrapApiKey({ hasRecords: true });
+  assert.equal(a.apiKeyRequired, true);
 });
 
 test('browser sessions require a CSRF token for writes', async () => {
@@ -440,4 +500,53 @@ test('saved views: personal views are private, team views need power user', asyn
   // Deleting a user removes their personal views.
   await admin({ method: 'DELETE', url: `/api/admin/users/${u2.id}` });
   assert.equal(app && accounts.db.prepare('SELECT COUNT(*) AS n FROM views WHERE owner_id = ?').get(u2.id).n, 0);
+});
+
+test('agent scripts can be downloaded without signing in', async () => {
+  const { app } = await setup();
+  for (const f of ['checkin-agent.sh', 'checkin-agent.ps1']) {
+    const r = await app.inject({ url: `/agent/${f}` });
+    assert.equal(r.statusCode, 200, f);
+    assert.match(r.body, /Check-In agent/);
+  }
+  assert.equal((await app.inject({ url: '/agent/..%2fsrc%2fconfig.js' })).statusCode, 404);
+  assert.equal((await app.inject({ url: '/agent/seed.js' })).statusCode, 404);
+});
+
+test('one-line installers point back at the server they came from', async () => {
+  const { app } = await setup({ trustProxy: true });
+  let r = await app.inject({ url: '/install.sh?every=10&fields=default,security&extra=site=Dallas,owner=it', headers: { host: 'checkin.example.com', 'x-forwarded-proto': 'https' } });
+  assert.equal(r.statusCode, 200);
+  assert.match(r.body, /SERVER="\$\{CHECKIN_URL:-https:\/\/checkin\.example\.com\}"/);
+  assert.match(r.body, /EVERY="\$\{CHECKIN_EVERY:-10\}"/);
+  assert.match(r.body, /FIELDS="\$\{CHECKIN_FIELDS:-default,security\}"/);
+  assert.match(r.body, /EXTRA='site=Dallas,owner=it'/);
+  r = await app.inject({ url: '/install.ps1?every=120', headers: { host: 'checkin.example.com:8443' } });
+  assert.equal(r.statusCode, 200);
+  assert.match(r.body, /\$Server\s+= if \(\$env:CHECKIN_URL\)\s+\{ \$env:CHECKIN_URL \}\s+else \{ 'http:\/\/checkin\.example\.com:8443' \}/);
+  assert.match(r.body, /'120'/);
+  // explicit address override
+  r = await app.inject({ url: '/install.sh?url=https://ops.example.org/' });
+  assert.match(r.body, /CHECKIN_URL:-https:\/\/ops\.example\.org\}/);
+  // unsafe or invalid options are refused with a script that fails loudly
+  for (const q of ['every=0', 'every=60', 'fields=cpu,nope', "extra=a'b", 'extra=$(id)', 'url=ftp://x']) {
+    r = await app.inject({ url: '/install.sh?' + q });
+    assert.equal(r.statusCode, 400, q);
+    assert.match(r.body, /exit 1/);
+  }
+  // environment variable references are kept literally (single quotes in the Linux installer)
+  r = await app.inject({ url: '/install.sh?extra=' + encodeURIComponent('site=${SITE},owner=%USERNAME%,team=${TEAM:-it}') });
+  assert.equal(r.statusCode, 200);
+  assert.match(r.body, /EXTRA='site=\$\{SITE\},owner=%USERNAME%,team=\$\{TEAM:-it\}'/);
+  r = await app.inject({ url: '/install.ps1?extra=' + encodeURIComponent('site=%SITE%') });
+  assert.match(r.body, /else \{ 'site=%SITE%' \}/);
+  for (const bad of ['a=$HOME', 'a=$(id)', 'a=${X']) {
+    assert.equal((await app.inject({ url: '/install.sh?extra=' + encodeURIComponent(bad) })).statusCode, 400, bad);
+  }
+  r = await app.inject({ url: '/install.ps1?extra=%60whoami%60' });
+  assert.equal(r.statusCode, 400);
+  assert.match(r.body, /^throw /);
+  assert.equal((await app.inject({ url: '/install.sh', headers: { host: 'evil"host' } })).statusCode, 400);
+  // the dashboard learns the address the server sees
+  assert.equal((await app.inject({ url: '/api/config', headers: { host: 'checkin.example.com', 'x-forwarded-proto': 'https' } })).json().siteUrl, 'https://checkin.example.com');
 });

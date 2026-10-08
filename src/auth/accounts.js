@@ -21,7 +21,8 @@ export const CAPS = {
   pause: 'power',
   threshold: 'power',
   teamViews: 'power',
-  apiKey: 'admin',
+  apiKey: 'power',        // view and regenerate the API key
+  apiKeyPolicy: 'admin',  // use a custom key, or stop requiring one
   sso: 'admin',
   users: 'admin',
   tls: 'admin',
@@ -155,15 +156,51 @@ export class Accounts {
   }
 
   // ---------------------------------------------------------------- API key (stored hashed)
+  // The API key is stored twice: hashed (to check requests quickly) and encrypted with the app
+  // secret (so power users and admins can look it up again). Keys saved by older versions only
+  // have the hash and can't be shown until they are regenerated or re-supplied via API_KEY.
   apiKeyInfo() {
     const k = this.getSetting('apiKey', null);
-    return k ? { set: true, prefix: k.prefix, created: k.created, createdBy: k.by } : { set: false };
+    const required = this.apiKeyRequired;
+    return k
+      ? { set: true, required, prefix: k.prefix, created: k.created, createdBy: k.by, revealable: Boolean(k.enc) }
+      : { set: false, required };
   }
+  /** Whether anonymous check-ins must present the API key (default: yes). */
+  get apiKeyRequired() { return this.getSetting('apiKeyRequired', null) !== false; }
+  setApiKeyRequired(required) { this.setSetting('apiKeyRequired', Boolean(required)); return this.apiKeyInfo(); }
   setApiKey(key, by) {
-    if (!key) { this.setSetting('apiKey', null); return { set: false }; }
+    if (!key) throw new HttpError(400, 'API key is required');
     if (key.length < 16) throw new HttpError(400, 'API key must be at least 16 characters');
-    this.setSetting('apiKey', { hash: sha256(key), prefix: key.slice(0, 6), created: new Date().toISOString(), by });
+    this.setSetting('apiKey', { hash: sha256(key), enc: encrypt(this.secret, key), prefix: key.slice(0, 6), created: new Date().toISOString(), by });
     return this.apiKeyInfo();
+  }
+  /** The current key in plain text, or null if it was stored by an older version (hash only). */
+  revealApiKey() {
+    const k = this.getSetting('apiKey', null);
+    return k?.enc ? decrypt(this.secret, k.enc) : null;
+  }
+  /**
+   * Start-up: make sure a key exists and the policy is set.
+   * - API_KEY from the environment is used for a new install, and makes an older hash-only key viewable.
+   * - Installs from before keys were required, which already have records but no key, keep accepting
+   *   check-ins without one (so their devices don't break); everything else requires the key.
+   * Returns notes for the start-up log.
+   */
+  bootstrapApiKey({ envKey = '', hasRecords = false } = {}) {
+    const notes = [];
+    const hadKey = this.apiKeyInfo().set;
+    if (envKey) {
+      if (!hadKey) { this.setApiKey(envKey, 'environment'); notes.push('API key set from API_KEY'); }
+      else if (!this.apiKeyInfo().revealable && this.checkApiKey(envKey)) { this.setApiKey(envKey, 'environment'); }
+    }
+    if (!this.s.getSetting.get('apiKeyRequired')) {
+      const legacyOpen = !hadKey && !envKey && hasRecords;
+      this.setApiKeyRequired(!legacyOpen);
+      if (legacyOpen) notes.push('check-ins stay open without an API key, as before; an admin can require it in Admin > API key');
+    }
+    if (!this.apiKeyInfo().set) { this.generateApiKey('system'); notes.push('generated an API key; power users and admins can see it on the Add Device page'); }
+    return notes;
   }
   generateApiKey(by) {
     const key = 'ck_' + randomToken(30);

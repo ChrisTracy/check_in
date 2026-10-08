@@ -8,8 +8,8 @@
   const json = (method, body) => ({ method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
 
   const ROLES = [
-    ['admin', 'Admin', 'Everything, including users, single sign-on and the API key'],
-    ['power', 'Power user', 'User rights plus Clear all, pausing check-ins and the active threshold'],
+    ['admin', 'Admin', 'Everything, including users, single sign-on and whether the API key is required'],
+    ['power', 'Power user', 'User rights plus Clear all, pausing check-ins, the active threshold and the API key'],
     ['user', 'User', 'View, import, export and delete records'],
     ['reader', 'Reader', 'View records and history only'],
   ];
@@ -338,26 +338,35 @@
   function renderApiKey(info) {
     head('API key', 'For devices and scripts that check in or call the API');
     const origin = location.origin;
+    const isAdmin = UI.can('apiKeyPolicy');
+    const masked = info.key ? info.key.slice(0, 6) + '•'.repeat(Math.max(8, info.key.length - 6)) : '';
     $('#aBody').innerHTML = `
       <div class="admin-section">
-        <div class="radio-card" style="cursor:default;align-items:center">
-          <span style="flex:1">
-            <span class="status-line">${info.set ? '<i class="dot fresh"></i><b>API key is set</b>' : '<i class="dot aging"></i><b>No API key</b>'}</span>
-            <small>${info.set ? `Starts with <code>${esc(info.prefix)}…</code> · created ${esc(relTime(info.created))}${info.createdBy ? ' by ' + esc(info.createdBy) : ''}` : 'Anyone who can reach the server can check in. Reading data still requires sign-in.'}</small>
-          </span>
-          <span style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
+        <div class="radio-card" style="cursor:default;flex-direction:column;align-items:stretch;gap:12px">
+          <span class="status-line">${info.required ? '<i class="dot fresh"></i><b>Required for check-ins</b>' : '<i class="dot aging"></i><b>Not required: anyone who can reach the server can check in</b>'}</span>
+          ${info.key
+            ? `<div class="copy-row"><input class="input" id="kValue" readonly value="${esc(masked)}" data-shown="0" spellcheck="false">
+                 <button class="btn" id="kShow">Show</button><button class="btn" id="kCopy">Copy</button></div>`
+            : info.set
+              ? `<div class="warn-box" style="margin:0">This key (starts with <code>${esc(info.prefix)}…</code>) was saved by an older version, which stored it in a form that can't be shown again. Set <code>API_KEY</code> to the same key and restart to make it viewable, or regenerate it.</div>`
+              : ''}
+          <small class="muted">${info.set ? `Created ${esc(relTime(info.created))}${info.createdBy ? ' by ' + esc(info.createdBy) : ''}. ` : ''}Power users and admins can see it here and on the Add Device page, which puts it into the install command.</small>
+          <span style="display:flex;gap:8px;flex-wrap:wrap">
             <button class="btn primary" id="kGen">${info.set ? 'Regenerate' : 'Generate key'}</button>
-            <button class="btn" id="kSet">Use my own</button>
-            ${info.set ? '<button class="btn danger" id="kOff">Remove</button>' : ''}
+            ${isAdmin ? '<button class="btn" id="kSet">Use my own</button>' : ''}
           </span>
         </div>
       </div>
+      ${isAdmin ? `<div class="admin-section">
+        <h4>Requirement</h4>
+        <label class="switch"><input type="checkbox" id="kRequired" ${info.required ? 'checked' : ''}><span class="track"></span>Require the API key for check-ins</label>
+        <p class="muted" style="margin:0;font-size:12px">On by default. When off, anyone who can reach the server can send check-ins; reading data still needs a sign-in. Only admins can change this.</p>
+      </div>` : ''}
       <div class="admin-section">
         <h4>What the key allows</h4>
         <div class="callout">
           The API key acts like a <b>User</b>: it can check in, read records and history, import, export and delete records.
-          It cannot clear all records or change settings. While a key is set, check-ins <b>without</b> a key (or a signed-in user) are rejected.
-          The key is stored hashed, so it's shown only once when it's created.
+          It cannot clear all records or change settings. It's stored encrypted, and only power users and admins can see or regenerate it.
         </div>
       </div>
       <div class="admin-section">
@@ -367,23 +376,31 @@
 Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;status=ok" -Headers @{ "X-API-Key" = "&lt;key&gt;" }</pre>
         <p class="muted" style="margin:0;font-size:12px">You can also send <code>Authorization: Bearer &lt;key&gt;</code> or <code>?api_key=&lt;key&gt;</code>. Scripts can use a user account instead, with HTTP Basic auth (<code>curl -u user:password</code>), and get that user's role.</p>
       </div>`;
+    $('#kShow')?.addEventListener('click', (e) => {
+      const el = $('#kValue');
+      const shown = el.dataset.shown === '1';
+      el.value = shown ? masked : info.key;
+      el.dataset.shown = shown ? '0' : '1';
+      e.target.textContent = shown ? 'Show' : 'Hide';
+    });
+    $('#kCopy')?.addEventListener('click', () => copy(info.key));
     $('#kGen').addEventListener('click', () => {
       const go = async () => {
         try {
           const r = await apiJson('/api/admin/apikey', json('POST', { action: 'generate' }));
           renderApiKey(r);
           UI.state.config.apiKeySet = true;
-          setTimeout(() => showKey(r.key), 50);
+          toast('New API key created. Update your devices with it.');
         } catch (e) { toast(e.message, 'error'); }
       };
       if (!info.set) return go();
       modal({
         title: 'Regenerate API key?',
-        body: '<div class="warn-box">The current key stops working immediately. Every device using it must be updated.</div>',
+        body: '<div class="warn-box">The current key stops working immediately. Every device using it must be updated: run the install command from Add Device again, or edit the key in its settings file.</div>',
         actions: [{ label: 'Cancel' }, { label: 'Regenerate', cls: 'danger solid', onClick: go }],
       });
     });
-    $('#kSet').addEventListener('click', () => modal({
+    $('#kSet')?.addEventListener('click', () => modal({
       title: 'Use your own API key',
       body: '<label>API key<input class="input" id="kCustom" type="password" autocomplete="off" placeholder="At least 16 characters"></label><p style="font-size:12px">Use this to keep an existing key that devices already have.</p>',
       actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
@@ -394,24 +411,22 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
         } catch (e) { toast(e.message, 'error'); return false; }
       } }],
     }));
-    $('#kOff')?.addEventListener('click', () => modal({
-      title: 'Remove the API key?',
-      body: '<div class="warn-box">Check-ins will be accepted from anyone who can reach the server, without a key.</div>',
-      actions: [{ label: 'Cancel' }, { label: 'Remove key', cls: 'danger solid', onClick: async () => {
+    $('#kRequired')?.addEventListener('change', (e) => {
+      const required = e.target.checked;
+      const apply = async () => {
         try {
-          renderApiKey(await apiJson('/api/admin/apikey', json('POST', { action: 'disable' })));
-          UI.state.config.apiKeySet = false;
-          toast('API key removed');
-        } catch (e) { toast(e.message, 'error'); }
-      } }],
-    }));
-  }
-
-  function showKey(key) {
-    modal({
-      title: 'Your new API key',
-      body: `<p>Copy it now. For security it won't be shown again.</p><div class="key-reveal" id="newKey">${esc(key)}</div>`,
-      actions: [{ label: 'Copy key', cls: 'primary', onClick: () => { copy(key); return false; } }, { label: 'Done' }],
+          renderApiKey(await apiJson('/api/admin/apikey', json('POST', { action: 'require', required })));
+          UI.state.config.apiKeyRequired = required;
+          toast(required ? 'Check-ins now require the API key' : 'Check-ins no longer require the API key');
+        } catch (err) { toast(err.message, 'error'); renderApiKey(info); }
+      };
+      if (required) return apply();
+      e.target.checked = true; // stays on unless confirmed
+      modal({
+        title: 'Stop requiring the API key?',
+        body: '<div class="warn-box">Anyone who can reach this server will be able to create and change records by checking in.</div>',
+        actions: [{ label: 'Cancel' }, { label: 'Stop requiring it', cls: 'danger solid', onClick: apply }],
+      });
     });
   }
 
