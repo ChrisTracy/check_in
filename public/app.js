@@ -72,7 +72,8 @@
     rev: 0,
     fieldCounts: new Map(),
     fields: [],
-    view: Object.assign(DEFAULT_VIEW(), store.get('view', {})),
+    // First visit on a phone: cards read better than a wide table.
+    view: Object.assign(DEFAULT_VIEW(), store.get('view', null) || (matchMedia('(max-width: 720px)').matches ? { layout: 'cards' } : {})),
     viewRef: store.get('viewRef', ''), // '' = Default, 'p:<id>' = personal view, 't:<id>' = team view
     views: { personal: [], team: [] }, // saved views from the server
     settings: Object.assign({ theme: 'auto', compact: false }, store.get('settings', {}), { staleMinutes: 15 }),
@@ -993,6 +994,11 @@
     $('#pwItem').hidden = S.me.kind !== 'session';
     $('#selDelete').hidden = !can('delete');
     $('#selExport').hidden = !can('export');
+    $('#mPause').hidden = !can('pause');
+    $('#mImport').hidden = !can('import');
+    $('#mExportView').hidden = !can('export');
+    $('#mExportAll').hidden = !can('export');
+    $('#mClear').hidden = !can('clearAll');
     for (const el of [$('#userAvatar'), $('#userAvatar2')]) el.textContent = initials(u);
     $('#userName').textContent = u.name || u.username;
     $('#userName2').textContent = u.name || u.username;
@@ -1381,7 +1387,10 @@
       e.stopPropagation();
       const open = $('#userMenu').classList.contains('open');
       closeMenus();
-      if (!open) $('#userMenu').classList.add('open');
+      if (!open) {
+        $('#mPause span').textContent = S.ingest.paused ? 'Resume check-ins' : 'Pause check-ins';
+        $('#userMenu').classList.add('open');
+      }
     });
     $('#userMenu').addEventListener('click', (e) => {
       const act = e.target.closest('[data-act]')?.dataset.act;
@@ -1391,6 +1400,13 @@
       if (act === 'settings') openSettings();
       if (act === 'password') changePassword();
       if (act === 'admin') window.CheckinAdmin?.open('users');
+      // Phone-only shortcuts for the header buttons hidden on small screens
+      if (act === 'm-pause') togglePause();
+      if (act === 'm-import') $('#importFile').click();
+      if (act === 'm-export-view') exportView();
+      if (act === 'm-export-all') exportServer('/api/export.csv', 'checkins');
+      if (act === 'm-theme') $('#themeBtn').click();
+      if (act === 'm-clear') $('#clearBtn').click();
     });
 
     // selection bar

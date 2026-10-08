@@ -76,22 +76,22 @@
     const list = users.filter((u) => !q || [u.username, u.name, u.email, u.roleLabel].some((x) => String(x || '').toLowerCase().includes(q)));
     $('#aBody').innerHTML = `
       <div class="admin-section">
-        <div class="grid2" style="grid-template-columns:repeat(4,minmax(0,1fr))">
+        <div class="grid2 role-grid">
           ${ROLES.map(([r, l, d]) => `<div class="radio-card" style="cursor:default;flex-direction:column;align-items:flex-start;gap:4px"><span class="role-badge r-${r}">${esc(l)}</span><small>${esc(d)}</small></div>`).join('')}
         </div>
       </div>
-      <table class="utable">
+      <table class="utable users-table">
         <thead><tr><th>User</th><th style="width:160px">Role</th><th>Sign-in</th><th>Last sign-in</th><th>Status</th><th style="width:120px"></th></tr></thead>
         <tbody>${list.map((u) => `
           <tr class="${u.disabled ? 'disabled' : ''}" data-id="${u.id}">
-            <td><div class="ucell"><span class="avatar sm">${esc(initials(u))}</span><div style="min-width:0">
+            <td class="u-user"><div class="ucell"><span class="avatar sm">${esc(initials(u))}</span><div style="min-width:0">
               <b>${esc(u.name || u.username)} ${u.id === me ? '<span class="tag">You</span>' : ''}</b>
               <small>${esc(u.username)}${u.email && u.email !== u.username ? ' · ' + esc(u.email) : ''}</small></div></div></td>
-            <td><select class="select" data-role>${roleOptions(u.role)}</select></td>
-            <td>${u.hasPassword ? '<span class="tag">Password</span>' : ''}${u.sso ? '<span class="tag">Entra SSO</span>' : ''}${!u.hasPassword && !u.sso ? '<span class="tag">SSO (not linked yet)</span>' : ''}</td>
-            <td title="${esc(absTime(u.lastLogin))}">${u.lastLogin ? esc(relTime(u.lastLogin)) : '<span class="muted">Never</span>'}</td>
-            <td>${u.disabled ? '<span class="tag off">Disabled</span>' : '<span class="tag ok">Active</span>'}</td>
-            <td style="text-align:right;white-space:nowrap">
+            <td class="u-role"><select class="select" data-role>${roleOptions(u.role)}</select></td>
+            <td class="u-signin">${u.hasPassword ? '<span class="tag">Password</span>' : ''}${u.sso ? '<span class="tag">Entra SSO</span>' : ''}${!u.hasPassword && !u.sso ? '<span class="tag">SSO (not linked yet)</span>' : ''}</td>
+            <td class="u-last" title="${esc(absTime(u.lastLogin))}">${u.lastLogin ? esc(relTime(u.lastLogin)) : '<span class="muted">Never</span>'}</td>
+            <td class="u-status">${u.disabled ? '<span class="tag off">Disabled</span>' : '<span class="tag ok">Active</span>'}</td>
+            <td class="u-actions" style="text-align:right;white-space:nowrap">
               <button class="icon-btn" data-act="edit" title="Edit details">${ICON.edit}</button>
               <button class="icon-btn" data-act="password" title="${u.hasPassword ? 'Reset password' : 'Set password'}">${ICON.key}</button>
               ${u.id === me ? '' : `<button class="icon-btn" data-act="toggle" title="${u.disabled ? 'Enable' : 'Disable'}">${u.disabled ? ICON.check : ICON.ban}</button>

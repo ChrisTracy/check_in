@@ -347,6 +347,7 @@ The dashboard's export menu can also download the **current view**: only the fil
 - **Layouts:** Table, Cards, or an Activity feed of recent changes.
 - **Columns:** show or hide, drag to reorder (in the header or the Columns panel), and drag a column edge to resize it (double-click the edge to reset).
 - **Sort:** click a header to sort. Shift+click adds a secondary sort.
+- **Phones and tablets:** on a phone the header shrinks to the logo and your account menu, which also holds Pause, Import, Export, Clear all and dark mode. The status counts sit in one compact row, and the less-used toolbar controls scroll sideways under the search box. Menus, filters and dialogs open as bottom sheets, and Admin opens full screen with users shown as cards. The first visit on a phone starts in card view. Held sideways, the page scrolls so the list gets nearly the whole screen.
 - **Saved views:** save the current filters, search, sort, grouping, columns and layout under a name. Views are stored on the server:
   - **My views** belong to your account. Only you can see them, and they follow you to any browser.
   - **Team views** are visible to everyone. Only power users and admins can create, overwrite or delete them, and changes show up on every open dashboard straight away.

@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#4f46e5">
   <title>Check-In Dashboard</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><path d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
   <link rel="stylesheet" href="styles.css">
@@ -36,6 +37,15 @@
         <button class="user-btn" id="userBtn" title="Account"><span class="avatar" id="userAvatar">?</span><span class="who"><b id="userName"></b><small id="userRole"></small></span></button>
         <div class="menu right" id="userMenu">
           <div class="menu-head"><span class="avatar sm" id="userAvatar2">?</span><div><b id="userName2"></b><small id="userSub"></small></div></div>
+          <div class="m-only" id="mActionsMenu">
+            <button class="row-item" data-act="m-pause" id="mPause"><svg class="i" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg><span>Pause check-ins</span></button>
+            <button class="row-item" data-act="m-import" id="mImport"><svg class="i" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></svg>Import CSV</button>
+            <button class="row-item" data-act="m-export-view" id="mExportView"><svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg>Export current view</button>
+            <button class="row-item" data-act="m-export-all" id="mExportAll"><svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg>Export all records</button>
+            <button class="row-item" data-act="m-theme"><svg class="i" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Toggle dark mode</button>
+            <button class="row-item danger" data-act="m-clear" id="mClear"><svg class="i" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>Clear all records</button>
+            <hr>
+          </div>
           <button class="row-item" data-act="admin" id="adminItem"><svg class="i" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>Admin</button>
           <button class="row-item" data-act="settings"><svg class="i" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Settings</button>
           <button class="row-item" data-act="password" id="pwItem"><svg class="i" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>Change password</button>
@@ -54,7 +64,7 @@
 
   <!-- ===== Stat cards (click to filter by status) ===== -->
   <section class="stats" id="stats">
-    <button class="stat" data-status="all"><span class="label">Total records</span><span class="value" id="statTotal">0</span><span class="sub" id="statFields">0 fields</span></button>
+    <button class="stat" data-status="all"><span class="label">Total<span class="d-only">records</span></span><span class="value" id="statTotal">0</span><span class="sub" id="statFields">0 fields</span></button>
     <button class="stat" data-status="fresh"><span class="label"><i class="dot fresh"></i>Active</span><span class="value" id="statFresh">0</span><span class="sub" id="statFreshSub"></span></button>
     <button class="stat" data-status="aging"><span class="label"><i class="dot aging"></i>Aging</span><span class="value" id="statAging">0</span><span class="sub" id="statAgingSub"></span></button>
     <button class="stat" data-status="stale"><span class="label"><i class="dot stale"></i>Stale</span><span class="value" id="statStale">0</span><span class="sub" id="statStaleSub"></span></button>
@@ -80,6 +90,7 @@
           <div class="pop-actions"><button class="btn" id="fCancel">Cancel</button><button class="btn primary" id="fAdd">Add filter</button></div>
         </div>
       </div>
+      <div class="tb-scroll">
       <select id="timeRange" class="select" title="Last check-in within">
         <option value="0">Any time</option>
         <option value="5">Last 5 min</option>
@@ -111,6 +122,7 @@
         <select id="viewSelect" class="select" title="Saved views"></select>
         <button class="icon-btn" id="viewSave" title="Save view"><svg class="i" viewBox="0 0 24 24"><path d="M5 3h11l3 3v15H5zM8 3v6h8V3M8 21v-7h8v7"/></svg></button>
         <button class="icon-btn" id="viewDelete" title="Delete view"><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+      </div>
       </div>
     </div>
     <div class="chips" id="chips"></div>
