@@ -66,6 +66,8 @@
     search: '', filters: [], match: 'all', time: 0, status: 'all', sort: [{ key: 'modified', dir: 'desc' }],
     hidden: [], order: [], widths: {}, groupBy: '', layout: 'table',
   });
+  // Defaults + a saved/stored state, with every value type-checked (see viewstate.js).
+  const normView = (st) => Object.assign(DEFAULT_VIEW(), window.CheckinViewState.cleanViewState(st));
   const S = {
     records: new Map(), // id -> record
     searchText: new Map(), // id -> lowercase haystack
@@ -73,7 +75,7 @@
     fieldCounts: new Map(),
     fields: [],
     // First visit on a phone: cards read better than a wide table.
-    view: Object.assign(DEFAULT_VIEW(), store.get('view', null) || (matchMedia('(max-width: 720px)').matches ? { layout: 'cards' } : {})),
+    view: normView(store.get('view', null) || (matchMedia('(max-width: 720px)').matches ? { layout: 'cards' } : {})),
     viewRef: store.get('viewRef', ''), // '' = Default, 'p:<id>' = personal view, 't:<id>' = team view
     views: { personal: [], team: [] }, // saved views from the server
     settings: Object.assign({ theme: 'auto', compact: false }, store.get('settings', {}), { staleMinutes: 15 }),
@@ -89,6 +91,11 @@
     config: { historyLimit: 100, apiKeySet: false, apiKeyRequired: true },
     connected: false,
   };
+
+  // Ids of the records matching the current filters (built on demand, reset by computeView).
+  Object.defineProperty(S, 'matching', {
+    get() { return S.matchingCache || (S.matchingCache = new Set(S.filtered.map((r) => r.id))); },
+  });
 
   // ------------------------------------------------------------------ API
   async function api(path, opts = {}) {
@@ -134,35 +141,72 @@
     S.fields = [...S.fieldCounts.entries()].sort((a, b) => b[1] - a[1] || collator.compare(a[0], b[0])).map((e) => e[0]);
   }
 
-  async function loadAll() {
-    const data = await apiJson('/api/records');
-    S.records.clear(); S.searchText.clear(); S.fieldCounts.clear();
-    for (const r of data.records) indexRecord(r);
-    S.rev = data.rev;
-    refreshFieldList();
-    scheduleRender(true);
+  // Full download of every record: used on page load (and when the server's data was replaced).
+  let loadingAll = null;
+  function loadAll() {
+    if (loadingAll) return loadingAll;
+    loadingAll = (async () => {
+      const data = await apiJson('/api/records');
+      S.records.clear(); S.searchText.clear(); S.fieldCounts.clear();
+      for (const r of data.records) indexRecord(r);
+      S.rev = data.rev;
+      refreshFieldList();
+      scheduleRender(true);
+    })().finally(() => { loadingAll = null; });
+    return loadingAll;
   }
 
+  // Live updates. However fast devices check in, the dashboard fetches what changed at most
+  // once per LIVE_INTERVAL and re-sorts/re-renders at most that often, so thousands of
+  // devices don't keep the browser busy. Interactions (typing, sorting...) still render at once.
+  const LIVE_INTERVAL = 1000;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let fetching = false;
   let fetchAgain = false;
+  let lastFetch = 0;
   async function fetchChanges() {
     if (fetching) { fetchAgain = true; return; }
     fetching = true;
     try {
       do {
         fetchAgain = false;
+        if (loadingAll) await loadingAll.catch(() => {}); // the full load already includes these changes
+        const wait = lastFetch + LIVE_INTERVAL - Date.now();
+        if (wait > 0) await sleep(wait);
+        lastFetch = Date.now();
         const data = await apiJson('/api/records?sinceRev=' + S.rev);
+        if (data.rev < S.rev) { await loadAll(); continue; } // server data was replaced: start over
         const now = Date.now();
         for (const r of data.records) { indexRecord(r); S.flash.set(r.id, now); }
         S.rev = Math.max(S.rev, data.rev);
         if (data.records.length) {
           refreshFieldList();
-          scheduleRender(true);
+          scheduleLiveRender();
           if (S.selected && data.records.some((r) => r.id === S.selected)) refreshDrawer();
-          if (S.view.layout === 'activity') loadActivity();
+          if (S.view.layout === 'activity') loadNewActivity();
         }
       } while (fetchAgain);
     } catch (e) { console.warn(e); } finally { fetching = false; }
+  }
+
+  // After a reconnect: fetch only what changed while we were away, and drop records that were
+  // deleted meanwhile using the list of ids, instead of downloading every record again.
+  async function resync() {
+    try {
+      if (!S.rev) { await loadAll(); return; }
+      fetchChanges();
+      const { ids, rev } = await apiJson('/api/records?idsOnly=1');
+      const keep = new Set(ids);
+      // Only records the id list could know about: anything with a newer rev arrived after it.
+      const gone = [];
+      for (const [id, rec] of S.records) if (!keep.has(id) && (rec._rev || 0) <= rev) gone.push(id);
+      if (!gone.length) return;
+      for (const id of gone) { removeRecord(id); S.checked.delete(id); }
+      refreshFieldList();
+      updateSelBar();
+      if (S.selected && !S.records.has(S.selected)) closeDrawer();
+      scheduleRender(true);
+    } catch (e) { console.warn(e); }
   }
 
   // ------------------------------------------------------------------ live (SSE)
@@ -174,7 +218,7 @@
     es.addEventListener('hello', () => {
       S.connected = true;
       updateLive();
-      if (everConnected) { loadAll().catch(() => {}); loadIngest(); } // re-sync after reconnect
+      if (everConnected) { resync(); loadIngest(); if (S.view.layout === 'activity') loadActivity(); } // catch up after a reconnect
       everConnected = true;
     });
     es.addEventListener('change', (e) => {
@@ -383,16 +427,21 @@
     }
     const sorts = v.sort.filter((s) => s.key);
     if (sorts.length) {
+      // Created/Modified are ISO-8601 UTC strings, which sort correctly as plain strings and much
+      // faster than through the locale-aware comparer (this runs on every live update).
+      const cmps = sorts.map((s) => {
+        const sign = s.dir === 'desc' ? -1 : 1;
+        if (DATE_FIELDS.has(s.key)) return (a, b) => { const x = a[s.key]; const y = b[s.key]; return x === y ? 0 : (x < y ? -sign : sign); };
+        return (a, b) => sign * cmpSort(getVal(a, s.key, now), getVal(b, s.key, now));
+      });
       out.sort((a, b) => {
-        for (const s of sorts) {
-          const r = cmpSort(getVal(a, s.key, now), getVal(b, s.key, now));
-          if (r) return s.dir === 'desc' ? -r : r;
-        }
+        for (const c of cmps) { const r = c(a, b); if (r) return r; }
         return collator.compare(a.id, b.id);
       });
     }
     S.filtered = out;
     S.counts = counts;
+    S.matchingCache = null;
 
     // grouping → flattened list of { g } and { r }
     const items = [];
@@ -444,7 +493,8 @@
   function renderCols() { return canSelect() ? [SEL_KEY, ...visibleColumns()] : visibleColumns(); }
   function colWidth(c) {
     if (c === SEL_KEY) return 40;
-    if (S.view.widths[c]) return S.view.widths[c];
+    const w = Number(S.view.widths[c]);
+    if (w > 0) return Math.min(2000, Math.max(40, Math.round(w)));
     if (c === STATUS_KEY) return 92;
     if (c === 'id') return 180;
     if (c === 'modified') return 130;
@@ -456,15 +506,30 @@
   let renderQueued = false;
   let activityDirty = false;
   let needCompute = false;
-  function scheduleRender(compute) {
-    if (compute) needCompute = true;
+  let viewChanged = false;
+  // compute: re-filter/sort the records. live: the reason is new data, not a change to the view
+  // (the activity feed then only adds the new entries instead of being rebuilt).
+  function scheduleRender(compute, live = false) {
+    if (compute) { needCompute = true; if (!live) viewChanged = true; }
     if (renderQueued) return;
     renderQueued = true;
     requestAnimationFrame(() => {
       renderQueued = false;
-      if (needCompute) { computeView(); needCompute = false; renderChrome(); activityDirty = true; if (S.checked.size) updateSelBar(); }
+      if (needCompute) {
+        computeView(); needCompute = false; renderChrome();
+        if (viewChanged) { activityDirty = true; viewChanged = false; }
+        if (S.checked.size) updateSelBar();
+      }
       renderBody();
     });
+  }
+  let lastLiveRender = 0;
+  let liveTimer = null;
+  function scheduleLiveRender() {
+    if (liveTimer) return;
+    const go = () => { liveTimer = null; lastLiveRender = Date.now(); scheduleRender(true, true); };
+    const wait = lastLiveRender + LIVE_INTERVAL - Date.now();
+    if (wait <= 0) go(); else liveTimer = setTimeout(go, wait);
   }
 
   function renderChrome() {
@@ -515,7 +580,8 @@
       chips.push(`<span class="chip${bad ? ' bad' : ''}" data-edit="${i}" title="${bad ? 'This filter is invalid and is ignored. ' : ''}Click to edit · × to remove"><b>${esc(fl)}</b><span class="op">${esc(ol)}</span>${vl !== '' ? `<b>${esc(vl)}</b>` : ''}<button data-rm="f${i}" title="Remove filter">${icon(ICON.x)}</button></span>`);
     });
     if (chips.length || v.search || v.time) chips.push('<span class="chip clear" data-rm="all">Clear filters</span>');
-    $('#chips').innerHTML = chips.join('');
+    const html = chips.join('');
+    if ($('#chips').dataset.html !== html) { $('#chips').innerHTML = html; $('#chips').dataset.html = html; }
   }
 
   function renderGroupOptions() {
@@ -543,6 +609,11 @@
     th.style.minWidth = '100%';
     const sortIdx = new Map(S.view.sort.map((s, i) => [s.key, i]));
     const filtered = new Set(S.view.filters.map((f) => f.field));
+    // Live updates re-run this every second; only rebuild the header when it would look different
+    // (rebuilding it mid-drag would cancel a column drag).
+    const sig = JSON.stringify([cols, S.view.sort, [...filtered], builtinStatusLabel()]);
+    if (th.dataset.sig === sig) { syncHeaderCheckbox(); return; }
+    th.dataset.sig = sig;
     th.innerHTML = cols.map((c) => {
       if (c === SEL_KEY) return '<div class="th cbcell" title="Select all matching records"><input type="checkbox" class="cb" id="cbAll" aria-label="Select all"></div>';
       const si = sortIdx.get(c);
@@ -591,7 +662,10 @@
     $$('#layoutSeg button').forEach((b) => b.classList.toggle('active', b.dataset.layout === layout));
     if (layout === 'table') renderTableRows();
     else if (layout === 'cards') renderCards();
-    else if (layout === 'activity' && activityDirty) { activityDirty = false; renderActivity(); }
+    else if (layout === 'activity') {
+      if (activityDirty) { activityDirty = false; renderActivity(); }
+      else { const n = $('#actNote b'); if (n) n.textContent = nf.format(S.filtered.length); }
+    }
   }
 
   function rowHeight() { return S.settings.compact ? 32 : 40; }
@@ -682,20 +756,54 @@
   }
 
   // activity feed
+  // Loads the newest 300 entries once, then only fetches entries newer than the top one
+  // (without each entry's full snapshot) and prepends them, keeping at most ACT_MAX rows.
+  const ACT_PAGE = 300;
+  const ACT_MAX = 1000;
   let activity = [];
+  let activityMore = false; // older entries exist on the server
+  let actSeq = 0; // bumps on every full load so late responses are ignored
+  const actUrl = (q, limit = ACT_PAGE) => `/api/history?data=0&limit=${limit}${q}`;
   const loadActivity = debounce(async () => {
+    const seq = ++actSeq;
     try {
-      const data = await apiJson('/api/history?limit=300');
+      const data = await apiJson(actUrl(''));
+      if (seq !== actSeq) return;
       activity = data.history;
+      activityMore = data.history.length === ACT_PAGE;
       renderActivity();
     } catch (e) { console.warn(e); }
   }, 300);
+  let actFetching = false;
+  let actAgain = false;
+  async function loadNewActivity() {
+    if (actFetching) { actAgain = true; return; }
+    if (!activity.length) { loadActivity(); return; }
+    actFetching = true;
+    try {
+      do {
+        actAgain = false;
+        const seq = actSeq;
+        const top = activity[0].hid;
+        const data = await apiJson(actUrl('&after=' + top, ACT_MAX));
+        // Ignore the answer if a full load replaced the list meanwhile.
+        if (seq !== actSeq || activity[0]?.hid !== top || S.view.layout !== 'activity') return;
+        if (data.history.length >= ACT_MAX) { loadActivity(); return; } // fell too far behind: start over
+        prependActivity(data.history);
+      } while (actAgain);
+    } catch (e) { console.warn(e); } finally { actFetching = false; }
+  }
   async function loadMoreActivity() {
     const last = activity[activity.length - 1];
     if (!last) return;
-    const data = await apiJson('/api/history?limit=300&before=' + last.hid);
+    const seq = actSeq;
+    const data = await apiJson(actUrl('&before=' + last.hid));
+    if (seq !== actSeq) return;
     activity = activity.concat(data.history);
-    renderActivity();
+    activityMore = data.history.length === ACT_PAGE;
+    const list = $('#actList');
+    if (list) list.insertAdjacentHTML('beforeend', activityRows(data.history));
+    syncMoreButton();
   }
   function changesHtml(changes, max = 12) {
     const keys = Object.keys(changes);
@@ -707,25 +815,46 @@
     if (keys.length > max) parts.push(`<span class="chg">+${keys.length - max} more</span>`);
     return `<div class="changes">${parts.join('')}</div>`;
   }
+  const activityFiltering = () => { const v = S.view; return Boolean(v.search || v.filters.length || v.status !== 'all' || v.time); };
+  // Rows for these entries, limited to the records that match the current filters.
+  function activityRows(entries) {
+    let list = entries;
+    if (activityFiltering()) list = entries.filter((h) => S.matching.has(h.id));
+    return list.map((h) => `<div class="act" data-id="${esc(h.id)}" data-hid="${Number(h.hid)}">
+      <time title="${esc(absTime(h.at))}">${esc(shortTime(h.at))}</time>
+      <div class="ico ${esc(h.action)}">${icon(h.action === 'create' ? ICON.plus : Object.keys(h.changes).length ? ICON.edit : ICON.pulse)}</div>
+      <div class="what"><b>${esc(h.id)}</b> <span class="muted">${h.action === 'create' ? 'created' : 'v' + esc(h.version)}</span>${changesHtml(h.changes, 8)}</div></div>`).join('');
+  }
+  function syncMoreButton() {
+    const btn = $('#moreActivity');
+    if (btn) btn.hidden = !activityMore;
+  }
+  function prependActivity(entries) {
+    if (!entries.length) return;
+    activity = entries.concat(activity);
+    const list = $('#actList');
+    if (!list) { renderActivity(); return; }
+    // New entries may belong to records that only now match the filters: refresh the matching set.
+    if (activityFiltering()) computeView();
+    list.insertAdjacentHTML('afterbegin', activityRows(entries));
+    if (activity.length > ACT_MAX) {
+      activity.length = ACT_MAX;
+      activityMore = true;
+      // Drop the rows of entries that fell off the end (they can be loaded again with "Load older").
+      const oldest = activity[activity.length - 1].hid;
+      while (list.lastElementChild && Number(list.lastElementChild.dataset.hid) < oldest) list.lastElementChild.remove();
+    }
+    syncMoreButton();
+  }
   function renderActivity() {
     const el = $('#activity');
     if (!activity.length) {
       el.innerHTML = `<div class="empty" style="position:static;padding:60px"><div><div class="big">No activity yet</div><div>${S.config.historyLimit === 0 ? 'History is disabled (HISTORY_LIMIT=0).' : 'Check-ins will appear here as they arrive.'}</div></div></div>`;
       return;
     }
-    const v = S.view;
-    const filtering = v.search || v.filters.length || v.status !== 'all' || v.time;
-    let list = activity;
-    if (filtering) {
-      const ids = new Set(S.filtered.map((r) => r.id));
-      list = activity.filter((h) => ids.has(h.id));
-    }
-    const note = filtering ? `<div class="muted" style="padding:8px 16px;font-size:12px">Showing activity for the ${nf.format(S.filtered.length)} records matching your filters.</div>` : '';
-    el.innerHTML = note + list.map((h) => `<div class="act" data-id="${esc(h.id)}">
-      <time title="${esc(absTime(h.at))}">${esc(shortTime(h.at))}</time>
-      <div class="ico ${h.action}">${icon(h.action === 'create' ? ICON.plus : Object.keys(h.changes).length ? ICON.edit : ICON.pulse)}</div>
-      <div class="what"><b>${esc(h.id)}</b> <span class="muted">${h.action === 'create' ? 'created' : 'v' + h.version}</span>${changesHtml(h.changes, 8)}</div></div>`).join('')
-      + (activity.length % 300 === 0 ? '<button class="btn load-more" id="moreActivity">Load older</button>' : '');
+    const note = activityFiltering() ? `<div class="muted" id="actNote" style="padding:8px 16px;font-size:12px">Showing activity for the <b>${nf.format(S.filtered.length)}</b> records matching your filters.</div>` : '';
+    el.innerHTML = note + `<div id="actList">${activityRows(activity)}</div>`
+      + `<button class="btn load-more" id="moreActivity"${activityMore ? '' : ' hidden'}>Load older</button>`;
   }
 
   // ------------------------------------------------------------------ drawer
@@ -855,7 +984,7 @@
   }
   const canWriteView = (v) => Boolean(v) && (v.scope === 'personal' || can('teamViews'));
   // Comparable form of a view state (fills in defaults so old and new states line up).
-  const viewKey = (st) => JSON.stringify(Object.assign(DEFAULT_VIEW(), JSON.parse(JSON.stringify(st || {}))));
+  const viewKey = (st) => JSON.stringify(normView(st));
   function updateViewDirty() {
     const saved = findView(S.viewRef);
     const dirty = saved ? viewKey(saved.state) !== viewKey(S.view) : false;
@@ -879,7 +1008,7 @@
   function applyNamedView(ref) {
     S.viewRef = ref;
     const saved = findView(ref);
-    S.view = Object.assign(DEFAULT_VIEW(), JSON.parse(JSON.stringify(saved ? saved.state : {})));
+    S.view = normView(saved ? saved.state : {});
     S.collapsed.clear();
     syncControls();
     saveState();
@@ -1689,7 +1818,7 @@
 
     // keep relative times and fresh/aging/stale buckets current
     setInterval(() => {
-      scheduleRender(true);
+      scheduleRender(true, true);
       if (S.selected && drawerData) renderDrawer();
       if (S.ingest.paused) updateLive();
     }, 10_000);

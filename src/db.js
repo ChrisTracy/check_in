@@ -75,6 +75,12 @@ export function openDb(file) {
       at        TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_history_record ON history(record_id, hid);
+
+    -- Small key/value store for the record engine (e.g. the highest rev ever handed out).
+    CREATE TABLE IF NOT EXISTS store_meta (
+      key   TEXT PRIMARY KEY,
+      value INTEGER NOT NULL
+    );
   `);
   return db;
 }

@@ -256,9 +256,10 @@ curl -X POST http://localhost:3000/api/checkin -H "Content-Type: application/jso
 | Method & path | Description |
 |---|---|
 | `GET /api/records` | All records. Optional parameters: `q` (text search), `f.<field>=<value>` (exact match; several are combined with AND, or with OR when you add `match=any`), `sort=<field>`, `order=asc\|desc`, `limit`, `offset`, `sinceRev=<n>` (only records changed since that revision), `status=active\|aging\|stale` (comma-separate for several), `createdAfter`, `createdBefore`, `modifiedAfter`, `modifiedBefore` (an ISO date/time such as `2026-10-01T09:00:00Z`, or a relative age such as `15m`, `2h`, `7d`, `1w`). Status and date parameters always combine with AND, even with `match=any` |
+| `GET /api/records?idsOnly=1` | Just the id of every record, plus the current `rev` |
 | `GET /api/records/:id` | One record |
 | `GET /api/records/:id/history?limit=500` | One record and its history, newest first. Each entry includes `changes: { field: [old, new] }` and a full snapshot in `data` |
-| `GET /api/history?limit=200&before=<hid>` | Recent activity across all records |
+| `GET /api/history?limit=200` | Recent activity across all records, newest first. `before=<hid>` pages back, `after=<hid>` returns only newer entries, and `data=0` leaves out each entry's full snapshot (just the changes) |
 | `GET /api/fields` | Every field name in use, with how many records have it |
 | `GET /api/stats` | Counts and write statistics |
 | `GET /api/events` | Server-Sent Events stream (`change`, `delete`, `clear`) that the dashboard uses for live updates |
@@ -358,7 +359,8 @@ The dashboard's export menu can also download the **current view**: only the fil
 
 - SQLite runs in WAL mode with `synchronous=NORMAL`. Concurrent check-ins are queued and committed together, up to `MAX_BATCH` per transaction.
 - The store alone sustains about 40,000+ upserts per second. Over HTTP, a 2-vCPU test machine (also running the load generator) handled about 6,000 check-ins per second with 300 to 1,000 simultaneous connections, with no errors. A dedicated server will do better.
-- The dashboard loads all records once, then fetches only changed records (`sinceRev`) when it is notified. Rows and cards are virtualised, so tens of thousands of records stay smooth.
+- The dashboard loads all records once, then fetches only changed records (`sinceRev`), at most once a second however fast devices check in, and re-sorts at most that often. After a reconnect it fetches only what changed plus the list of ids (to drop deleted records) instead of everything. Rows and cards are virtualised, so tens of thousands of records stay smooth.
+- Responses are compressed with Brotli or gzip: the full list for 10,000 devices is about 11 MB as JSON and about 0.4 MB compressed. If your reverse proxy also compresses (Caddy `encode`), that's fine; it leaves already-compressed responses alone.
 
 Run the load test yourself while the server is running:
 

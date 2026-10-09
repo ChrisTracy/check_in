@@ -1,5 +1,8 @@
 import { HttpError } from './store.js';
 import { can } from './auth/accounts.js';
+import '../public/viewstate.js'; // defines globalThis.CheckinViewState (shared with the dashboard)
+
+const { cleanViewState } = globalThis.CheckinViewState;
 
 /**
  * Saved dashboard views, stored on the server.
@@ -7,7 +10,6 @@ import { can } from './auth/accounts.js';
  *   team     – visible to everyone; created/changed/deleted by power users and admins.
  */
 const SCOPES = new Set(['personal', 'team']);
-const STATE_KEYS = ['search', 'filters', 'match', 'time', 'status', 'sort', 'hidden', 'order', 'widths', 'groupBy', 'layout'];
 const MAX_STATE_BYTES = 64 * 1024;
 const MAX_PERSONAL = 200;
 const MAX_TEAM = 500;
@@ -22,15 +24,19 @@ function cleanName(name) {
 
 function cleanState(state) {
   if (!state || typeof state !== 'object' || Array.isArray(state)) throw new HttpError(400, 'View state must be an object');
-  const out = {};
-  for (const k of STATE_KEYS) if (k in state) out[k] = state[k];
-  const json = JSON.stringify(out);
+  // Type-checks every key: view state ends up in the dashboard's markup and styles.
+  const json = JSON.stringify(cleanViewState(state));
   if (json.length > MAX_STATE_BYTES) throw new HttpError(400, 'View is too large');
   return json;
 }
 
+function safeParse(json) {
+  try { return JSON.parse(json); } catch { return {}; }
+}
+
 const toView = (r) => ({
-  id: r.id, scope: r.scope, name: r.name, state: JSON.parse(r.state),
+  // Cleaned on the way out too, so views saved by older versions can't carry bad values.
+  id: r.id, scope: r.scope, name: r.name, state: cleanViewState(safeParse(r.state)),
   created: r.created, updated: r.updated, updatedBy: r.updated_by,
 });
 

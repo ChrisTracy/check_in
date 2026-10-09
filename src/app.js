@@ -7,6 +7,7 @@ import { Readable } from 'node:stream';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import fastifyCookie from '@fastify/cookie';
+import { registerCompression } from './compress.js';
 import { HttpError, normalizeInput } from './store.js';
 import { csvRow, parseCsv, decodeCell } from './csv.js';
 import { ROOT } from './config.js';
@@ -111,6 +112,8 @@ export function buildApp({ config, store, accounts, oidc }) {
     { parseAs: 'string' }, (req, body, done) => done(null, body));
 
   app.register(fastifyCookie);
+  // Compress JSON, CSV, scripts and styles (the full record list is ~10x smaller compressed).
+  registerCompression(app);
 
   // ---- security headers --------------------------------------------------
   app.addHook('onSend', async (req, reply, payload) => {
@@ -232,6 +235,7 @@ export function buildApp({ config, store, accounts, oidc }) {
   const view = { config: { cap: 'view' } };
   app.get('/api/records', view, async (req, reply) => {
     const q = req.query;
+    if (q.idsOnly === '1' || q.idsOnly === 'true') return store.ids();
     const filters = {};
     for (const [k, v] of Object.entries(flattenParams(q))) {
       if (k.startsWith('f.') && k.length > 2) filters[k.slice(2)] = v;
@@ -239,9 +243,10 @@ export function buildApp({ config, store, accounts, oidc }) {
     let ranges;
     try { ranges = timeRanges(q, accounts.staleMinutes); }
     catch (err) { return reply.code(400).send({ ok: false, error: err.message }); }
-    return store.list({
+    const json = store.listJson({
       sinceRev: q.sinceRev, q: q.q, filters, match: q.match, ranges, sort: q.sort, order: q.order, limit: q.limit, offset: q.offset,
     });
+    return reply.type('application/json; charset=utf-8').send(json);
   });
 
   app.get('/api/records/:id', view, async (req, reply) => {
@@ -257,7 +262,10 @@ export function buildApp({ config, store, accounts, oidc }) {
     return { id: req.params.id, record: rec, history };
   });
 
-  app.get('/api/history', view, async (req) => ({ history: store.recentHistory(req.query) }));
+  app.get('/api/history', view, async (req) => {
+    const q = req.query;
+    return { history: store.recentHistory({ limit: q.limit, before: q.before, after: q.after, data: q.data !== '0' && q.data !== 'false' }) };
+  });
   app.get('/api/fields', view, async () => ({ fields: store.fields() }));
   app.get('/api/stats', view, async () => store.summary());
 
@@ -383,11 +391,16 @@ export function buildApp({ config, store, accounts, oidc }) {
     req.raw.on('close', () => clients.delete(res));
   });
 
-  app.addHook('onClose', async () => {
-    await tlsManager.close();
+  // End the live streams *before* the server stops listening: an open SSE stream keeps the HTTP
+  // server from closing, so shutdown would hang until Docker kills the container, and dashboards
+  // would keep showing "Live" while nothing arrives.
+  app.addHook('preClose', async () => {
     clearInterval(heartbeat);
     for (const res of clients) res.end();
     clients.clear();
+  });
+  app.addHook('onClose', async () => {
+    await tlsManager.close();
   });
 
   return app;

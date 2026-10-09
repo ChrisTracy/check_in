@@ -228,6 +228,8 @@ body.compact .td { font-size: 13px; }
 /* activity */
 .activity-wrap { padding: 4px 0; }
 .act { display: grid; grid-template-columns: 110px 28px 1fr; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--border); cursor: pointer; align-items: start; }
+/* Off-screen rows skip layout and paint: the live feed prepends rows every second. */
+.act { content-visibility: auto; contain-intrinsic-size: auto 62px; }
 .act:hover { background: var(--hover); }
 .act time { color: var(--muted); font-size: 12px; padding-top: 3px; font-variant-numeric: tabular-nums; }
 .act .ico { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; background: var(--hover); color: var(--text-2); }

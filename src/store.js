@@ -46,6 +46,17 @@ export function normalizeInput(input, { maxFields = 500, skipEmpty = false } = {
 
 const jsonPath = (field) => '$."' + String(field).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
 
+/**
+ * The same record as toRecord(), serialised straight from the stored JSON without parsing it.
+ * Building the full list this way is several times faster, which matters because it runs on the
+ * event loop that also accepts check-ins.
+ */
+export function recordJson(row) {
+  const head = `{"id":${JSON.stringify(row.id)},"created":${JSON.stringify(row.created)},"modified":${JSON.stringify(row.modified)},"_version":${Number(row.version)},"_rev":${Number(row.rev)}`;
+  const d = row.data;
+  return d.length > 2 && d[0] === '{' ? head + ',' + d.slice(1) : head + '}';
+}
+
 export function toRecord(row) {
   const out = { id: row.id, created: row.created, modified: row.modified, _version: row.version, _rev: row.rev };
   const data = JSON.parse(row.data);
@@ -67,7 +78,13 @@ export class Store extends EventEmitter {
     this.maxFields = maxFields;
     this.queue = [];
     this.scheduled = false;
-    this.rev = db.prepare('SELECT COALESCE(MAX(rev), 0) AS r FROM records').get().r;
+    // The rev counter must never go backwards, even when the newest records were deleted before a
+    // restart: dashboards catch up with "everything after rev N" and would miss reused numbers.
+    this.rev = Math.max(
+      db.prepare('SELECT COALESCE(MAX(rev), 0) AS r FROM records').get().r,
+      db.prepare("SELECT COALESCE(MAX(value), 0) AS r FROM store_meta WHERE key = 'rev'").get().r,
+    );
+    this.saveRev = db.prepare("INSERT INTO store_meta (key, value) VALUES ('rev', ?) ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)");
     this.stats = { writes: 0, batches: 0, startedAt: new Date().toISOString() };
 
     this.s = {
@@ -212,7 +229,20 @@ export class Store extends EventEmitter {
    * Query records.
    * filters: { field: value } exact match (string compare); q: free-text over id + data.
    */
-  list({ sinceRev, q, filters = {}, match = 'all', ranges = [], sort, order, limit, offset } = {}) {
+  list(opts = {}) {
+    const { rows, total } = this.#query(opts);
+    return { records: rows.map(toRecord), total, rev: this.rev };
+  }
+
+  /** list() as a JSON string (what the API sends). */
+  listJson(opts = {}) {
+    const { rows, total } = this.#query(opts);
+    let out = '{"records":[';
+    for (let i = 0; i < rows.length; i++) out += (i ? ',' : '') + recordJson(rows[i]);
+    return out + `],"total":${total},"rev":${this.rev}}`;
+  }
+
+  #query({ sinceRev, q, filters = {}, match = 'all', ranges = [], sort, order, limit, offset } = {}) {
     const where = [];
     const params = [];
     if (sinceRev !== undefined && sinceRev !== null && sinceRev !== '') {
@@ -266,7 +296,7 @@ export class Store extends EventEmitter {
     }
     const rows = this.db.prepare(sql).all(...params, ...sortParams, ...pageParams);
     const total = this.db.prepare(countSql).get(...params).n;
-    return { records: rows.map(toRecord), total, rev: this.rev };
+    return { rows, total };
   }
 
   /** Iterate every record (for CSV export) without loading them all at once. */
@@ -282,12 +312,24 @@ export class Store extends EventEmitter {
     ).all(id, Math.min(Number(limit) || 500, 100000)).map(parseHist);
   }
 
-  recentHistory({ limit = 200, before } = {}) {
+  /**
+   * Newest history across all records. `before` pages back (hid < before); `after` returns
+   * only entries newer than a hid the caller already has. `data: false` leaves out the full
+   * snapshot of each entry (the activity feed only needs the changes).
+   */
+  recentHistory({ limit = 200, before, after, data = true } = {}) {
     const lim = Math.min(Number(limit) || 200, 5000);
-    const rows = before
-      ? this.db.prepare('SELECT hid, record_id AS id, version, action, changes, data, at FROM history WHERE hid < ? ORDER BY hid DESC LIMIT ?').all(Number(before), lim)
-      : this.db.prepare('SELECT hid, record_id AS id, version, action, changes, data, at FROM history ORDER BY hid DESC LIMIT ?').all(lim);
+    const cols = data ? 'hid, record_id AS id, version, action, changes, data, at' : 'hid, record_id AS id, version, action, changes, at';
+    let rows;
+    if (before) rows = this.db.prepare(`SELECT ${cols} FROM history WHERE hid < ? ORDER BY hid DESC LIMIT ?`).all(Number(before), lim);
+    else if (after !== undefined && after !== null && after !== '') rows = this.db.prepare(`SELECT ${cols} FROM history WHERE hid > ? ORDER BY hid DESC LIMIT ?`).all(Number(after) || 0, lim);
+    else rows = this.db.prepare(`SELECT ${cols} FROM history ORDER BY hid DESC LIMIT ?`).all(lim);
     return rows.map(parseHist);
+  }
+
+  /** Every record id plus the current rev (lets a reconnecting dashboard drop deleted records). */
+  ids() {
+    return { ids: this.db.prepare('SELECT id FROM records').all().map((r) => r.id), rev: this.rev };
   }
 
   *iterateHistory() {
@@ -302,6 +344,7 @@ export class Store extends EventEmitter {
     this.db.transaction(() => {
       this.s.del.run(id);
       this.s.pruneAll.run(id);
+      this.saveRev.run(this.rev);
     })();
     for (const k in JSON.parse(row.data)) this.#bumpField(k, -1);
     this.emit('delete', { ids: [id] });
@@ -321,6 +364,7 @@ export class Store extends EventEmitter {
         for (const k in JSON.parse(row.data)) this.#bumpField(k, -1);
         deleted.push(id);
       }
+      if (deleted.length) this.saveRev.run(this.rev);
     })();
     if (deleted.length) this.emit('delete', { ids: deleted });
     return deleted;
@@ -333,6 +377,7 @@ export class Store extends EventEmitter {
     const history = this.s.histCount.get().n;
     this.db.transaction(() => {
       this.db.exec('DELETE FROM records; DELETE FROM history;');
+      this.saveRev.run(this.rev);
     })();
     this.db.pragma('wal_checkpoint(TRUNCATE)');
     this.fieldCounts.clear();
@@ -361,5 +406,5 @@ export class Store extends EventEmitter {
 
 function parseHist(r) {
   return { hid: r.hid, id: r.id, version: r.version, action: r.action, at: r.at,
-    changes: JSON.parse(r.changes), data: JSON.parse(r.data) };
+    changes: JSON.parse(r.changes), ...(r.data !== undefined ? { data: JSON.parse(r.data) } : {}) };
 }

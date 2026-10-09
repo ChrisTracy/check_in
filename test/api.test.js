@@ -550,3 +550,60 @@ test('one-line installers point back at the server they came from', async () => 
   // the dashboard learns the address the server sees
   assert.equal((await app.inject({ url: '/api/config', headers: { host: 'checkin.example.com', 'x-forwarded-proto': 'https' } })).json().siteUrl, 'https://checkin.example.com');
 });
+
+test('saved views: state is type-checked so it cannot inject markup', async () => {
+  const { as, accounts } = await setup();
+  await accounts.create({ username: 'pu', password: 'powerpass123', role: 'power' });
+  const pu = as('pu', 'powerpass123');
+  const state = {
+    widths: { id: '1px;background:url(x)"><img src=x onerror=alert(1)>', site: 250.4, big: 99999, small: 1, bad: 'abc', __proto__x: 100 },
+    filters: [{ field: 'site', op: 'eq', value: 'Dallas' }, { field: 'x', op: '"><script>' }, 'junk', { field: 'n', op: 'gt', value: 5 }],
+    sort: [{ key: 'modified', dir: 'sideways' }, { key: { a: 1 } }],
+    hidden: ['a', 7, null, { x: 1 }], status: 'evil', match: 'x', layout: '<b>', time: 'soon', search: 42, groupBy: ['x'],
+  };
+  const r = await pu({ method: 'POST', url: '/api/views', payload: { name: 'Ops', scope: 'team', state } });
+  assert.equal(r.statusCode, 201, r.body);
+  const s = r.json().view.state;
+  assert.deepEqual(s.widths, { site: 250, big: 2000, small: 40, __proto__x: 100 });
+  assert.deepEqual(s.filters, [{ field: 'site', op: 'eq', value: 'Dallas' }, { field: 'n', op: 'gt', value: '5' }]);
+  assert.deepEqual(s.sort, [{ key: 'modified', dir: 'desc' }]);
+  assert.deepEqual(s.hidden, ['a', '7']);
+  assert.equal(s.status, 'all'); assert.equal(s.match, 'all'); assert.equal(s.layout, 'table');
+  assert.equal(s.time, 0); assert.equal(s.search, '42'); assert.equal(s.groupBy, '');
+  // Views stored before this check are cleaned when they're read.
+  accounts.db.prepare('UPDATE views SET state = ?').run(JSON.stringify({ widths: { id: '1px;x' }, layout: 'cards' }));
+  const v = (await pu({ url: '/api/views' })).json().team[0];
+  assert.deepEqual(v.state, { widths: {}, layout: 'cards' });
+  // "Not in the last hour" is a negative time and must survive.
+  const neg = await pu({ method: 'POST', url: '/api/views', payload: { name: 'Quiet', scope: 'team', state: { time: -60 } } });
+  assert.equal(neg.json().view.state.time, -60);
+});
+
+test('responses are compressed; id list and lightweight activity feed', async () => {
+  const { call } = await setup({ historyLimit: 10 });
+  for (let i = 0; i < 50; i++) await call({ method: 'POST', url: '/api/checkin', payload: { id: `dev-${i}`, site: 'Dallas', note: 'x'.repeat(50) } });
+  await call({ method: 'POST', url: '/api/checkin', payload: { id: 'dev-1', site: 'Austin' } });
+  let r = await call({ url: '/api/records', headers: { 'accept-encoding': 'gzip' } });
+  assert.equal(r.headers['content-encoding'], 'gzip');
+  r = await call({ url: '/api/records', headers: { 'accept-encoding': 'br, gzip' } });
+  assert.equal(r.headers['content-encoding'], 'br');
+  r = await call({ url: '/api/records?idsOnly=1' });
+  assert.equal(r.json().ids.length, 50);
+  assert.equal(r.json().rev, 51);
+  const all = (await call({ url: '/api/history?limit=100&data=0' })).json().history;
+  assert.equal(all.length, 51);
+  assert.equal(all[0].data, undefined);
+  assert.deepEqual(all[0].changes.site, ['Dallas', 'Austin']);
+  const newer = (await call({ url: `/api/history?after=${all[3].hid}` })).json().history;
+  assert.deepEqual(newer.map((h) => h.hid), all.slice(0, 3).map((h) => h.hid));
+  assert.ok(newer[0].data);
+});
+
+test('the rev counter never goes backwards after deleting the newest records', async () => {
+  const db = openDb(':memory:');
+  const store = new Store(db, { historyLimit: 3, maxBatch: 100 });
+  await store.upsert({ id: 'a' }); await store.upsert({ id: 'b' }); await store.upsert({ id: 'c' });
+  assert.equal(store.rev, 3);
+  store.deleteMany(['b', 'c']);
+  assert.equal(new Store(db, { historyLimit: 3, maxBatch: 100 }).rev, 3); // as after a restart
+});
