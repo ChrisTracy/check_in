@@ -361,7 +361,7 @@ The dashboard's export menu can also download the **current view**: only the fil
   **Default view** (the star next to the views menu) picks the view that opens when the page loads:
   - **My default** is stored on your account, so it follows you to any browser. It can be one of your views, a team view, or the **Default View** (the standard layout).
   - **Team default** (power users and admins) is a team view that opens for everyone who hasn't picked their own.
-  - With neither set, the dashboard reopens the way you left it in that browser. The current default is marked ★ in the views menu, and deleting a view clears any default that pointed to it.
+  - With neither set, the dashboard reopens the way you left it in that browser. In the views menu, a star with one person marks your default and a star with two people marks the team default (hover for a description). Deleting a view clears any default that pointed to it.
 - **Record drawer:** click a row to see every field and a timeline of changes.
 - **Multi-select:** tick the checkboxes in the table (Shift+click selects a range) or on cards. The header checkbox selects every matching row. A bar appears where you can **Delete** or **Export** the selection; the Delete key works too. Esc clears the selection.
 - **Live updates:** changes stream in as they happen.

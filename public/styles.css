@@ -126,7 +126,7 @@ h1 { font-size: 18px; margin: 0; letter-spacing: -.01em; }
 .seg button { width: 34px; height: 28px; border: 0; background: transparent; border-radius: 6px; display: grid; place-items: center; cursor: pointer; color: var(--muted); }
 .seg button.active { background: var(--accent-soft); color: var(--accent); }
 .views { display: flex; gap: 4px; align-items: center; }
-.views .select { max-width: 180px; }
+.views .select { max-width: 200px; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .chips:empty { display: none; }
 .chip { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 4px 0 10px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 500; border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); }
@@ -857,3 +857,19 @@ body.compact .td { font-size: 13px; }
   .bx-min { flex: 1 1 40%; }
   .bx-tools { flex: 1 1 100%; justify-content: flex-end; }
 }
+
+/* ===== Saved views menu ===== */
+.view-btn { display: inline-flex; align-items: center; gap: 6px; text-align: left; color: var(--text); font: inherit; }
+.view-btn #viewBtnName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.view-btn #viewBtnBadges { display: inline-flex; flex: none; }
+.view-menu { min-width: 220px; max-height: min(60vh, 420px); overflow: auto; }
+.view-menu .vm-head { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 10px 10px 4px; }
+.menu > button.vm-item { flex-direction: row; align-items: center; gap: 8px; }
+.vm-item .vm-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vm-item.sel { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.vbadge { display: inline-flex; align-items: center; gap: 1px; flex: none; padding: 1px 4px; border-radius: 999px; cursor: help; }
+.vbadge .i { width: 13px; height: 13px; }
+.vbadge .star, .vbadge .person { fill: currentColor; }
+.vbadge .person { stroke: none; width: 14px; height: 14px; }
+.vbadge.mine { color: var(--accent); }
+.vbadge.team { color: var(--aging); }

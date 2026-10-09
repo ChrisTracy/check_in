@@ -24,6 +24,9 @@
     pause: 'M8 5v14M16 5v14', play: 'M7 4l13 8-13 8z',
     up: 'M6 15l6-6 6 6', down: 'M6 9l6 6 6-6', trash: 'M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3',
     sliders: 'M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0M16 4v4M10 10v4M18 16v4',
+    star: 'M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z',
+    user: 'M16 8a4 4 0 1 1-8 0 4 4 0 0 1 8 0M4 21a8 8 0 0 1 16 0',
+    users: 'M13 8a4 4 0 1 1-8 0 4 4 0 0 1 8 0M2 21a7 7 0 0 1 14 0M17 11a3 3 0 1 0 0-6M22 21a6 6 0 0 0-4-5.6',
   };
 
   function relTime(iso, now = Date.now()) {
@@ -1187,14 +1190,23 @@
   function renderViewSelect() {
     if (S.viewsLoaded && S.viewRef && !findView(S.viewRef)) { S.viewRef = ''; saveState(); }
     const def = effectiveDefault();
-    const mineIsSet = S.viewDefaults.mine && S.viewDefaults.mine !== 'builtin' && findView(S.viewDefaults.mine);
-    const mark = (ref) => (ref === def ? (mineIsSet ? ' ★ my default' : ' ★ team default') : '');
-    const opt = (v) => `<option value="${viewRef(v)}" title="${esc(v.scope === 'team' ? `Updated by ${v.updatedBy || 'unknown'}` : 'Only you can see this view')}">${esc(v.name)}${mark(viewRef(v))}</option>`;
+    const cur = findView(S.viewRef) ? S.viewRef : '';
     const { personal, team } = S.views;
-    $('#viewSelect').innerHTML = `<option value="">Default View${def === '' ? ' ★ my default' : ''}</option>`
-      + (personal.length ? `<optgroup label="My views">${personal.map(opt).join('')}</optgroup>` : '')
-      + (team.length ? `<optgroup label="Team views">${team.map(opt).join('')}</optgroup>` : '');
-    $('#viewSelect').value = findView(S.viewRef) ? S.viewRef : '';
+    // Default markers: star + one person = your default, star + two people = the team default.
+    const mineRef = S.viewDefaults.mine === 'builtin' ? '' : (S.viewDefaults.mine && findView(S.viewDefaults.mine) ? S.viewDefaults.mine : null);
+    const teamRef = S.viewDefaults.team && findView(S.viewDefaults.team) ? S.viewDefaults.team : null;
+    // Solid silhouettes read better than outlines at this size; the second person sits behind, faded.
+    const svgUser = '<svg class="i person" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4.2"/><path d="M3.5 21c0-4.4 3.8-7.5 8.5-7.5s8.5 3.1 8.5 7.5z"/></svg>';
+    const svgUsers = '<svg class="i person" viewBox="0 0 24 24"><g opacity=".5"><circle cx="16.5" cy="7.5" r="3.4"/><path d="M13.5 13.9c1-.5 2-.8 3-.8 3.7 0 6.5 2.6 6.5 6.4h-6.2c-.3-2.3-1.4-4.3-3.3-5.6z"/></g><circle cx="8.5" cy="9" r="3.8"/><path d="M1 21c0-4 3.3-6.8 7.5-6.8S16 17 16 21z"/></svg>';
+    const badges = (ref) => (ref === mineRef ? `<span class="vbadge mine" title="Your default view: opens when you load the dashboard">${icon(ICON.star, 'i star')}${svgUser}</span>` : '')
+      + (ref === teamRef ? `<span class="vbadge team" title="Team default view: opens for everyone who hasn't picked their own${mineRef !== null && ref !== mineRef ? ' (you picked another)' : ''}">${icon(ICON.star, 'i star')}${svgUsers}</span>` : '');
+    const item = (ref, name, title) => `<button type="button" class="vm-item${ref === cur ? ' sel' : ''}" data-ref="${esc(ref)}" role="option" aria-selected="${ref === cur}">
+        <span class="vm-name" title="${esc(title)}">${esc(name)}</span>${badges(ref)}</button>`;
+    $('#viewMenu').innerHTML = item('', 'Default View', 'The standard layout')
+      + (personal.length ? '<div class="vm-head">My views</div>' + personal.map((v) => item(viewRef(v), v.name, 'Only you can see this view')).join('') : '')
+      + (team.length ? '<div class="vm-head">Team views</div>' + team.map((v) => item(viewRef(v), v.name, `Team view, updated by ${v.updatedBy || 'unknown'}`)).join('') : '');
+    $('#viewBtnName').textContent = cur ? findView(cur).name : 'Default View';
+    $('#viewBtnBadges').innerHTML = badges(cur);
     const del = canWriteView(findView(S.viewRef));
     $('#viewDelete').disabled = !del;
     $('#viewDelete').style.opacity = del ? 1 : .4;
@@ -2052,7 +2064,13 @@
     });
 
     // views
-    $('#viewSelect').addEventListener('change', (e) => applyNamedView(e.target.value));
+    toggle('#viewBtn', '#viewMenu');
+    $('#viewMenu').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-ref]');
+      if (!b) return;
+      closeMenus();
+      applyNamedView(b.dataset.ref);
+    });
     $('#viewSave').addEventListener('click', openSaveView);
     $('#viewDelete').addEventListener('click', deleteCurrentView);
     $('#viewDefault').addEventListener('click', openDefaultView);
