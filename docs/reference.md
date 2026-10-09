@@ -384,6 +384,26 @@ From PowerShell (Windows PowerShell 5.1 or PowerShell 7), this fires 500 simulta
 .\scripts\loadtest.ps1 -Count 2000 -Rounds 5 -ApiKey ck_xxx
 ```
 
+### Simulating a fleet (continuous load test)
+
+`scripts/loadtest-fleet.ps1` (Windows PowerShell 5.1 or PowerShell 7) runs a simulated fleet until you press Ctrl+C. Every device sends its own check-in with agent-like fields, and you choose how many show up in each state:
+
+```powershell
+.\scripts\loadtest-fleet.ps1 -Url https://checkin.example.com -ApiKey ck_xxx `
+  -Active 5000 -Aging 200 -Stale 100 -IntervalSeconds 60 `
+  -HighCpu 50 -HighMemory 40 -HighDiskActivity 20 -LowDiskSpace 30 -RebootRequired 120 -NotDomainJoined 10 -FailedServices 25
+.\scripts\loadtest-fleet.ps1 -Active 10000 -IntervalSeconds 30 -Burst -Minutes 10   # all at once every 30 s, for 10 minutes
+.\scripts\loadtest-fleet.ps1 -DryRun                                                 # show the plan and a sample check-in
+.\scripts\loadtest-fleet.ps1 -Cleanup                                                # delete the simulated records
+```
+
+- **Active** devices check in every `-IntervalSeconds`, spread over the interval like real agents (`-Burst` sends them all at once). The interval must be shorter than the active threshold.
+- **Aging** devices check in just before they'd turn stale. The script runs enough of them, staggered, that about `-Aging` are aging at any moment; the others in that group are in the active part of their cycle and count towards `-Active`.
+- **Stale** devices check in once (only if they don't exist yet), then never again.
+- **Problems** (`-HighCpu`, `-HighMemory`, `-HighDiskActivity`, `-LowDiskSpace`, `-RebootRequired`, `-NotDomainJoined`, `-FailedServices`) go to that many active devices and hold on every check-in, with values that trip the Status box presets (for example `cpu_pct` 92-99).
+- The script reads the active threshold from the server. Status comes from the time of the last check-in, so aging settles after about twice the threshold and new stale devices turn stale after twice the threshold; for a quick demo, set the threshold to 1 or 2 minutes in Settings first.
+- Every few seconds it prints check-ins sent, failures by HTTP status, and latency (p50 / p95 / p99 / max); totals when it stops. Simulated ids start with `-Prefix` (default `LT-`) and carry `sim_group` (active, aging, stale), so they're easy to filter.
+
 ## Agents (Windows and Linux)
 
 Two ready-made agents report a machine to the server: `scripts/checkin-agent.ps1` for Windows (Windows PowerShell 5.1 or PowerShell 7) and `scripts/checkin-agent.sh` for Linux (bash and curl). Each run:
@@ -562,7 +582,7 @@ src/
     oidc.js      Microsoft Entra ID (OIDC, code flow + PKCE)
     security.js  scrypt hashing, encryption, rate limiting
 public/       dashboard and login page (index.html, login.html, app.js, admin.js, agents.js, chart.js, viewstate.js, login.js, styles.css; no build step)
-scripts/      seed.js, loadtest.js, loadtest.ps1, checkin-agent.sh, checkin-agent.ps1 (agents served at /agent/...)
+scripts/      seed.js, loadtest.js, loadtest.ps1, loadtest-fleet.ps1, checkin-agent.sh, checkin-agent.ps1 (agents served at /agent/...)
 test/         API tests (node:test)
 ```
 
