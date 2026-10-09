@@ -152,7 +152,7 @@ Notes:
 | Check in (API) | | ✓ | ✓ | ✓ |
 | Import CSV, export CSV | | ✓ | ✓ | ✓ |
 | Delete records (single or multi-select) | | ✓ | ✓ | ✓ |
-| **Clear all**, pause/resume check-ins, change the active threshold, create/edit/delete team views | | | ✓ | ✓ |
+| **Clear all**, pause/resume check-ins, change the active threshold, create/edit/delete team views, set up status boxes | | | ✓ | ✓ |
 | See and regenerate the API key | | | ✓ | ✓ |
 | Manage users and single sign-on; use a custom API key or stop requiring one | | | | ✓ |
 
@@ -298,6 +298,8 @@ curl -X POST http://localhost:3000/api/checkin -H "Content-Type: application/jso
 | `GET /api/views` | any signed-in user | `{ "personal": [...], "team": [...] }`. Each view has `id`, `scope`, `name`, `state`, `updated` and `updatedBy` |
 | `POST /api/views` | any signed-in user (team: Power user or Admin) | `{ "scope": "personal" \| "team", "name": "…", "state": {…} }`. Saving under an existing name in the same scope overwrites that view. Personal views need a user account, not the API key |
 | `PUT /api/views/:id`, `DELETE /api/views/:id` | owner (personal) or Power user/Admin (team) | Rename or update `state`, or delete |
+| `GET /api/boxes` | any signed-in user | `{ "boxes": [...] }`: the status boxes, in order. Each has `id`, `name`, `field`, `op` (`gt`, `gte`, `lt`, `lte`, `eq`, `neq`, `contains`, `ncontains`, `empty`, `nempty`), `value`, `minutes`, `tone` (`bad`, `warn`, `info`, `neutral`), `ignoreStale` and `enabled` |
+| `PUT /api/boxes` | Power user or Admin | `{ "boxes": [...] }` replaces the whole list (up to 24). Records then carry `_boxes: { "<box id>": "<since>" }`: when each box's condition started holding for that record |
 | `GET /api/status` | public | `{ "accepting": true, "paused": false, "since": "…" }`. Signed-in callers also get `by` (who paused it) |
 | `PUT /api/status` | Power user or Admin | `{ "paused": true }` to stop accepting check-ins, `{ "paused": false }` to resume |
 
@@ -329,6 +331,12 @@ The dashboard's export menu can also download the **current view**: only the fil
 ## Dashboard
 
 - **Status cards:** Active, Aging and Stale are based on time since the last check-in. The threshold is set in Settings (default 15 minutes; Aging runs up to 2× the threshold). Click a card to filter by that status.
+- **Status boxes** (optional): extra cards under Active / Aging / Stale that count devices matching a rule, for example **High CPU**: `cpu_pct > 90` for at least 10 minutes. Power users and admins set them up from the account menu → **Status boxes** (or the sliders button at the end of the row); everyone sees them. There are presets for high CPU, high memory, high disk activity, low disk space, reboot required and not domain joined, or build one on any field with the same conditions as filters. Each box has:
+  - **For at least N minutes:** every check-in for that long matched (0 = the latest one matches). The server records when each device started matching and keeps it across restarts. When you create or change a box it works this out from the stored history, so with a short `HISTORY_LIMIT` it can only look back that far.
+  - **Don't count stale devices** (on by default): a device that stopped checking in keeps its last reading, which is out of date.
+  - A color, and a switch to hide it without deleting it.
+
+  Click a box to show just those devices (click again to clear); the box filter is saved with views. A device's details show which boxes it's in, since when, or how far along it is (for example "4 min of 10 min").
 - **Search** across every field. Press `/` to jump to the search box.
 - **Filters:** use the **Filter** button or the funnel icon on any column header. The conditions offered depend on the field:
   - **Text fields** (custom fields, ID, Any field): contains, does not contain, is, is not, starts with, greater/less than, matches regex, is empty, is not empty. The panel shows the most common values for one-click filtering.
@@ -342,7 +350,7 @@ The dashboard's export menu can also download the **current view**: only the fil
 - **Columns:** show or hide, drag to reorder (in the header or the Columns panel), and drag a column edge to resize it (double-click the edge to reset).
 - **Sort:** click a header to sort. Shift+click adds a secondary sort.
 - **Phones and tablets:** on a phone the header shrinks to the logo and your account menu, which also holds Pause, Import, Export, Clear all and dark mode. The status counts sit in one compact row, and the less-used toolbar controls scroll sideways under the search box. Menus, filters and dialogs open as bottom sheets, and Admin opens full screen with users shown as cards. The first visit on a phone starts in card view. Held sideways, the page scrolls so the list gets nearly the whole screen.
-- **Graph tab:** in a record's details, **Graph** plots CPU %, RAM % and disk space used % over the record's stored history (the last `HISTORY_LIMIT` check-ins), with hover details, per-line toggles and a min / avg / max / latest table. It reads `cpu_pct`, `ram_pct` and `disk_pct` (what the agents send) or common alternatives such as `cpu`, `mem_pct` and `disk`. The tab is greyed out for records without any of these.
+- **Graph tab:** in a record's details, **Graph** plots CPU %, RAM %, disk space used % and disk activity % over the record's stored history (the last `HISTORY_LIMIT` check-ins), with hover details, per-line toggles and a min / avg / max / latest table. It reads `cpu_pct`, `ram_pct`, `disk_pct` and `disk_busy_pct` (what the agents send) or common alternatives such as `cpu`, `mem_pct`, `disk` and `disk_util_pct`. The tab is greyed out for records without any of these.
 - **Saved views:** save the current filters, search, sort, grouping, columns and layout under a name. Views are stored on the server:
   - **My views** belong to your account. Only you can see them, and they follow you to any browser.
   - **Team views** are visible to everyone. Only power users and admins can create, overwrite or delete them, and changes show up on every open dashboard straight away.
@@ -395,7 +403,7 @@ Both agents use the same field names, so filters and saved views work across Win
 | `system` | hostname, fqdn, os, os_version, arch, vendor, model, serial, virtualization (+ `os_build`, `os_release` on Windows; `kernel` on Linux) |
 | `cpu` | cpu_pct, cpu_cores, cpu_model (+ load_1m/5m/15m on Linux) |
 | `ram` | ram_pct, ram_used_mb, ram_total_mb, swap_pct (page file on Windows) |
-| `disk` | Disk **space**, not activity: disk_pct (% of the system drive / root filesystem in use), disk_free_gb, disk_size_gb, disk_max_pct and disk_max_mount (the fullest drive) |
+| `disk` | Disk **activity**: disk_busy_pct (how much of a one-second sample the busiest physical disk was busy, like `iostat` %util on Linux or 100 − % Idle Time on Windows; taken in the same second as cpu_pct, so it adds no extra wait). Disk **space**: disk_pct (% of the system drive / root filesystem in use), disk_free_gb, disk_size_gb, disk_max_pct and disk_max_mount (the fullest drive) |
 | `time` | system_time, timezone, time_synced, time_source |
 | `uptime` | boot_time, uptime, uptime_h |
 | `network` | ip, interface, mac, gateway, dns_servers |
@@ -544,6 +552,8 @@ src/
   csv.js      CSV helpers
   tls.js      built-in HTTPS: certificate storage, validation, hot reload, redirects
   views.js    saved views (personal and team)
+  boxes.js    status boxes: rules, per-device "since" tracking, routes
+  compress.js Brotli / gzip response compression
   agents.js   agent downloads and the /install.sh, /install.ps1 one-line installers
   config.js   env/.env loading
   auth/
@@ -551,7 +561,7 @@ src/
     accounts.js  users, sessions, settings, roles, SSO user provisioning
     oidc.js      Microsoft Entra ID (OIDC, code flow + PKCE)
     security.js  scrypt hashing, encryption, rate limiting
-public/       dashboard and login page (index.html, login.html, app.js, admin.js, agents.js, chart.js, login.js, styles.css; no build step)
+public/       dashboard and login page (index.html, login.html, app.js, admin.js, agents.js, chart.js, viewstate.js, login.js, styles.css; no build step)
 scripts/      seed.js, loadtest.js, loadtest.ps1, checkin-agent.sh, checkin-agent.ps1 (agents served at /agent/...)
 test/         API tests (node:test)
 ```

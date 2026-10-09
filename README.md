@@ -13,7 +13,7 @@ A self-hosted dashboard that keeps track of your devices. Each device checks in 
 | ![Dashboard with live status, filters and sortable columns](docs/screenshots/dashboard.png) | ![Card view grouped by site, dark theme](docs/screenshots/cards-dark.png) |
 | **Dashboard**: live status, search, filters and sortable columns | **Cards**, grouped by site (dark theme) |
 | ![CPU, RAM and disk space graph for one device](docs/screenshots/record-graph.png) | ![Add Device page with the one-line install command](docs/screenshots/add-device.png) |
-| **Graph**: CPU, RAM and disk space over time | **Add Device**: one command installs the agent |
+| **Graph**: CPU, RAM, disk space and disk activity over time | **Add Device**: one command installs the agent |
 | ![Per-record change history](docs/screenshots/record-history.png) | ![User management](docs/screenshots/admin-users-dark.png) |
 | **History**: every change, old value → new value | **Users and roles**, with Microsoft Entra ID sign-in |
 
@@ -22,8 +22,9 @@ A self-hosted dashboard that keeps track of your devices. Each device checks in 
 - **Any data, no setup.** A check-in needs only an `id`. Every other field you send becomes a column automatically.
 - **Live dashboard** with table, card and activity views. It updates instantly as devices check in.
 - **Active / aging / stale status** based on each device's last check-in, with a threshold you choose.
+- **Status boxes** you can add for things like high CPU for 10+ minutes, high memory, busy disks, low disk space or reboot required. Click one to see those devices.
 - **Filters** on any field, status, or created/modified time; match all or any; save them as personal or team views.
-- **History and graphs** for every record: what changed and when, plus CPU, RAM and disk space over time.
+- **History and graphs** for every record: what changed and when, plus CPU, RAM, disk space and disk activity over time.
 - **Windows and Linux agents** that report system details (OS, CPU, memory, disk, network, domain join, uptime and more). **Add Device** gives you a one-line install command.
 - **CSV import and export**, multi-select delete, and a pause switch to stop accepting check-ins.
 - **Users and roles** (Admin, Power user, User, Reader), an API key for devices, and Microsoft Entra ID single sign-on.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Check-In agent for Linux                                         version 2.0.0
+# Check-In agent for Linux                                         version 2.1.0
 #
 # 1. Asks the server whether it is accepting check-ins   (GET  /api/status)
 # 2. Only if it is: gathers the selected details        (CPU sample takes 1s)
@@ -34,7 +34,8 @@
 #   system    hostname, fqdn, os, os_version, kernel, arch, vendor, model, serial, virtualization
 #   cpu       cpu_pct, cpu_cores, cpu_model, load_1m, load_5m, load_15m
 #   ram       ram_pct, ram_used_mb, ram_total_mb, swap_pct
-#   disk      space, not activity: disk_pct (% of / used), disk_free_gb, disk_size_gb,
+#   disk      activity: disk_busy_pct (% of one second the busiest disk was busy, like iostat %util)
+#             space: disk_pct (% of / used), disk_free_gb, disk_size_gb,
 #             disk_max_pct and disk_max_mount (the fullest filesystem)
 #   time      system_time, timezone, time_synced, time_source
 #   uptime    boot_time, uptime, uptime_h
@@ -74,7 +75,7 @@ DEFAULT_EVERY=5                 # minutes between runs when installing (1-59)
 DEFAULT_GROUPS="system cpu ram disk time uptime network domain users health"
 # ----------------------------------------------------------------------------------------------
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 INSTALL_PATH="/usr/local/bin/checkin-agent"
 DEFAULT_CONFIG="/etc/check-in/agent.conf"
 ALL_GROUPS="system cpu ram disk time uptime network domain users health updates security"
@@ -322,11 +323,27 @@ if want system; then
   add_str virtualization "$VIRT"
 fi
 
+# ---- one-second samples: CPU busy % and disk busy % ------------------------------------
+# /proc/stat and /proc/diskstats are read twice, one second apart (a single wait for both).
+read_cpu() { awk '/^cpu /{idle=$5+$6; t=0; for(i=2;i<=NF;i++) t+=$i; print t, idle; exit}' /proc/stat; }
+# Whole disks only (no partitions, loop, ram, zram, optical, md or device-mapper volumes):
+# name and milliseconds spent doing I/O (field 13), the number iostat's %util is based on.
+DISK_LIST=$(ls /sys/block 2>/dev/null | grep -vE '^(loop|ram|zram|dm-|md|sr|fd|nbd)')
+read_disks() { awk -v list="$DISK_LIST" 'BEGIN{n=split(list, a, "\n"); for (i = 1; i <= n; i++) ok[a[i]] = 1} ($3 in ok){print $3, $13}' /proc/diskstats 2>/dev/null; }
+now_ms() { local n; n=$(date +%s%N 2>/dev/null); case "$n" in ''|*N*) echo "";; *) echo $((n / 1000000));; esac; }
+if want cpu || want disk; then
+  T1=0 I1=0 T2=0 I2=0 D1="" D2=""
+  want cpu && read -r T1 I1 <<<"$(read_cpu)"
+  want disk && D1=$(read_disks)
+  MS1=$(now_ms); sleep 1; MS2=$(now_ms)
+  want cpu && read -r T2 I2 <<<"$(read_cpu)"
+  want disk && D2=$(read_disks)
+  DT_MS=1000; [ -n "$MS1" ] && [ -n "$MS2" ] && [ $((MS2 - MS1)) -gt 0 ] && DT_MS=$((MS2 - MS1))
+fi
+
 if want cpu; then
   add_str cpu_model "$(grep -m1 -E '^(model name|Hardware|Model)' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//; s/  */ /g')"
   add_num cpu_cores "$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo)"
-  read_cpu() { awk '/^cpu /{idle=$5+$6; t=0; for(i=2;i<=NF;i++) t+=$i; print t, idle; exit}' /proc/stat; }
-  read -r T1 I1 <<<"$(read_cpu)"; sleep 1; read -r T2 I2 <<<"$(read_cpu)"
   [ $((T2 - T1)) -gt 0 ] && add_num cpu_pct "$(awk -v dt=$((T2 - T1)) -v di=$((I2 - I1)) 'BEGIN{printf "%.1f", (dt-di)*100/dt}')"
   read -r L1 L5 L15 _ < /proc/loadavg
   add_num load_1m "$L1"; add_num load_5m "$L5"; add_num load_15m "$L15"
@@ -344,6 +361,14 @@ if want ram; then
 fi
 
 if want disk; then
+  if [ -n "$D1" ] && [ -n "$D2" ]; then
+    DISK_BUSY=$(printf '%s\n--\n%s\n' "$D1" "$D2" | awk -v dt="$DT_MS" '
+      $1 == "--" {second = 1; next}
+      !second {a[$1] = $2; next}
+      ($1 in a) {u = ($2 - a[$1]) * 100 / dt; if (u > 100) u = 100; if (u < 0) u = 0; if (!f || u > m) m = u; f = 1}
+      END {if (f) printf "%.1f", m}')
+    add_num disk_busy_pct "$DISK_BUSY"
+  fi
   read -r D_SIZE D_AVAIL D_PCT <<<"$(df -P -k / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $2, $4, $5}')"
   add_num disk_pct "${D_PCT:-}"
   [ -n "${D_AVAIL:-}" ] && add_num disk_free_gb "$(awk -v a="$D_AVAIL" 'BEGIN{printf "%.1f", a/1048576}')"

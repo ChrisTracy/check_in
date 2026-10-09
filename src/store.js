@@ -8,7 +8,8 @@ export class HttpError extends Error {
   }
 }
 
-const RESERVED = new Set(['id', 'created', 'modified']);
+// Set by the server; a device can't send these (they'd override the real values in the API output).
+const RESERVED = new Set(['id', 'created', 'modified', '_version', '_rev', '_boxes']);
 const MAX_ID_LEN = 512;
 const MAX_FIELD_NAME_LEN = 200;
 
@@ -44,7 +45,7 @@ export function normalizeInput(input, { maxFields = 500, skipEmpty = false } = {
   return { id, fields };
 }
 
-const jsonPath = (field) => '$."' + String(field).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+export const jsonPath = (field) => '$."' + String(field).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
 
 /**
  * The same record as toRecord(), serialised straight from the stored JSON without parsing it.
@@ -159,6 +160,8 @@ export class Store extends EventEmitter {
       }
       this.stats.writes += batch.length;
       this.stats.batches++;
+      // Listeners (status boxes) update before anyone can read the new rev.
+      try { this.emit('written', results); } catch (err) { console.error('written listener failed:', err); }
       for (let i = 0; i < batch.length; i++) {
         batch[i].resolve(results[i]);
         ids.push(batch[i].id);
@@ -222,7 +225,11 @@ export class Store extends EventEmitter {
 
   get(id) {
     const row = this.s.get.get(id);
-    return row ? toRecord(row) : null;
+    if (!row) return null;
+    const rec = toRecord(row);
+    const extra = this.decorate && this.decorate(id);
+    if (extra) rec._boxes = { ...extra };
+    return rec;
   }
 
   /**
@@ -238,7 +245,13 @@ export class Store extends EventEmitter {
   listJson(opts = {}) {
     const { rows, total } = this.#query(opts);
     let out = '{"records":[';
-    for (let i = 0; i < rows.length; i++) out += (i ? ',' : '') + recordJson(rows[i]);
+    const deco = this.decorate;
+    for (let i = 0; i < rows.length; i++) {
+      let j = recordJson(rows[i]);
+      const extra = deco && deco(rows[i].id);
+      if (extra) j = j.slice(0, -1) + ',"_boxes":' + JSON.stringify(extra) + '}';
+      out += (i ? ',' : '') + j;
+    }
     return out + `],"total":${total},"rev":${this.rev}}`;
   }
 

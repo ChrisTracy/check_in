@@ -21,6 +21,7 @@ export const CAPS = {
   pause: 'power',
   threshold: 'power',
   teamViews: 'power',
+  boxes: 'power',         // set up the status boxes everyone sees
   apiKey: 'power',        // view and regenerate the API key
   apiKeyPolicy: 'admin',  // use a custom key, or stop requiring one
   sso: 'admin',

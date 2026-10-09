@@ -48,6 +48,7 @@
           </div>
           <button class="row-item" data-act="agents" id="agentsItem"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/><path d="M12 7v5M9.5 9.5L12 12l2.5-2.5"/></svg>Add Device</button>
           <button class="row-item" data-act="admin" id="adminItem"><svg class="i" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>Admin</button>
+          <button class="row-item" data-act="boxes" id="boxesItem"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="7" rx="1.5"/><rect x="13" y="4" width="8" height="7" rx="1.5"/><rect x="3" y="13" width="8" height="7" rx="1.5"/><path d="M17 14v6M14 17h6"/></svg>Status boxes</button>
           <button class="row-item" data-act="settings"><svg class="i" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Settings</button>
           <button class="row-item" data-act="password" id="pwItem"><svg class="i" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>Change password</button>
           <hr>
@@ -71,6 +72,8 @@
     <button class="stat" data-status="stale"><span class="label"><i class="dot stale"></i>Stale</span><span class="value" id="statStale">0</span><span class="sub" id="statStaleSub"></span></button>
     <div class="stat static"><span class="label">Check-ins / min</span><span class="value" id="statRate">0</span><span class="sub">records updated in last 60s</span></div>
   </section>
+  <!-- ===== Status boxes (optional; set up by power users, click to filter) ===== -->
+  <section class="boxes" id="boxes" hidden aria-label="Status boxes"></section>
 
   <!-- ===== Toolbar ===== -->
   <section class="toolbar">

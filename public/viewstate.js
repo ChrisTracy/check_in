@@ -46,6 +46,7 @@
       out.widths = w;
     }
     if (has('groupBy')) out.groupBy = str(state.groupBy) ?? '';
+    if (has('box')) out.box = typeof state.box === 'string' && /^[a-z0-9]{0,16}$/.test(state.box) ? state.box : '';
     if (has('layout')) out.layout = LAYOUTS.includes(state.layout) ? state.layout : 'table';
     return out;
   }

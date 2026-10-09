@@ -22,6 +22,8 @@
     filter: 'M3 5h18l-7 8v6l-4 2v-8z', x: 'M6 6l12 12M18 6L6 18', chev: 'M6 9l6 6 6-6', grip: 'M9 6h.01M9 12h.01M9 18h.01M15 6h.01M15 12h.01M15 18h.01',
     plus: 'M12 5v14M5 12h14', pulse: 'M3 12h4l3-8 4 16 3-8h4', edit: 'M4 20h4L19 9l-4-4L4 16zM14 6l4 4',
     pause: 'M8 5v14M16 5v14', play: 'M7 4l13 8-13 8z',
+    up: 'M6 15l6-6 6 6', down: 'M6 9l6 6 6-6', trash: 'M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3',
+    sliders: 'M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0M16 4v4M10 10v4M18 16v4',
   };
 
   function relTime(iso, now = Date.now()) {
@@ -64,7 +66,7 @@
   // ------------------------------------------------------------------ state
   const DEFAULT_VIEW = () => ({
     search: '', filters: [], match: 'all', time: 0, status: 'all', sort: [{ key: 'modified', dir: 'desc' }],
-    hidden: [], order: [], widths: {}, groupBy: '', layout: 'table',
+    hidden: [], order: [], widths: {}, groupBy: '', layout: 'table', box: '',
   });
   // Defaults + a saved/stored state, with every value type-checked (see viewstate.js).
   const normView = (st) => Object.assign(DEFAULT_VIEW(), window.CheckinViewState.cleanViewState(st));
@@ -89,6 +91,8 @@
     selected: null,
     flash: new Map(), // id -> timestamp of last change seen live
     config: { historyLimit: 100, apiKeySet: false, apiKeyRequired: true },
+    boxes: [], // status boxes (shared; set up by power users)
+    boxesVersion: null, // server's version of that list (bumps on every save)
     connected: false,
   };
 
@@ -218,7 +222,10 @@
     es.addEventListener('hello', () => {
       S.connected = true;
       updateLive();
-      if (everConnected) { resync(); loadIngest(); if (S.view.layout === 'activity') loadActivity(); } // catch up after a reconnect
+      if (everConnected) { // catch up after a reconnect
+        resync(); loadIngest(); if (S.view.layout === 'activity') loadActivity();
+        loadBoxes().then((changed) => { if (changed) loadAll().catch(() => {}); });
+      }
       everConnected = true;
     });
     es.addEventListener('change', (e) => {
@@ -233,6 +240,13 @@
       scheduleRender(true);
     });
     es.addEventListener('views', () => loadViews());
+    // Box definitions changed. When a rule changed, every record's box state was recomputed.
+    es.addEventListener('boxes', (e) => {
+      const d = JSON.parse(e.data || '{}');
+      if (d.version === S.boxesVersion) return; // our own save, already applied
+      loadBoxes();
+      if (d.reload) loadAll().catch(() => {});
+    });
     es.addEventListener('ingest', (e) => { S.ingest = JSON.parse(e.data); updateLive(); });
     es.addEventListener('reload', () => { S.checked.clear(); updateSelBar(); loadAll().catch(() => {}); });
     es.addEventListener('settings', (e) => {
@@ -391,6 +405,14 @@
     return rec[key];
   }
 
+  /** Is this record counted in box `b` right now? (condition held for the box's minutes) */
+  function boxHit(rec, b, st, now) {
+    const since = rec._boxes?.[b.id];
+    if (!since) return false;
+    if (b.ignoreStale && st === 'stale') return false;
+    return now - Date.parse(since) >= b.minutes * 60000;
+  }
+
   function computeView() {
     const v = S.view;
     const now = Date.now();
@@ -398,14 +420,19 @@
     const terms = q ? q.split(/\s+/) : [];
     const filters = v.filters.map((f) => prepareFilter(f, now)).filter(Boolean);
     const timeMs = Math.abs(v.time) * 60000;
-    const counts = { all: 0, fresh: 0, aging: 0, stale: 0, rate: 0 };
+    const counts = { all: 0, fresh: 0, aging: 0, stale: 0, rate: 0, box: {} };
+    const boxes = S.boxes.filter((b) => b.enabled);
+    for (const b of boxes) counts.box[b.id] = 0;
+    const boxFilter = boxes.find((b) => b.id === v.box) || null;
     const out = [];
     for (const rec of S.records.values()) {
       const st = statusOf(rec, now);
       counts.all++; counts[st]++;
       const mod = Date.parse(rec.modified);
       if (now - mod <= 60000) counts.rate++;
+      if (rec._boxes) for (const b of boxes) if (boxHit(rec, b, st, now)) counts.box[b.id]++;
       if (v.status !== 'all' && st !== v.status) continue;
+      if (boxFilter && !boxHit(rec, boxFilter, st, now)) continue;
       if (v.time > 0 && now - mod > timeMs) continue;
       if (v.time < 0 && now - mod <= timeMs) continue;
       if (terms.length) {
@@ -545,6 +572,7 @@
     $('#statStaleSub').textContent = `> ${m * 2}m ago`;
     $('#statRate').textContent = nf.format(c.rate);
     $$('.stat[data-status]').forEach((el) => el.classList.toggle('active', el.dataset.status === S.view.status && S.view.status !== 'all'));
+    renderBoxCounts();
     const shown = S.filtered.length;
     $('#countText').textContent = shown === c.all ? `${nf.format(c.all)} records` : `Showing ${nf.format(shown)} of ${nf.format(c.all)} records`;
     $('#exportViewHint').textContent = `${nf.format(shown)} rows · ${visibleColumns().filter((x) => x !== STATUS_KEY).length} columns`;
@@ -569,6 +597,8 @@
     const v = S.view;
     const chips = [];
     if (v.status !== 'all') chips.push(`<span class="chip"><span class="op">status</span><b>${esc(statusLabel(v.status))}</b><button data-rm="status">${icon(ICON.x)}</button></span>`);
+    const fb = activeBox();
+    if (fb) chips.push(`<span class="chip"><span class="op">box</span><b>${esc(fb.name)}</b><button data-rm="box" title="Remove box filter">${icon(ICON.x)}</button></span>`);
     const anyMode = v.match === 'any';
     if (v.filters.length > 1) {
       chips.push(`<span class="seg text match-seg" title="How filter chips combine"><button data-match="all" class="${anyMode ? '' : 'active'}">Match all</button><button data-match="any" class="${anyMode ? 'active' : ''}">Match any</button></span>`);
@@ -815,7 +845,7 @@
     if (keys.length > max) parts.push(`<span class="chg">+${keys.length - max} more</span>`);
     return `<div class="changes">${parts.join('')}</div>`;
   }
-  const activityFiltering = () => { const v = S.view; return Boolean(v.search || v.filters.length || v.status !== 'all' || v.time); };
+  const activityFiltering = () => { const v = S.view; return Boolean(v.search || v.filters.length || v.status !== 'all' || v.time || activeBox()); };
   // Rows for these entries, limited to the records that match the current filters.
   function activityRows(entries) {
     let list = entries;
@@ -891,7 +921,7 @@
     const chart = window.CheckinChart ? window.CheckinChart.extract(record, history) : null;
     const gTab = $('#dGraphTab');
     gTab.disabled = !chart;
-    gTab.title = chart ? 'CPU %, RAM % and disk space used % over time' : 'No CPU, RAM or disk space % fields on this record (e.g. cpu_pct, ram_pct, disk_pct)';
+    gTab.title = chart ? 'CPU %, RAM %, disk space used % and disk activity % over time' : 'No CPU, RAM or disk % fields on this record (e.g. cpu_pct, ram_pct, disk_pct, disk_busy_pct)';
     if (!chart && drawerTab === 'graph') drawerTab = 'fields';
     $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === drawerTab));
     if (!record) { $('#dBody').innerHTML = '<div class="muted">Record no longer exists.</div>'; return; }
@@ -900,7 +930,7 @@
     if (drawerTab === 'fields') {
       const keys = Object.keys(record).filter((k) => !SYS.includes(k) && k[0] !== '_').sort(collator.compare);
       const val = (v) => (typeof v === 'object' && v !== null ? `<pre>${esc(JSON.stringify(v, null, 2))}</pre>` : pillClass(v) ? `<span class="pill ${pillClass(v)}">${esc(show(v))}</span>` : esc(show(v)));
-      $('#dBody').innerHTML = `<table class="kv">
+      $('#dBody').innerHTML = drawerBoxesHtml(record, now) + `<table class="kv">
         ${keys.map((k) => `<tr><td>${esc(k)}</td><td>${val(record[k])}</td></tr>`).join('') || '<tr><td colspan="2" class="muted">No custom fields</td></tr>'}
         <tr class="sys"><td>created</td><td>${esc(absTime(record.created))} <span class="muted">(${esc(relTime(record.created, now))})</span></td></tr>
         <tr class="sys"><td>modified</td><td>${esc(absTime(record.modified))} <span class="muted">(${esc(relTime(record.modified, now))})</span></td></tr>
@@ -944,7 +974,8 @@
     $('#toasts').appendChild(el);
     setTimeout(() => el.remove(), type === 'error' ? 6000 : 3500);
   }
-  function modal({ title, body, actions }) {
+  function modal({ title, body, actions, wide = false }) {
+    $('#modalBack .modal').classList.toggle('wide', wide);
     $('#mTitle').textContent = title;
     $('#mBody').innerHTML = body;
     const box = $('#mActions');
@@ -962,6 +993,167 @@
     if (first) setTimeout(() => first.focus(), 30);
   }
   function closeModal() { $('#modalBack').hidden = true; }
+
+  // ------------------------------------------------------------------ status boxes
+  // Optional cards under Active / Aging / Stale, e.g. "High CPU: cpu_pct > 90 for 10+ minutes".
+  // Power users and admins set them up (shared with everyone). The server tracks since when each
+  // device has matched each box (record._boxes); this side decides what counts right now.
+  const BOX_OPS = {
+    gt: '>', gte: '≥', lt: '<', lte: '≤', eq: 'is', neq: 'is not',
+    contains: 'contains', ncontains: 'does not contain', empty: 'is empty', nempty: 'is not empty',
+  };
+  const BOX_NO_VALUE = new Set(['empty', 'nempty']);
+  const BOX_TONES = { bad: 'Red', warn: 'Amber', info: 'Blue', neutral: 'Grey' };
+  const BOX_PRESETS = [
+    { key: 'cpu', label: 'High CPU', box: { name: 'High CPU', field: 'cpu_pct', op: 'gt', value: '90', minutes: 10, tone: 'bad' } },
+    { key: 'ram', label: 'High memory', box: { name: 'High memory', field: 'ram_pct', op: 'gt', value: '90', minutes: 15, tone: 'warn' } },
+    { key: 'io', label: 'High disk activity', box: { name: 'High disk activity', field: 'disk_busy_pct', op: 'gt', value: '90', minutes: 10, tone: 'warn' } },
+    { key: 'disk', label: 'Low disk space', box: { name: 'Low disk space', field: 'disk_max_pct', op: 'gte', value: '90', minutes: 0, tone: 'warn' } },
+    { key: 'reboot', label: 'Reboot required', box: { name: 'Reboot required', field: 'reboot_required', op: 'eq', value: 'true', minutes: 0, tone: 'info' } },
+    { key: 'domain', label: 'Not domain joined', box: { name: 'Not domain joined', field: 'domain_joined', op: 'eq', value: 'false', minutes: 0, tone: 'neutral' } },
+    { key: 'custom', label: 'Custom…', box: { name: '', field: '', op: 'gt', value: '', minutes: 0, tone: 'warn' } },
+  ];
+  const fmtMinutes = (m) => (m < 60 ? `${m} min` : m % 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m / 60}h`);
+  const boxRule = (b) => `${colLabel(b.field)} ${BOX_OPS[b.op] || b.op}${BOX_NO_VALUE.has(b.op) ? '' : ' ' + b.value}`;
+  const boxSummary = (b) => boxRule(b) + (b.minutes ? ` · ${fmtMinutes(b.minutes)}+` : '');
+  const activeBox = () => (S.view.box ? S.boxes.find((b) => b.enabled && b.id === S.view.box) || null : null);
+
+  // Returns true when the list changed since we last had it (the records' _boxes may have been
+  // recomputed then too, e.g. while this dashboard was disconnected).
+  async function loadBoxes() {
+    let r;
+    try { r = await apiJson('/api/boxes'); } catch { return false; }
+    const changed = S.boxesVersion !== null && r.version !== S.boxesVersion;
+    S.boxes = r.boxes || [];
+    S.boxesVersion = r.version;
+    renderBoxes();
+    scheduleRender(true);
+    return changed;
+  }
+
+  // Card structure (only when the list of boxes changes); counts are filled in by renderBoxCounts().
+  function renderBoxes() {
+    const el = $('#boxes');
+    const shown = S.boxes.filter((b) => b.enabled);
+    const editable = can('boxes');
+    const sig = JSON.stringify([shown, editable]);
+    if (el.dataset.sig === sig) return;
+    el.dataset.sig = sig;
+    el.hidden = !shown.length;
+    el.innerHTML = shown.map((b) => `<button class="stat box tone-${esc(b.tone)}" data-box="${esc(b.id)}"
+        title="${esc(boxRule(b))}${b.minutes ? ` for at least ${esc(fmtMinutes(b.minutes))}` : ''}${b.ignoreStale ? ' · stale devices not counted' : ''}. Click to show these devices.">
+        <span class="label"><i class="tone-dot"></i>${esc(b.name)}</span>
+        <span class="value" data-count>0</span>
+        <span class="sub">${esc(boxSummary(b))}</span></button>`).join('')
+      + (editable ? `<button class="box-edit" id="boxEdit" title="Edit status boxes" aria-label="Edit status boxes">${icon(ICON.sliders)}</button>` : '');
+  }
+  function renderBoxCounts() {
+    renderBoxes();
+    const counts = S.counts?.box || {};
+    $$('#boxes [data-box]').forEach((el) => {
+      const n = counts[el.dataset.box] || 0;
+      el.querySelector('[data-count]').textContent = nf.format(n);
+      el.classList.toggle('zero', !n);
+      el.classList.toggle('active', el.dataset.box === S.view.box);
+    });
+  }
+
+  // Badges in the record drawer: which boxes this device is in (or is on its way into).
+  function drawerBoxesHtml(record, now) {
+    const st = statusOf(record, now);
+    const items = S.boxes.filter((b) => b.enabled && record._boxes?.[b.id]).map((b) => {
+      const since = record._boxes[b.id];
+      const held = now - Date.parse(since);
+      const counted = boxHit(record, b, st, now);
+      const why = counted ? `since ${relTime(since, now).replace(' ago', '')}` : b.ignoreStale && st === 'stale' ? 'not counted while stale' : `${fmtMinutes(Math.floor(held / 60000))} of ${fmtMinutes(b.minutes)}`;
+      return `<span class="box-badge tone-${esc(b.tone)}${counted ? '' : ' pending'}" title="${esc(boxRule(b))} since ${esc(absTime(since))}"><i class="tone-dot"></i>${esc(b.name)} <small>${esc(why)}</small></span>`;
+    });
+    return items.length ? `<div class="d-boxes">${items.join('')}</div>` : '';
+  }
+
+  function openBoxEditor() {
+    if (!can('boxes')) return;
+    let draft = S.boxes.map((b) => ({ ...b }));
+    const known = new Set(S.fields);
+    const row = (b, i) => `<div class="bx${b.enabled ? '' : ' off'}" data-i="${i}">
+      <div class="bx-row">
+        <label class="bx-name">Name<input class="input" data-k="name" maxlength="40" value="${esc(b.name)}" placeholder="e.g. High CPU"></label>
+        <label class="bx-tone">Color<select class="select" data-k="tone">${Object.entries(BOX_TONES).map(([k, l]) => `<option value="${k}" ${b.tone === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+        <div class="bx-tools">
+          <label class="switch" title="Show this box on the dashboard"><input type="checkbox" data-k="enabled" ${b.enabled ? 'checked' : ''}><span class="track"></span></label>
+          <button class="icon-btn sm" data-move="-1" title="Move up" ${i === 0 ? 'disabled' : ''}>${icon(ICON.up)}</button>
+          <button class="icon-btn sm" data-move="1" title="Move down" ${i === draft.length - 1 ? 'disabled' : ''}>${icon(ICON.down)}</button>
+          <button class="icon-btn sm danger" data-del title="Delete box">${icon(ICON.trash)}</button>
+        </div>
+      </div>
+      <div class="bx-row">
+        <label class="bx-field">Field<input class="input" data-k="field" list="bxFields" value="${esc(b.field)}" placeholder="e.g. cpu_pct" autocomplete="off"></label>
+        <label class="bx-op">Condition<select class="select" data-k="op">${Object.entries(BOX_OPS).map(([k, l]) => `<option value="${k}" ${b.op === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+        <label class="bx-val">Value<input class="input" data-k="value" value="${esc(b.value)}" ${BOX_NO_VALUE.has(b.op) ? 'disabled' : ''}></label>
+        <label class="bx-min">For at least<span class="bx-unit"><input class="input" type="number" min="0" max="10080" step="1" data-k="minutes" value="${Number(b.minutes) || 0}">min</span></label>
+      </div>
+      <label class="bx-check"><input type="checkbox" data-k="ignoreStale" ${b.ignoreStale !== false ? 'checked' : ''}>Don't count stale devices (their last reading is out of date)</label>
+      <div class="bx-warn"${fieldWarn(b.field) ? '' : ' hidden'}>${fieldWarn(b.field)}</div>
+    </div>`;
+    function fieldWarn(f) { return f && S.records.size && !known.has(f) && f !== 'id' ? `No device has reported <code>${esc(f)}</code> yet.` : ''; }
+    const draw = () => {
+      $('#bxList').innerHTML = draft.length ? draft.map(row).join('')
+        : '<div class="bx-empty muted">No boxes yet. Start with a preset below, or build your own.</div>';
+    };
+    modal({
+      title: 'Status boxes',
+      wide: true,
+      body: `<p style="font-size:13px">Boxes sit under Active / Aging / Stale and count the devices that match a rule. Everyone sees them; clicking one shows just those devices.
+          <b>For at least</b> means every check-in for that long matched (0 = the latest check-in matches).</p>
+        <div id="bxList"></div>
+        <div class="bx-add"><span class="muted">Add a box:</span>${BOX_PRESETS.map((p) => `<button class="btn sm" data-preset="${p.key}">${icon(ICON.plus)}${esc(p.label)}</button>`).join('')}</div>
+        <datalist id="bxFields">${S.fields.map((f) => `<option value="${esc(f)}">`).join('')}</datalist>`,
+      actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
+        try {
+          const r = await apiJson('/api/boxes', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ boxes: draft, version: S.boxesVersion }) });
+          S.boxes = r.boxes;
+          S.boxesVersion = r.version;
+          if (r.recomputed) loadAll().catch(() => {}); // records' _boxes were worked out again
+          renderBoxes();
+          if (S.view.box && !activeBox()) setView({ box: '' }); else scheduleRender(true);
+          toast('Status boxes saved for everyone');
+        } catch (e) { toast(e.message, 'error'); if (/someone else/i.test(e.message)) loadBoxes(); return false; }
+      } }],
+    });
+    draw();
+    const list = $('#bxList');
+    list.addEventListener('input', (e) => {
+      const k = e.target.dataset.k;
+      const i = Number(e.target.closest('.bx')?.dataset.i);
+      if (!k || !draft[i]) return;
+      const b = draft[i];
+      b[k] = e.target.type === 'checkbox' ? e.target.checked : k === 'minutes' ? Math.max(0, Math.round(Number(e.target.value) || 0)) : e.target.value;
+      if (k === 'op') { const v = e.target.closest('.bx').querySelector('[data-k="value"]'); v.disabled = BOX_NO_VALUE.has(b.op); }
+      if (k === 'enabled') e.target.closest('.bx').classList.toggle('off', !b.enabled);
+    });
+    list.addEventListener('change', (e) => {
+      if (e.target.dataset.k !== 'field') return;
+      const w = e.target.closest('.bx').querySelector('.bx-warn');
+      w.innerHTML = fieldWarn(e.target.value.trim());
+      w.hidden = !w.innerHTML;
+    });
+    list.addEventListener('click', (e) => {
+      const i = Number(e.target.closest('.bx')?.dataset.i);
+      const mv = e.target.closest('[data-move]');
+      if (mv) { const j = i + Number(mv.dataset.move); [draft[i], draft[j]] = [draft[j], draft[i]]; draw(); return; }
+      if (e.target.closest('[data-del]')) { draft.splice(i, 1); draw(); }
+    });
+    $('#mBody .bx-add').addEventListener('click', (e) => {
+      const p = BOX_PRESETS.find((x) => x.key === e.target.closest('[data-preset]')?.dataset.preset);
+      if (!p) return;
+      if (draft.length >= 24) { toast('At most 24 boxes', 'error'); return; }
+      draft.push({ ...p.box, ignoreStale: true, enabled: true });
+      draw();
+      const last = $$('#bxList .bx').pop();
+      last?.scrollIntoView({ block: 'nearest' });
+      last?.querySelector(p.key === 'custom' ? '[data-k="name"]' : '[data-k="value"]')?.focus();
+    });
+  }
 
   // ------------------------------------------------------------------ views
   // Saved views live on the server: personal views belong to your account,
@@ -1140,6 +1332,7 @@
     $('#dDelete').hidden = !can('delete');
     $('#adminItem').hidden = !can('users');
     $('#agentsItem').hidden = !can('checkin');
+    $('#boxesItem').hidden = !can('boxes');
     $('#pwItem').hidden = S.me.kind !== 'session';
     $('#selDelete').hidden = !can('delete');
     $('#selExport').hidden = !can('export');
@@ -1548,6 +1741,7 @@
       closeMenus();
       if (act === 'logout') logout();
       if (act === 'settings') openSettings();
+      if (act === 'boxes') openBoxEditor();
       if (act === 'password') changePassword();
       if (act === 'admin') window.CheckinAdmin?.open('users');
       if (act === 'agents') window.CheckinAgents?.open();
@@ -1577,6 +1771,11 @@
       const s = el.dataset.status;
       setView({ status: S.view.status === s ? 'all' : s });
     }));
+    $('#boxes').addEventListener('click', (e) => {
+      if (e.target.closest('#boxEdit')) { openBoxEditor(); return; }
+      const id = e.target.closest('[data-box]')?.dataset.box;
+      if (id) setView({ box: S.view.box === id ? '' : id });
+    });
 
     $('#chips').addEventListener('click', (e) => {
       const m = e.target.closest('[data-match]')?.dataset.match;
@@ -1585,8 +1784,9 @@
       const edit = e.target.closest('[data-edit]')?.dataset.edit;
       if (!rm && edit !== undefined) { e.stopPropagation(); openFilterPop(null, Number(edit)); return; }
       if (!rm) return;
-      if (rm === 'all') { setView({ filters: [], match: 'all', status: 'all', search: '', time: 0 }); syncControls(); }
+      if (rm === 'all') { setView({ filters: [], match: 'all', status: 'all', search: '', time: 0, box: '' }); syncControls(); }
       else if (rm === 'status') setView({ status: 'all' });
+      else if (rm === 'box') setView({ box: '' });
       else setView({ filters: S.view.filters.filter((_, i) => 'f' + i !== rm) });
     });
 
@@ -1848,6 +2048,7 @@
     try { S.settings.staleMinutes = (await apiJson('/api/settings')).staleMinutes; } catch { /* ignore */ }
     applyCaps();
     loadViews().then(migrateLocalViews);
+    loadBoxes();
     await loadIngest();
     connect();
     try { await loadAll(); } catch (e) { if (e.message !== 'API key required') toast('Could not load records: ' + e.message, 'error'); }

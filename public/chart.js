@@ -1,5 +1,5 @@
-/* Metrics chart for the record drawer: CPU / RAM / disk % over the record's stored history.
- * One shared 0-100% axis (all three are percentages), 2px lines in fixed series colours,
+/* Metrics chart for the record drawer: CPU / RAM / disk space / disk activity % over the record's stored history.
+ * One shared 0-100% axis (all are percentages), 2px lines in fixed series colours,
  * direct labels at the line ends, a crosshair + tooltip on hover, and a min/avg/max table. */
 (() => {
   'use strict';
@@ -10,6 +10,7 @@
     { key: 'cpu', label: 'CPU', hint: 'Processor busy %, sampled over one second at each check-in', fields: ['cpu_pct', 'cpu', 'cpu_percent', 'cpu_usage', 'cpu_load_pct'] },
     { key: 'ram', label: 'RAM', hint: 'Memory in use %', fields: ['ram_pct', 'ram', 'mem_pct', 'memory_pct', 'mem', 'memory', 'ram_percent'] },
     { key: 'disk', label: 'Disk space', hint: 'Space used on the system drive (C: or /), not disk activity', fields: ['disk_pct', 'disk', 'disk_root_pct', 'disk_used_pct', 'disk_percent'] },
+    { key: 'io', label: 'Disk activity', hint: 'How busy the busiest disk was %, sampled over one second at each check-in', fields: ['disk_busy_pct', 'disk_util_pct', 'disk_io_pct', 'disk_active_pct', 'disk_time_pct'] },
   ];
   const num = (v) => {
     if (typeof v === 'number') return Number.isFinite(v) ? v : null;

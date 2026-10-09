@@ -11,7 +11,7 @@
     ['system', 'System', 'OS, model, serial'],
     ['cpu', 'CPU', 'usage, cores'],
     ['ram', 'Memory', 'usage, total'],
-    ['disk', 'Disk space', '% used, free GB (not activity)'],
+    ['disk', 'Disk', 'activity %, space used %, free GB'],
     ['time', 'Time', 'system time, time zone, sync'],
     ['uptime', 'Uptime', 'boot time, uptime'],
     ['network', 'Network', 'IP, MAC, gateway, DNS'],

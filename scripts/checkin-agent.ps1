@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Check-In agent for Windows (Windows PowerShell 5.1 or PowerShell 7+).            version 2.0.0
+  Check-In agent for Windows (Windows PowerShell 5.1 or PowerShell 7+).            version 2.1.0
 
 .DESCRIPTION
   1. Asks the server whether it is accepting check-ins   (GET  /api/status)
@@ -15,7 +15,8 @@
     system    hostname, fqdn, os, os_version, os_build, os_release, arch, vendor, model, serial, virtualization
     cpu       cpu_pct, cpu_cores, cpu_model
     ram       ram_pct, ram_used_mb, ram_total_mb, swap_pct
-    disk      space, not activity: disk_pct (% of the system drive used), disk_free_gb, disk_size_gb,
+    disk      activity: disk_busy_pct (% of one second the busiest physical disk was busy)
+              space: disk_pct (% of the system drive used), disk_free_gb, disk_size_gb,
               disk_max_pct and disk_max_mount (the fullest drive)
     time      system_time, timezone, time_synced, time_source
     uptime    boot_time, uptime, uptime_h
@@ -113,7 +114,7 @@ $DefaultGroups = @('system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 if (-not $PSBoundParameters.ContainsKey('Every')) { $Every = $DefaultEvery }
-$Version = '2.0.0'
+$Version = '2.1.0'
 $TaskName = 'Check-In Agent'
 $HomeDir = Join-Path $env:ProgramData 'CheckIn'
 $InstalledScript = Join-Path $HomeDir 'checkin-agent.ps1'
@@ -375,14 +376,27 @@ if (Want 'system') { Try-Group 'system' {
   Add-Field 'virtualization' $virt
 } }
 
+# ---- one-second samples: CPU busy % and disk busy % ------------------------------------
+# Raw performance counters read twice, one second apart (locale-independent, unlike counter
+# names; same idea as /proc/stat and /proc/diskstats on Linux). One wait covers both.
+$cpuQuery = "SELECT PercentProcessorTime, Timestamp_Sys100NS FROM Win32_PerfRawData_PerfOS_Processor WHERE Name='_Total'"
+$diskQuery = "SELECT Name, PercentIdleTime, Timestamp_Sys100NS FROM Win32_PerfRawData_PerfDisk_PhysicalDisk WHERE Name<>'_Total'"
+$sampleA = @{}; $sampleB = @{}
+if ((Want 'cpu') -or (Want 'disk')) {
+  $takeSample = {
+    param($into)
+    if (Want 'cpu') { try { $into.cpu = Get-CimInstance -Query $cpuQuery -ErrorAction Stop } catch { } }
+    if (Want 'disk') { try { $into.disk = @(Get-CimInstance -Query $diskQuery -ErrorAction Stop) } catch { } }
+  }
+  & $takeSample $sampleA; Start-Sleep -Seconds 1; & $takeSample $sampleB
+}
+
 if (Want 'cpu') { Try-Group 'cpu' {
   $procs = @(Get-CimInstance Win32_Processor)
   Add-Field 'cpu_model' (($procs[0].Name -replace '\s+', ' ').Trim())
   Add-Field 'cpu_cores' ([int]($procs | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)
-  # Two raw samples one second apart (locale-independent; same idea as /proc/stat on Linux).
-  $q = "SELECT PercentProcessorTime, Timestamp_Sys100NS FROM Win32_PerfRawData_PerfOS_Processor WHERE Name='_Total'"
-  $a = Get-CimInstance -Query $q; Start-Sleep -Seconds 1; $b = Get-CimInstance -Query $q
-  $dt = [double]$b.Timestamp_Sys100NS - [double]$a.Timestamp_Sys100NS
+  $a = $sampleA.cpu; $b = $sampleB.cpu
+  $dt = if ($a -and $b) { [double]$b.Timestamp_Sys100NS - [double]$a.Timestamp_Sys100NS } else { 0 }
   if ($dt -gt 0) {
     $busy = 100.0 * (1.0 - (([double]$b.PercentProcessorTime - [double]$a.PercentProcessorTime) / $dt))
     Add-Field 'cpu_pct' ([Math]::Round([Math]::Max(0, [Math]::Min(100, $busy)), 1))
@@ -402,6 +416,19 @@ if (Want 'ram') { Try-Group 'ram' {
 } }
 
 if (Want 'disk') { Try-Group 'disk' {
+  # Activity: 100 - idle %, for the busiest physical disk.
+  $busiest = $null
+  foreach ($after in @($sampleB.disk)) {
+    if (-not $after) { continue }
+    $before = @($sampleA.disk) | Where-Object { $_ -and $_.Name -eq $after.Name } | Select-Object -First 1
+    if (-not $before) { continue }
+    $dt = [double]$after.Timestamp_Sys100NS - [double]$before.Timestamp_Sys100NS
+    if ($dt -le 0) { continue }
+    $busy = 100.0 * (1.0 - (([double]$after.PercentIdleTime - [double]$before.PercentIdleTime) / $dt))
+    $busy = [Math]::Max(0, [Math]::Min(100, $busy))
+    if ($null -eq $busiest -or $busy -gt $busiest) { $busiest = $busy }
+  }
+  if ($null -ne $busiest) { Add-Field 'disk_busy_pct' ([Math]::Round($busiest, 1)) }
   $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Where-Object { $_.Size -gt 0 })
   $sys = $disks | Where-Object { $_.DeviceID -eq $env:SystemDrive } | Select-Object -First 1
   if ($sys) {

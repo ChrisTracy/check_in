@@ -1,5 +1,6 @@
 import { SavedViews, registerViews } from './views.js';
 import { registerAgentRoutes, siteUrl } from './agents.js';
+import { StatBoxes, registerBoxes } from './boxes.js';
 import path from 'node:path';
 import http from 'node:http';
 import querystring from 'node:querystring';
@@ -153,6 +154,8 @@ export function buildApp({ config, store, accounts, oidc }) {
   const views = new SavedViews(accounts.db);
   registerAuth(app, { accounts, oidc, config, broadcast, views });
   registerViews(app, { views, broadcast });
+  const boxes = new StatBoxes({ db: store.db, store, accounts });
+  registerBoxes(app, { boxes, broadcast });
 
   // ---- admin: HTTPS / TLS --------------------------------------------------
   const tlsCap = { config: { cap: 'tls' } };

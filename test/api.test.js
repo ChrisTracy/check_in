@@ -607,3 +607,72 @@ test('the rev counter never goes backwards after deleting the newest records', a
   store.deleteMany(['b', 'c']);
   assert.equal(new Store(db, { historyLimit: 3, maxBatch: 100 }).rev, 3); // as after a restart
 });
+
+test('status boxes: power users set them up, check-ins track how long a condition has held', async () => {
+  const { call, as, accounts, store } = await setup({ historyLimit: 10 });
+  await accounts.create({ username: 'pu', password: 'powerpass123', role: 'power' });
+  await accounts.create({ username: 'u1', password: 'userpass1234', role: 'user' });
+  const pu = as('pu', 'powerpass123'); const u1 = as('u1', 'userpass1234');
+  const checkin = (payload) => call({ method: 'POST', url: '/api/checkin', payload });
+  const boxesOf = async (id) => (await call({ url: `/api/records/${id}` })).json()._boxes;
+  // History before the box exists: web-1 was high for its last two check-ins, web-2 dipped.
+  await checkin({ id: 'web-1', cpu_pct: 20 });
+  await new Promise((r) => setTimeout(r, 5));
+  await checkin({ id: 'web-1', cpu_pct: 95 });
+  const firstHigh = (await call({ url: '/api/records/web-1' })).json().modified;
+  await new Promise((r) => setTimeout(r, 5));
+  await checkin({ id: 'web-1', cpu_pct: 97 });
+  await checkin({ id: 'web-2', cpu_pct: 99 });
+  await checkin({ id: 'web-2', cpu_pct: 10 });
+
+  const cpu = { name: 'High CPU', field: 'cpu_pct', op: 'gt', value: '90', minutes: 10, tone: 'bad' };
+  assert.equal((await u1({ method: 'PUT', url: '/api/boxes', payload: { boxes: [cpu] } })).statusCode, 403);
+  assert.equal((await pu({ method: 'PUT', url: '/api/boxes', payload: { boxes: [{ ...cpu, value: '' }] } })).statusCode, 400);
+  assert.equal((await pu({ method: 'PUT', url: '/api/boxes', payload: { boxes: [{ ...cpu, op: 'evil' }] } })).statusCode, 400);
+  let r = await pu({ method: 'PUT', url: '/api/boxes', payload: { boxes: [cpu, { name: 'Off domain', field: 'domain_joined', op: 'eq', value: 'false', ignoreStale: false }] } });
+  assert.equal(r.statusCode, 200, r.body);
+  const [box, dom] = r.json().boxes;
+  assert.equal(box.ignoreStale, true); assert.equal(box.enabled, true); assert.equal(dom.ignoreStale, false); assert.equal(dom.tone, 'warn');
+  assert.deepEqual((await u1({ url: '/api/boxes' })).json().boxes.map((b) => b.name), ['High CPU', 'Off domain']);
+
+  // Backfilled from history: since = first check-in of the current high run.
+  assert.deepEqual(await boxesOf('web-1'), { [box.id]: firstHigh });
+  assert.equal(await boxesOf('web-2'), undefined);
+  // Live: starts when it goes high, ends when it drops, and appears in the record list.
+  await checkin({ id: 'web-2', cpu_pct: 91, domain_joined: false });
+  const b2 = await boxesOf('web-2');
+  assert.ok(b2[box.id] && b2[dom.id]);
+  const list = (await call({ url: '/api/records' })).json().records;
+  assert.deepEqual(list.find((x) => x.id === 'web-2')._boxes, b2);
+  await checkin({ id: 'web-1', cpu_pct: 40 });
+  assert.equal(await boxesOf('web-1'), undefined);
+  // Stays the same while it holds; survives a restart; removed with the record.
+  await checkin({ id: 'web-2', cpu_pct: 93 });
+  assert.equal((await boxesOf('web-2'))[box.id], b2[box.id]);
+  const { StatBoxes } = await import('../src/boxes.js');
+  const again = new StatBoxes({ db: store.db, store: new Store(store.db, { historyLimit: 10 }), accounts });
+  assert.equal(again.state.get('web-2')[box.id], b2[box.id]);
+  await call({ method: 'DELETE', url: '/api/records/web-2' });
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM box_state WHERE record_id = ?').get('web-2').n, 0);
+  // Changing the rule recomputes it; removing a box clears its state.
+  await checkin({ id: 'web-3', cpu_pct: 60 });
+  r = await pu({ method: 'PUT', url: '/api/boxes', payload: { boxes: [{ ...box, value: '50' }] } });
+  assert.ok((await boxesOf('web-3'))[box.id]);
+  await pu({ method: 'PUT', url: '/api/boxes', payload: { boxes: [] } });
+  assert.equal(await boxesOf('web-3'), undefined);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM box_state').get().n, 0);
+});
+
+test('status boxes: stale editors get a 409; devices cannot fake server fields', async () => {
+  const { call, admin } = await setup();
+  const v0 = (await admin({ url: '/api/boxes' })).json().version;
+  const box = { name: 'Off domain', field: 'domain_joined', op: 'eq', value: 'false', id: 'constructor' };
+  let r = await admin({ method: 'PUT', url: '/api/boxes', payload: { boxes: [box], version: v0 } });
+  assert.equal(r.statusCode, 200);
+  assert.match(r.json().boxes[0].id, /^[0-9a-f]{8}$/);
+  assert.equal(r.json().recomputed, true);
+  assert.equal((await admin({ method: 'PUT', url: '/api/boxes', payload: { boxes: [], version: v0 } })).statusCode, 409);
+  await call({ method: 'POST', url: '/api/checkin', payload: { id: 'x', _boxes: { a: '2000-01-01' }, _version: 99, _rev: 1e9 } });
+  const rec = (await call({ url: '/api/records/x' })).json();
+  assert.equal(rec._boxes, undefined); assert.equal(rec._version, 1); assert.notEqual(rec._rev, 1e9);
+});
