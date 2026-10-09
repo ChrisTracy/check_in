@@ -318,7 +318,10 @@ Write-Host "Check-In fleet load test  ->  $base/api/checkin" -ForegroundColor Cy
 Write-Host ("  Active threshold {0} min: active < {0} min since last check-in, aging < {1} min, stale after that" -f $ActiveMinutes, ($ActiveMinutes * 2))
 Write-Host ("  Active  {0,7}  check in every {1}s{2}" -f (& $fmt $Active), $IntervalSeconds, $(if ($Burst) { ', all at once' } else { ', spread over the interval' }))
 if ($Aging) { Write-Host ("  Aging   {0,7}  from {1} staggered devices that check in every {2:N1} min ({3} of them show as active at any time)" -f (& $fmt $Aging), (& $fmt $agingPool), ($agingCycle / 60), (& $fmt $agingActiveShare)) }
-if ($Stale) { Write-Host ("  Stale   {0,7}  {1} new (one check-in now; stale in {2} min), {3} already exist" -f (& $fmt $Stale), (& $fmt $staleNew), ($ActiveMinutes * 2), (& $fmt ($Stale - $staleNew))) }
+if ($Stale) {
+  $staleNote = if ($staleNew) { "{0} new (one check-in now; stale in {1} min), {2} already exist" -f (& $fmt $staleNew), ($ActiveMinutes * 2), (& $fmt ($Stale - $staleNew)) } else { 'all already exist; nothing to send' }
+  Write-Host ("  Stale   {0,7}  {1}" -f (& $fmt $Stale), $staleNote)
+}
 if ($agingActiveShare -gt $Active) { Write-Warning "Active will be about $agingActiveShare, not ${Active}: that many aging-group devices are in the active part of their cycle at any time." }
 $cond = ($conditions.GetEnumerator() | Where-Object Value | ForEach-Object { "$($_.Key) $($_.Value)" }) -join ', '
 if ($cond) { Write-Host "  Problems on active devices: $cond" }
@@ -373,14 +376,16 @@ function Write-Report([double]$elapsed, [switch]$Final) {
 # the devices that are due (fast enough for tens of thousands of devices, even in PowerShell 5.1).
 $buckets = [System.Collections.Generic.Dictionary[long, System.Collections.Generic.List[object]]]::new()
 $cursor = [long]0
-function Add-Due($d) {
+function Add-Due($d, [switch]$Initial) {
+  # Devices with nothing left to send (stale ones that already exist) have NextDue = infinity.
   if ([double]::IsInfinity($d.NextDue)) { return }
-  $k = [Math]::Max([long][Math]::Floor($d.NextDue * 4), $script:cursor + 1)
+  $k = [long][Math]::Floor($d.NextDue * 4)
+  if (-not $Initial) { $k = [Math]::Max($k, $script:cursor + 1) }   # never into a bucket already passed
   $list = $null
   if (-not $buckets.TryGetValue($k, [ref]$list)) { $list = [System.Collections.Generic.List[object]]::new(); $buckets[$k] = $list }
   $list.Add($d)
 }
-foreach ($d in $devices) { $k = [long][Math]::Floor($d.NextDue * 4); if (-not [double]::IsInfinity($d.NextDue)) { $list = $null; if (-not $buckets.TryGetValue($k, [ref]$list)) { $list = [System.Collections.Generic.List[object]]::new(); $buckets[$k] = $list }; $list.Add($d) } }
+foreach ($d in $devices) { Add-Due $d -Initial }
 
 try {
   while ($true) {

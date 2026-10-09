@@ -297,6 +297,7 @@ curl -X POST http://localhost:3000/api/checkin -H "Content-Type: application/jso
 |---|---|---|
 | `GET /api/views` | any signed-in user | `{ "personal": [...], "team": [...] }`. Each view has `id`, `scope`, `name`, `state`, `updated` and `updatedBy` |
 | `POST /api/views` | any signed-in user (team: Power user or Admin) | `{ "scope": "personal" \| "team", "name": "…", "state": {…} }`. Saving under an existing name in the same scope overwrites that view. Personal views need a user account, not the API key |
+| `PUT /api/views/defaults` | any signed-in user (team: Power user or Admin) | `{ "mine": "p:<id>" \| "t:<id>" \| "builtin" \| null, "team": "t:<id>" \| null }`, either or both. `GET /api/views` returns the current ones as `defaults` |
 | `PUT /api/views/:id`, `DELETE /api/views/:id` | owner (personal) or Power user/Admin (team) | Rename or update `state`, or delete |
 | `GET /api/boxes` | any signed-in user | `{ "boxes": [...] }`: the status boxes, in order. Each has `id`, `name`, `field`, `op` (`gt`, `gte`, `lt`, `lte`, `eq`, `neq`, `contains`, `ncontains`, `empty`, `nempty`), `value`, `minutes`, `tone` (`bad`, `warn`, `info`, `neutral`), `ignoreStale` and `enabled` |
 | `PUT /api/boxes` | Power user or Admin | `{ "boxes": [...] }` replaces the whole list (up to 24). Records then carry `_boxes: { "<box id>": "<since>" }`: when each box's condition started holding for that record |
@@ -356,6 +357,11 @@ The dashboard's export menu can also download the **current view**: only the fil
   - **Team views** are visible to everyone. Only power users and admins can create, overwrite or delete them, and changes show up on every open dashboard straight away.
 
   A dot on the save button means you've changed the view since it was saved. Readers and users can open a team view, adjust it, and save their own copy under **My views**. Views saved in the browser by older versions are moved to your account the first time you sign in. Deleting a user also deletes their personal views.
+
+  **Default view** (the star next to the views menu) picks the view that opens when the page loads:
+  - **My default** is stored on your account, so it follows you to any browser. It can be one of your views, a team view, or the **Default View** (the standard layout).
+  - **Team default** (power users and admins) is a team view that opens for everyone who hasn't picked their own.
+  - With neither set, the dashboard reopens the way you left it in that browser. The current default is marked ★ in the views menu, and deleting a view clears any default that pointed to it.
 - **Record drawer:** click a row to see every field and a timeline of changes.
 - **Multi-select:** tick the checkboxes in the table (Shift+click selects a range) or on cards. The header checkbox selects every matching row. A bar appears where you can **Delete** or **Export** the selection; the Delete key works too. Esc clears the selection.
 - **Live updates:** changes stream in as they happen.

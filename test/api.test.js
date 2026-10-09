@@ -676,3 +676,28 @@ test('status boxes: stale editors get a 409; devices cannot fake server fields',
   const rec = (await call({ url: '/api/records/x' })).json();
   assert.equal(rec._boxes, undefined); assert.equal(rec._version, 1); assert.notEqual(rec._rev, 1e9);
 });
+
+test('default views: personal default follows the account, team default needs power user', async () => {
+  const { as, accounts, admin } = await setup();
+  await accounts.create({ username: 'pu', password: 'powerpass123', role: 'power' });
+  await accounts.create({ username: 'u1', password: 'userpass1234', role: 'user' });
+  await accounts.create({ username: 'u2', password: 'userpass1234', role: 'user' });
+  const pu = as('pu', 'powerpass123'); const u1 = as('u1', 'userpass1234'); const u2 = as('u2', 'userpass1234');
+  const put = (who, payload) => who({ method: 'PUT', url: '/api/views/defaults', payload });
+  const team = (await pu({ method: 'POST', url: '/api/views', payload: { name: 'Ops', scope: 'team', state: { layout: 'cards' } } })).json().view;
+  const mine = (await u1({ method: 'POST', url: '/api/views', payload: { name: 'Mine', state: {} } })).json().view;
+  const theirs = (await u2({ method: 'POST', url: '/api/views', payload: { name: 'Theirs', state: {} } })).json().view;
+
+  assert.deepEqual((await u1({ url: '/api/views' })).json().defaults, { mine: null, team: null });
+  assert.equal((await put(u1, { team: `t:${team.id}` })).statusCode, 403);
+  assert.equal((await put(pu, { team: `p:${mine.id}` })).statusCode, 400);
+  assert.equal((await put(pu, { team: `t:${team.id}` })).statusCode, 200);
+  assert.equal((await put(u1, { mine: `p:${theirs.id}` })).statusCode, 400); // someone else's personal view
+  assert.equal((await put(u1, { mine: `p:${mine.id}` })).json().defaults.mine, `p:${mine.id}`);
+  assert.deepEqual((await u2({ url: '/api/views' })).json().defaults, { mine: null, team: `t:${team.id}` });
+  assert.equal((await put(u2, { mine: 'builtin' })).json().defaults.mine, 'builtin');
+  // Deleting a view clears any default pointing at it.
+  await u1({ method: 'DELETE', url: `/api/views/${mine.id}` });
+  await admin({ method: 'DELETE', url: `/api/views/${team.id}` });
+  assert.deepEqual((await u1({ url: '/api/views' })).json().defaults, { mine: null, team: null });
+});

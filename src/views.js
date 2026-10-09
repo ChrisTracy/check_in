@@ -55,6 +55,13 @@ export class SavedViews {
         updated_by TEXT NOT NULL DEFAULT ''
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_views_name ON views(scope, IFNULL(owner_id, 0), name);
+
+      -- Which view opens first. owner_id 0 = the team default (a team view); otherwise a user's own
+      -- choice: 'p:<id>' / 't:<id>' for a saved view, or 'builtin' for the built-in layout.
+      CREATE TABLE IF NOT EXISTS view_defaults (
+        owner_id INTEGER PRIMARY KEY,
+        ref      TEXT NOT NULL
+      );
     `);
     this.s = {
       get: db.prepare('SELECT * FROM views WHERE id = ?'),
@@ -69,7 +76,42 @@ export class SavedViews {
     return {
       personal: userId ? this.s.personal.all(userId).map(toView) : [],
       team: this.s.team.all().map(toView),
+      defaults: this.defaults(userId),
     };
+  }
+
+  /** { mine: 'builtin' | 'p:<id>' | 't:<id>' | null (follow the team default), team: 't:<id>' | null } */
+  defaults(userId) {
+    const get = (owner) => this.db.prepare('SELECT ref FROM view_defaults WHERE owner_id = ?').get(owner)?.ref ?? null;
+    return { mine: userId ? get(userId) : null, team: get(0) };
+  }
+
+  /** Set your own default and/or (power users and admins) the team default. null clears it. */
+  setDefaults(auth, body) {
+    const set = (owner, ref) => {
+      if (ref === null) this.db.prepare('DELETE FROM view_defaults WHERE owner_id = ?').run(owner);
+      else this.db.prepare('INSERT INTO view_defaults (owner_id, ref) VALUES (?, ?) ON CONFLICT(owner_id) DO UPDATE SET ref = excluded.ref').run(owner, ref);
+    };
+    const check = (ref, { allowBuiltin, teamOnly }) => {
+      if (ref === null || ref === undefined || ref === '') return null;
+      if (ref === 'builtin' && allowBuiltin) return 'builtin';
+      const m = /^([pt]):(\d{1,12})$/.exec(String(ref));
+      const row = m && this.s.get.get(Number(m[2]));
+      const ok = row && row.scope === (m[1] === 't' ? 'team' : 'personal') && (row.scope === 'team' || row.owner_id === auth.userId);
+      if (!ok || (teamOnly && row.scope !== 'team')) throw new HttpError(400, teamOnly ? 'The team default must be a team view' : 'View not found');
+      return `${m[1]}:${row.id}`;
+    };
+    if ('mine' in body) {
+      if (!auth.userId) throw new HttpError(400, 'A personal default needs a user account (not an API key)');
+      set(auth.userId, check(body.mine, { allowBuiltin: true }));
+    }
+    let teamChanged = false;
+    if ('team' in body) {
+      if (!can(auth.role, 'teamViews')) throw new HttpError(403, 'Only power users and admins can set the team default');
+      set(0, check(body.team, { teamOnly: true }));
+      teamChanged = true;
+    }
+    return { defaults: this.defaults(auth.userId), teamChanged };
   }
 
   /** Throws unless `auth` may change views in `scope` (and, for personal views, owns it). */
@@ -122,11 +164,14 @@ export class SavedViews {
     if (!row) throw new HttpError(404, 'View not found');
     this.assertCanWrite(auth, row.scope, row.scope === 'personal' ? row.owner_id : undefined);
     this.db.prepare('DELETE FROM views WHERE id = ?').run(row.id);
+    // Anyone who had it as their default (or the team default) falls back.
+    this.db.prepare('DELETE FROM view_defaults WHERE ref = ?').run(`${row.scope === 'team' ? 't' : 'p'}:${row.id}`);
     return row.scope;
   }
 
   removeOwner(userId) {
     this.db.prepare("DELETE FROM views WHERE scope = 'personal' AND owner_id = ?").run(userId);
+    this.db.prepare('DELETE FROM view_defaults WHERE owner_id = ?').run(userId);
   }
 }
 
@@ -140,6 +185,12 @@ export function registerViews(app, { views, broadcast }) {
     const { view: v, created } = views.save(req.auth, req.body || {});
     notify(v.scope);
     return reply.code(created ? 201 : 200).send({ ok: true, created, view: v });
+  });
+
+  app.put('/api/views/defaults', view, async (req) => {
+    const r = views.setDefaults(req.auth, req.body || {});
+    if (r.teamChanged) broadcast('views', { scope: 'team' });
+    return { ok: true, defaults: r.defaults };
   });
 
   app.put('/api/views/:id', view, async (req) => {

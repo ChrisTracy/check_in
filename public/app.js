@@ -80,6 +80,7 @@
     view: normView(store.get('view', null) || (matchMedia('(max-width: 720px)').matches ? { layout: 'cards' } : {})),
     viewRef: store.get('viewRef', ''), // '' = Default, 'p:<id>' = personal view, 't:<id>' = team view
     views: { personal: [], team: [] }, // saved views from the server
+    viewDefaults: { mine: null, team: null }, // which view opens first (see effectiveDefault)
     settings: Object.assign({ theme: 'auto', compact: false }, store.get('settings', {}), { staleMinutes: 15 }),
     me: null, // { user, role, caps, csrf }
     checked: new Set(), // multi-selected record ids
@@ -1185,9 +1186,12 @@
   }
   function renderViewSelect() {
     if (S.viewsLoaded && S.viewRef && !findView(S.viewRef)) { S.viewRef = ''; saveState(); }
-    const opt = (v) => `<option value="${viewRef(v)}" title="${esc(v.scope === 'team' ? `Updated by ${v.updatedBy || 'unknown'}` : 'Only you can see this view')}">${esc(v.name)}</option>`;
+    const def = effectiveDefault();
+    const mineIsSet = S.viewDefaults.mine && S.viewDefaults.mine !== 'builtin' && findView(S.viewDefaults.mine);
+    const mark = (ref) => (ref === def ? (mineIsSet ? ' ★ my default' : ' ★ team default') : '');
+    const opt = (v) => `<option value="${viewRef(v)}" title="${esc(v.scope === 'team' ? `Updated by ${v.updatedBy || 'unknown'}` : 'Only you can see this view')}">${esc(v.name)}${mark(viewRef(v))}</option>`;
     const { personal, team } = S.views;
-    $('#viewSelect').innerHTML = '<option value="">Default</option>'
+    $('#viewSelect').innerHTML = `<option value="">Default View${def === '' ? ' ★ my default' : ''}</option>`
       + (personal.length ? `<optgroup label="My views">${personal.map(opt).join('')}</optgroup>` : '')
       + (team.length ? `<optgroup label="Team views">${team.map(opt).join('')}</optgroup>` : '');
     $('#viewSelect').value = findView(S.viewRef) ? S.viewRef : '';
@@ -1195,8 +1199,61 @@
     $('#viewDelete').disabled = !del;
     $('#viewDelete').style.opacity = del ? 1 : .4;
     $('#viewDelete').title = del ? 'Delete view' : S.viewRef ? 'Only power users and admins can delete team views' : 'Delete view';
+    const dbtn = $('#viewDefault');
+    dbtn.classList.toggle('active', def !== null && def === (findView(S.viewRef) ? S.viewRef : ''));
+    dbtn.hidden = !personalDefaultsOk() && !can('teamViews');
     updateViewDirty();
   }
+
+  // ---- default view: which view opens first ----
+  const personalDefaultsOk = () => S.me?.kind === 'session' || Boolean(S.me?.user?.id);
+  /** The view to open on page load: '' = built-in layout, a view ref, or null = reopen as last left. */
+  function effectiveDefault() {
+    const { mine, team } = S.viewDefaults;
+    if (mine === 'builtin') return '';
+    if (mine && findView(mine)) return mine;
+    if (team && findView(team)) return team;
+    return null;
+  }
+  function openDefaultView() {
+    const mineOk = personalDefaultsOk();
+    const teamOk = can('teamViews');
+    const { personal, team } = S.views;
+    const cur = findView(S.viewRef) ? S.viewRef : '';
+    const curName = cur ? findView(cur).name : 'Default View';
+    const teamView = S.viewDefaults.team && findView(S.viewDefaults.team);
+    const opts = (list, sel) => list.map((v) => `<option value="${viewRef(v)}" ${viewRef(v) === sel ? 'selected' : ''}>${esc(v.name)}</option>`).join('');
+    const mineSel = S.viewDefaults.mine && (S.viewDefaults.mine === 'builtin' || findView(S.viewDefaults.mine)) ? S.viewDefaults.mine : '';
+    const teamSel = teamView ? S.viewDefaults.team : '';
+    modal({
+      title: 'Default view',
+      body: `<p>Choose the view that opens when you load the dashboard. You're looking at <b>${esc(curName)}</b>.</p>
+        ${mineOk ? `<label>My default (follows you to any browser)<select class="select" id="dvMine">
+          <option value="">${teamView ? `Same as the team: ${esc(teamView.name)}` : 'None: reopen the way I left it in this browser'}</option>
+          <option value="builtin" ${mineSel === 'builtin' ? 'selected' : ''}>Default View</option>
+          ${personal.length ? `<optgroup label="My views">${opts(personal, mineSel)}</optgroup>` : ''}
+          ${team.length ? `<optgroup label="Team views">${opts(team, mineSel)}</optgroup>` : ''}
+        </select></label>` : ''}
+        ${teamOk ? `<label>Team default (everyone who hasn't picked their own)<select class="select" id="dvTeam">
+          <option value="">None: each person reopens the way they left it</option>
+          ${opts(team, teamSel)}
+        </select></label>
+        ${team.length ? '' : '<p style="font-size:12px">Save a team view first to make it the team default.</p>'}` : ''}
+        <p style="font-size:12px">The default opens each time the page loads; you can still switch views while you work.</p>`,
+      actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
+        const body = {};
+        if (mineOk) body.mine = $('#dvMine').value || null;
+        if (teamOk) body.team = $('#dvTeam').value || null;
+        try {
+          const r = await apiJson('/api/views/defaults', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+          S.viewDefaults = r.defaults;
+          renderViewSelect();
+          toast('Default view saved');
+        } catch (e) { toast(e.message, 'error'); return false; }
+      } }],
+    });
+  }
+
   function applyNamedView(ref) {
     S.viewRef = ref;
     const saved = findView(ref);
@@ -1211,6 +1268,7 @@
     try {
       const r = await apiJson('/api/views');
       S.views = { personal: r.personal || [], team: r.team || [] };
+      S.viewDefaults = r.defaults || { mine: null, team: null };
       S.viewsLoaded = true;
     } catch { /* keep what we have */ }
     renderViewSelect();
@@ -1997,6 +2055,7 @@
     $('#viewSelect').addEventListener('change', (e) => applyNamedView(e.target.value));
     $('#viewSave').addEventListener('click', openSaveView);
     $('#viewDelete').addEventListener('click', deleteCurrentView);
+    $('#viewDefault').addEventListener('click', openDefaultView);
 
     // keyboard
     document.addEventListener('keydown', (e) => {
@@ -2047,7 +2106,11 @@
     try { S.config = await apiJson('/api/config'); } catch { /* ignore */ }
     try { S.settings.staleMinutes = (await apiJson('/api/settings')).staleMinutes; } catch { /* ignore */ }
     applyCaps();
-    loadViews().then(migrateLocalViews);
+    // Saved views first, so a default view can open before the records arrive.
+    await loadViews();
+    const startRef = effectiveDefault();
+    if (startRef !== null && S.viewsLoaded) applyNamedView(startRef);
+    migrateLocalViews();
     loadBoxes();
     await loadIngest();
     connect();
