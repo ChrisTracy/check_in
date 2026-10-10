@@ -24,6 +24,7 @@ export const CAPS = {
   boxes: 'power',         // set up the status boxes everyone sees
   apiKey: 'power',        // view and regenerate the API key
   apiKeyPolicy: 'admin',  // use a custom key, or stop requiring one
+  portCheckPolicy: 'admin', // turn port checks on or off
   sso: 'admin',
   users: 'admin',
   tls: 'admin',

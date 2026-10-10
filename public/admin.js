@@ -8,7 +8,7 @@
   const json = (method, body) => ({ method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
 
   const ROLES = [
-    ['admin', 'Admin', 'Everything, including users, single sign-on and whether the API key is required'],
+    ['admin', 'Admin', 'Everything, including users, single sign-on, port checks and whether the API key is required'],
     ['power', 'Power user', 'User rights plus Clear all, pausing check-ins, the active threshold and the API key'],
     ['user', 'User', 'View, import, export and delete records'],
     ['reader', 'Reader', 'View records and history only'],
@@ -56,7 +56,7 @@
     $$('.admin-nav [data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
     $('#aBody').innerHTML = '<div class="muted">Loading…</div>';
     foot('');
-    ({ users: loadUsers, sso: loadSso, apikey: loadApiKey, tls: loadTls })[t]();
+    ({ users: loadUsers, sso: loadSso, apikey: loadApiKey, tls: loadTls, ports: loadPorts })[t]();
   }
 
   // ================================================================== Users
@@ -623,6 +623,70 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
       toast(e.message, 'error');
       $('#tSave').disabled = false;
     }
+  }
+
+  // ================================================================== Port checks
+  async function loadPorts() {
+    try { renderPorts(await apiJson('/api/admin/portcheck')); } catch (e) { $('#aBody').innerHTML = `<div class="warn-box">${esc(e.message)}</div>`; }
+  }
+
+  function renderPorts(pc) {
+    head('Port checks', 'Devices ask the server whether their ports can be reached');
+    const origin = location.origin;
+    const s = pc.stats || {};
+    UI.state.config.portCheck = { enabled: pc.enabled, maxPorts: pc.maxPorts };
+    $('#aBody').innerHTML = `
+      <div class="admin-section">
+        <label class="switch"><input type="checkbox" id="pcEnabled" ${pc.enabled ? 'checked' : ''}><span class="track"></span><b>Allow port checks</b></label>
+        <p class="muted" style="margin:0;font-size:12px">Off by default. When on, a device can ask the server to try connecting back to it on a few ports, either with its check-in (saved on its record as <code>port_3389</code> = open / closed) or on its own (the answer goes back to the device only). The Add Device page offers it once this is on.</p>
+      </div>
+      <div class="admin-section">
+        <h4>Limits</h4>
+        <div class="row" style="display:flex;gap:12px;flex-wrap:wrap;max-width:520px">
+          <label class="field" style="flex:1;min-width:180px">Wait for an answer (ms)<input class="input" id="pcTimeout" type="number" min="200" max="10000" step="100" value="${esc(pc.timeoutMs)}"></label>
+          <label class="field" style="flex:1;min-width:180px">Ports per request<input class="input" id="pcMax" type="number" min="1" max="20" value="${esc(pc.maxPorts)}"></label>
+        </div>
+        <p class="muted" style="margin:6px 0 10px;font-size:12px">A port that doesn't answer within the wait counts as closed (shown as <i>filtered</i> in the details). Each address can check up to 300 ports a minute.</p>
+        <button class="btn primary" id="pcSave" style="align-self:flex-start">Save limits</button>
+      </div>
+      <div class="admin-section">
+        <h4>How it works</h4>
+        <div class="callout">
+          The server only ever checks <b>the address the request came from</b>; a device can't ask it to check anything else, so this can't be used to scan other machines.
+          "Open" means reachable <b>from this server</b>: firewalls between the server and the device count, and a device behind NAT, a VPN gateway or a proxy is checked at that gateway's address.
+          ${pc.yourAddress ? `<br><br>Right now the server sees you as <code>${esc(pc.yourAddress)}</code>. Behind a reverse proxy, set <code>TRUST_PROXY</code> so it sees each device's real address instead of the proxy's.` : ''}
+        </div>
+      </div>
+      <div class="admin-section">
+        <h4>Usage</h4>
+        <pre class="key-reveal" style="border-style:solid;border-color:var(--border);white-space:pre-wrap"># Just ask (the answer comes back; nothing is saved)
+curl -H "X-API-Key: &lt;key&gt;" "${esc(origin)}/api/portcheck?ports=22,443"
+  → {"ok":true,"ip":"10.0.0.15","ports":{"22":"open","443":"closed"},"ms":3}
+
+# With a check-in (saved as port_3389 on the record, details in the reply)
+curl -X POST "${esc(origin)}/api/checkin?id=web-01&amp;check_ports=3389" -H "X-API-Key: &lt;key&gt;"
+
+# The agents
+sudo checkin-agent --port-check 22,443          (Linux: ask once)
+checkin-agent.ps1 -PortCheck 3389                (Windows: ask once)
+--check-ports 22 / -CheckPorts 3389              (with every check-in; Add Device sets this)</pre>
+      </div>
+      <div class="admin-section">
+        <h4>Since the server started</h4>
+        <p class="muted" style="margin:0">${nf.format(s.checks || 0)} ports checked: ${nf.format(s.open || 0)} open, ${nf.format(s.closed || 0)} closed, ${nf.format(s.filtered || 0)} no answer${s.error ? `, ${nf.format(s.error)} errors` : ''}.</p>
+      </div>`;
+    $('#pcEnabled').addEventListener('change', async (e) => {
+      try {
+        renderPorts(await apiJson('/api/admin/portcheck', json('PUT', { enabled: e.target.checked })));
+        toast(e.target.checked ? 'Port checks turned on' : 'Port checks turned off');
+      } catch (err) { toast(err.message, 'error'); e.target.checked = !e.target.checked; }
+    });
+    $('#pcSave').addEventListener('click', async () => {
+      try {
+        renderPorts(await apiJson('/api/admin/portcheck', json('PUT', { timeoutMs: Number($('#pcTimeout').value), maxPorts: Number($('#pcMax').value) })));
+        toast('Port check limits saved');
+      } catch (err) { toast(err.message, 'error'); }
+    });
   }
 
   // ================================================================== wiring

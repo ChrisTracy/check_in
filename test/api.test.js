@@ -701,3 +701,46 @@ test('default views: personal default follows the account, team default needs po
   await admin({ method: 'DELETE', url: `/api/views/${team.id}` });
   assert.deepEqual((await u1({ url: '/api/views' })).json().defaults, { mine: null, team: null });
 });
+
+test('port checks: off by default, admin turns them on, results saved with the check-in', async () => {
+  const net = await import('node:net');
+  const { call, admin, as, accounts, store } = await setup();
+  await accounts.create({ username: 'pu', password: 'powerpass123', role: 'power' });
+  const srv = net.createServer((c) => c.on('error', () => {})).listen(0, '127.0.0.1');
+  await new Promise((r) => srv.once('listening', r));
+  const open = srv.address().port;
+  const closedSrv = net.createServer().listen(0, '127.0.0.1');
+  await new Promise((r) => closedSrv.once('listening', r));
+  const closed = closedSrv.address().port;
+  await new Promise((r) => closedSrv.close(r));
+  try {
+    // Off: the endpoint refuses; a check-in still works and says so, without storing check_ports.
+    assert.equal((await call({ url: `/api/portcheck?ports=${open}` })).statusCode, 403);
+    let r = await call({ method: 'POST', url: '/api/checkin', payload: { id: 'pc-1', check_ports: String(open) } });
+    assert.equal(r.json().portCheck, 'off');
+    assert.equal(store.get('pc-1').check_ports, undefined);
+    assert.equal((await call({ url: '/api/config' })).json().portCheck.enabled, false);
+    // Only admins can turn it on.
+    assert.equal((await as('pu', 'powerpass123')({ method: 'PUT', url: '/api/admin/portcheck', payload: { enabled: true } })).statusCode, 403);
+    r = await admin({ method: 'PUT', url: '/api/admin/portcheck', payload: { enabled: true, timeoutMs: 500, maxPorts: 3 } });
+    assert.equal(r.statusCode, 200, r.body);
+    assert.equal(r.json().enabled, true);
+    // Standalone: checks the caller's own address.
+    r = await call({ url: `/api/portcheck?ports=${open},${closed}` });
+    assert.equal(r.statusCode, 200, r.body);
+    assert.equal(r.json().ip, '127.0.0.1');
+    assert.deepEqual(r.json().ports, { [open]: 'open', [closed]: 'closed' });
+    assert.equal((await call({ url: '/api/portcheck?ports=1,2,3,4' })).statusCode, 400);   // more than maxPorts
+    assert.equal((await call({ url: '/api/portcheck?ports=70000' })).statusCode, 400);
+    assert.equal((await call({ url: '/api/portcheck?ports=22&host=10.0.0.1' })).json().ip, '127.0.0.1'); // no other targets
+    // With a check-in: saved as fields, details returned.
+    r = await call({ method: 'POST', url: '/api/checkin', payload: { id: 'pc-1', cpu_pct: 5, check_ports: `${open},${closed}` } });
+    assert.deepEqual(r.json().ports, { [open]: 'open', [closed]: 'closed' });
+    const rec = store.get('pc-1');
+    assert.equal(rec[`port_${open}`], 'open');
+    assert.equal(rec[`port_${closed}`], 'closed');
+    assert.equal(rec.check_ports, undefined);
+  } finally {
+    srv.close();
+  }
+});

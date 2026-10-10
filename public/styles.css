@@ -873,3 +873,9 @@ body.compact .td { font-size: 13px; }
 .vbadge .person { stroke: none; width: 14px; height: 14px; }
 .vbadge.mine { color: var(--accent); }
 .vbadge.team { color: var(--aging); }
+
+/* Add Device: port check option */
+.ag-port-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.ag-port-row .input { width: 140px; }
+.ag-port.off { opacity: .55; }
+.ag-port.off .switch { cursor: not-allowed; }

@@ -28,7 +28,9 @@
     ext: '<svg class="i" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>',
   };
 
-  const st = { keyInfo: null, os: 'windows', every: 5, groups: new Set(DEFAULT), extra: '', key: '', insecure: false, shell: 'ps', removeRecord: true };
+  const st = { keyInfo: null, os: 'windows', every: 5, groups: new Set(DEFAULT), extra: '', key: '', insecure: false, shell: 'ps', removeRecord: true,
+    portOn: true, ports: { windows: '3389', linux: '22' } };
+  const portsEnabled = () => UI.state.config.portCheck?.enabled === true;
   let root = null;
 
   function origin() { return location.origin; }
@@ -43,6 +45,7 @@
         : hasDefaults ? ['default', ...sel.filter((g) => !DEFAULT.includes(g))].join(',') : sel.join(','));
     }
     if (st.extra.trim()) p.set('extra', st.extra.trim());
+    if (portsEnabled() && st.portOn && st.ports[st.os]) p.set('ports', st.ports[st.os]);
     if (st.insecure) p.set('insecure', '1');
     // If the server sees itself under another address (e.g. behind a proxy without TRUST_PROXY), pin ours.
     const site = UI.state.config.siteUrl;
@@ -102,6 +105,23 @@
     return `${esc(c.note)} ${missing ? '<b class="ag-warn">Add the API key above first, or the install will fail.</b>' : ''}`;
   }
 
+  // Port check option: greyed out until an admin turns port checks on.
+  function portField() {
+    const on = portsEnabled();
+    const name = st.os === 'windows' ? 'Remote Desktop' : 'SSH';
+    const list = st.ports[st.os];
+    const first = (list.split(',')[0] || (st.os === 'windows' ? '3389' : '22'));
+    return `<div class="field ag-port${on ? '' : ' off'}" style="margin-top:12px">
+        <div class="ag-port-row">
+          <label class="switch" title="${on ? '' : 'Turned off on this server: an admin can turn it on in Admin → Port checks'}"><input type="checkbox" id="agPorts" ${on && st.portOn ? 'checked' : ''} ${on ? '' : 'disabled'}><span class="track"></span>Check that ${name} is reachable</label>
+          <input class="input mono" id="agPortList" value="${esc(list)}" ${on && st.portOn ? '' : 'disabled'} spellcheck="false" aria-label="Ports to check" title="Ports, separated by commas">
+        </div>
+        <small>${on
+          ? `On each check-in the server tries to connect back to the machine on these ports and saves <code>port_${esc(first)}</code> = open or closed, so you can filter on it and use the ${name === 'SSH' ? 'SSH' : 'RDP'} status boxes. It tests from the server's side of the network.`
+          : 'Port checks are turned off on this server. An admin can turn them on in <b>Admin → Port checks</b>.'}</small>
+      </div>`;
+  }
+
   function render() {
     const keyNeeded = keyRequired();
     const ki = st.keyInfo;
@@ -137,6 +157,7 @@
             <small>Sent with every check-in. A value can use the machine's environment variables, read on every run: <code>\${NAME}</code>, <code>\${NAME:-fallback}</code> or <code>%NAME%</code>. ${st.os === 'windows' ? 'Set them as System variables so the scheduled task can see them.' : 'Put them in /etc/environment or the agent config so the timer or cron job can see them.'}</small>
           </label>
         </div>
+        ${portField()}
         <div class="field" style="margin-top:12px">What to send
           <div class="ag-groups">${GROUPS.map(([g, l, d]) => `<label class="ag-group ${st.groups.has(g) ? 'on' : ''}"><input type="checkbox" value="${g}" ${st.groups.has(g) ? 'checked' : ''}><b>${l}</b><small>${d}</small></label>`).join('')}</div>
         </div>
@@ -216,6 +237,7 @@
       if (e.target.id === 'agEvery') { st.every = Number(e.target.value); render(); }
       else if (e.target.id === 'agInsecure') { st.insecure = e.target.checked; render(); }
       else if (e.target.id === 'agRemoveRecord') { st.removeRecord = e.target.checked; render(); }
+      else if (e.target.id === 'agPorts') { st.portOn = e.target.checked; render(); }
       else if (e.target.closest('.ag-groups')) {
         if (e.target.checked) st.groups.add(e.target.value); else st.groups.delete(e.target.value);
         if (!st.groups.size) { st.groups.add(e.target.value); e.target.checked = true; toast('Pick at least one group', 'error'); }
@@ -225,6 +247,12 @@
     });
     root.addEventListener('input', (e) => {
       if (e.target.id === 'agKey') { st.key = e.target.value.replace(/[^A-Za-z0-9_-]/g, ''); if (st.key !== e.target.value) e.target.value = st.key; update(); }
+      if (e.target.id === 'agPortList') {
+        const v = e.target.value.replace(/[^0-9,]/g, '').replace(/,{2,}/g, ',');
+        if (v !== e.target.value) e.target.value = v;
+        st.ports[st.os] = v.replace(/^,|,$/g, '').split(',').filter((p) => p && Number(p) >= 1 && Number(p) <= 65535).slice(0, 20).join(',');
+        update();
+      }
       if (e.target.id === 'agExtra') { st.extra = e.target.value.replace(/[^A-Za-z0-9_.:@/ =,+${}%-]/g, ''); if (st.extra !== e.target.value) e.target.value = st.extra; update(); }
     });
   }

@@ -17,6 +17,7 @@ import { ROOT } from './config.js';
  *   &exclude=users                field groups to leave out
  *   &extra=site=Dallas,owner=it   extra fields; values may use the machine's environment variables,
  *                                 read on every run: site=${SITE}, owner=${OWNER:-it} or site=%SITE%
+ *   &ports=3389                   ports the server tests on each check-in (port checks must be on)
  *   &insecure=1                   accept a self-signed certificate
  *   &url=https://checkin.example.com   override the server address baked into the installer
  *
@@ -32,6 +33,7 @@ export const INSTALL_DEFAULTS = {
   fields: 'default',
   exclude: '',
   extra: '',
+  ports: '',
 };
 
 export const AGENT_GROUPS = ['system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 'domain', 'users', 'health', 'updates', 'security'];
@@ -81,6 +83,13 @@ export function installOptions(q, { maxEvery }) {
     if (/\$(?!\{[A-Za-z_][A-Za-z0-9_]*(:-[^}$]*)?\})/.test(v)) throw new BadOption('in extra, $ may only be used as ${NAME} or ${NAME:-fallback}');
     opt.extra = v;
   }
+  if (q.ports !== undefined) {
+    const v = String(q.ports).replace(/\s+/g, '');
+    if (v && (!/^\d{1,5}(,\d{1,5}){0,19}$/.test(v) || v.split(',').some((p) => Number(p) < 1 || Number(p) > 65535))) {
+      throw new BadOption('ports must be port numbers separated by commas, e.g. 22 or 3389,443');
+    }
+    opt.ports = v;
+  }
   opt.insecure = q.insecure === '1' || q.insecure === 'true';
   return opt;
 }
@@ -105,6 +114,7 @@ FIELDS="\${CHECKIN_FIELDS:-${o.fields}}"             # field groups: default, al
 EXCLUDE="\${CHECKIN_EXCLUDE:-${o.exclude}}"          # field groups to leave out
 EXTRA="\${CHECKIN_EXTRA:-}"                         # extra fields, e.g. 'site=Dallas,owner=\${OWNER:-it}'
 [ -n "$EXTRA" ] || EXTRA='${o.extra}'   # single quotes: \${NAME} and %NAME% are read on each run, not now
+CHECK_PORTS="\${CHECKIN_CHECK_PORTS:-${o.ports}}"    # ports the server tests on each check-in, e.g. 22 (Admin → Port checks)
 INSECURE="\${CHECKIN_INSECURE:-${o.insecure ? 1 : ''}}"           # 1 = accept a self-signed certificate
 # --------------------------------------------------------------------------------------------------
 set -eu
@@ -117,6 +127,7 @@ curl -fsS $K "$SERVER/agent/checkin-agent.sh" -o "$TMP"
 set -- --install --url "$SERVER" --every "$EVERY" --fields "$FIELDS"
 [ -n "$EXCLUDE" ] && set -- "$@" --exclude "$EXCLUDE"
 [ -n "$EXTRA" ] && set -- "$@" --extra "$EXTRA"
+[ -n "$CHECK_PORTS" ] && set -- "$@" --check-ports "$CHECK_PORTS"
 [ "$INSECURE" = 1 ] && set -- "$@" --insecure
 [ "\${CHECKIN_CRON:-}" = 1 ] && set -- "$@" --cron
 bash "$TMP" "$@" </dev/null
@@ -144,6 +155,7 @@ function windowsInstaller(site, o) {
   $Fields   = if ($env:CHECKIN_FIELDS)  { $env:CHECKIN_FIELDS }  else { '${q(o.fields)}' }   # default, all, or e.g. cpu,ram,disk
   $Exclude  = if ($env:CHECKIN_EXCLUDE) { $env:CHECKIN_EXCLUDE } else { '${q(o.exclude)}' }  # groups to leave out
   $Extra    = if ($env:CHECKIN_EXTRA)   { $env:CHECKIN_EXTRA }   else { '${q(o.extra)}' }    # e.g. site=%SITE%,owner=it (%NAME% / \${NAME} are read on each run)
+  $CheckPorts = if ($env:CHECKIN_CHECK_PORTS) { $env:CHECKIN_CHECK_PORTS } else { '${q(o.ports)}' }  # ports the server tests on each check-in, e.g. 3389 (Admin → Port checks)
   $Insecure = ${o.insecure ? '$true' : '$false'}                                             # $true = accept a self-signed certificate
   # -----------------------------------------------------------------------------------------------
   $ErrorActionPreference = 'Stop'
@@ -163,6 +175,7 @@ function windowsInstaller(site, o) {
   $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dl.OutFile, '-Install', '-Url', $Server, '-Every', $Every, '-Fields', $Fields)
   if ($Exclude) { $a += @('-Exclude', $Exclude) }
   if ($Extra) { $a += @('-Extra', $Extra) }
+  if ($CheckPorts) { $a += @('-CheckPorts', $CheckPorts) }
   if ($Insecure) { $a += '-Insecure' }
   # Runs in a separate Windows PowerShell so the agent's exit codes can't close this window.
   & (Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe') @a

@@ -1,6 +1,7 @@
 import { SavedViews, registerViews } from './views.js';
 import { registerAgentRoutes, siteUrl } from './agents.js';
 import { StatBoxes, registerBoxes } from './boxes.js';
+import { PortChecker, registerPortCheck, parsePorts } from './portcheck.js';
 import path from 'node:path';
 import http from 'node:http';
 import querystring from 'node:querystring';
@@ -17,6 +18,16 @@ import { TlsManager } from './tls.js';
 
 const AUTH_QUERY_KEYS = new Set(['api_key', 'apikey']);
 const MAX_BULK_DELETE = 100_000;
+
+/** Split off the check_ports instruction so it's never stored as a field. */
+function withoutCheckPorts(input) {
+  const fields = { ...input };
+  let ports;
+  for (const k of Object.keys(fields)) {
+    if (k.toLowerCase() === 'check_ports') { ports = fields[k]; delete fields[k]; }
+  }
+  return { fields, ports };
+}
 
 // querystring / form values can be arrays for repeated keys; the last one wins.
 function flattenParams(obj) {
@@ -156,6 +167,8 @@ export function buildApp({ config, store, accounts, oidc }) {
   registerViews(app, { views, broadcast });
   const boxes = new StatBoxes({ db: store.db, store, accounts });
   registerBoxes(app, { boxes, broadcast });
+  const portChecker = new PortChecker(accounts);
+  registerPortCheck(app, { portChecker });
 
   // ---- admin: HTTPS / TLS --------------------------------------------------
   const tlsCap = { config: { cap: 'tls' } };
@@ -194,7 +207,7 @@ export function buildApp({ config, store, accounts, oidc }) {
     let site = null;
     try { site = siteUrl(req); } catch { /* unusual Host header */ }
     const k = accounts.apiKeyInfo();
-    return { historyLimit: config.historyLimit, apiKeySet: k.set, apiKeyRequired: k.required, siteUrl: site };
+    return { historyLimit: config.historyLimit, apiKeySet: k.set, apiKeyRequired: k.required, siteUrl: site, portCheck: { enabled: portChecker.enabled, maxPorts: portChecker.settings.maxPorts } };
   });
 
   // ---- check-in (create or update) --------------------------------------
@@ -209,7 +222,7 @@ export function buildApp({ config, store, accounts, oidc }) {
       const errors = [];
       body.forEach((item, index) => {
         try {
-          const merged = item && typeof item === 'object' && !Array.isArray(item) ? { ...query, ...item } : item;
+          const merged = item && typeof item === 'object' && !Array.isArray(item) ? withoutCheckPorts({ ...query, ...item }).fields : item;
           const { id, fields } = normalizeInput(merged, { maxFields: store.maxFields });
           pending.push(store.enqueue(id, fields).then((r) => ({ index, id, action: r.action, changed: r.changed })));
         } catch (e) {
@@ -230,8 +243,22 @@ export function buildApp({ config, store, accounts, oidc }) {
     const ct = req.headers['content-type'] || '';
     const fromBody = body && typeof body === 'object'
       ? (ct.includes('application/x-www-form-urlencoded') ? flattenParams(body) : body) : {};
-    const result = await store.upsert({ ...query, ...fromBody });
-    return reply.code(result.action === 'created' ? 201 : 200).send({ ok: true, ...result });
+    const { fields: merged, ports: wantPorts } = withoutCheckPorts({ ...query, ...fromBody });
+    // check_ports=22,3389: the server checks those ports on the caller's address first, saves
+    // port_<n> = "open" | "closed" with this check-in, and returns the details.
+    let portInfo = {};
+    if (wantPorts !== undefined) {
+      if (!portChecker.enabled) portInfo = { portCheck: 'off' };
+      else {
+        try {
+          const r = await portChecker.check(req, parsePorts(wantPorts, portChecker.settings.maxPorts));
+          for (const [p, state] of Object.entries(r.ports)) merged[`port_${p}`] = state === 'open' ? 'open' : 'closed';
+          portInfo = { ports: r.ports, portCheckAddress: r.ip };
+        } catch (e) { portInfo = { portCheckError: e.message }; }
+      }
+    }
+    const result = await store.upsert(merged);
+    return reply.code(result.action === 'created' ? 201 : 200).send({ ok: true, ...result, ...portInfo });
   });
 
   // ---- read --------------------------------------------------------------

@@ -20,6 +20,12 @@
 #                                         environment variables, read on every run: ${NAME},
 #                                         ${NAME:-fallback} or %NAME%  (e.g. 'site=${SITE}').
 #                                         Quote it in single quotes so your shell doesn't expand it.
+#   --check-ports LIST CHECKIN_CHECK_PORTS With each check-in, ask the server to test these TCP ports
+#                                         on this machine (e.g. 22) and save port_22 = open / closed.
+#                                         Needs port checks turned on (dashboard: Admin → Port checks).
+#   --port-check LIST                     Just ask the server whether these ports on this machine are
+#                                         reachable from it, print the answer and exit
+#                                         (exit 0 = all open, 3 = some not open). Sends no check-in.
 #   --insecure         CHECKIN_INSECURE=1 Accept a self-signed certificate
 #   --config FILE      CHECKIN_CONFIG     Config file (default /etc/check-in/agent.conf)
 #   --dry-run                             Print the JSON; don't contact the server
@@ -71,6 +77,7 @@ DEFAULT_FIELDS="default"        # field groups to send: default, all, or e.g. cp
 DEFAULT_EXCLUDE=""              # field groups to skip
 DEFAULT_EXTRA=""                # extra fields, e.g. 'site=Dallas,owner=${OWNER:-it}' (see --extra)
 DEFAULT_EVERY=5                 # minutes between runs when installing (1-59)
+DEFAULT_CHECK_PORTS=""          # ports the server tests on each check-in, e.g. "22" (needs Admin → Port checks)
 # What "default" means (the groups sent when nothing else is chosen):
 DEFAULT_GROUPS="system cpu ram disk time uptime network domain users health"
 # ----------------------------------------------------------------------------------------------
@@ -86,7 +93,7 @@ log() { printf '%s\n' "$*" >&2; [ "$LOG_TO_SYSLOG" = 1 ] && logger -t checkin-ag
 die() { log "check-in agent: $*"; exit 1; }
 
 # ---- options ------------------------------------------------------------------------
-OPT_URL="" OPT_KEY="" OPT_ID="" OPT_FIELDS="" OPT_EXCLUDE="" OPT_EXTRA="" OPT_INSECURE="" OPT_CONFIG=""
+OPT_URL="" OPT_KEY="" OPT_ID="" OPT_FIELDS="" OPT_EXCLUDE="" OPT_EXTRA="" OPT_INSECURE="" OPT_CONFIG="" OPT_CHECK_PORTS="" PORT_CHECK=""
 DRY_RUN=0 FORCE=0 ACTION="run" EVERY="$DEFAULT_EVERY" USE_CRON=0 REMOVE_RECORD=0
 need() { [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#--}" = "$2" ] || die "$1 needs a value (see --help)"; }
 while [ $# -gt 0 ]; do
@@ -98,6 +105,8 @@ while [ $# -gt 0 ]; do
     --exclude) need "$@"; OPT_EXCLUDE="$2"; shift ;;
     --extra) need "$@"; OPT_EXTRA="$2"; shift ;;
     --config) need "$@"; OPT_CONFIG="$2"; shift ;;
+    --check-ports) need "$@"; OPT_CHECK_PORTS="$2"; shift ;;
+    --port-check) need "$@"; PORT_CHECK="$2"; ACTION="portcheck"; shift ;;
     --every) need "$@"; EVERY="$2"; shift ;;
     --insecure) OPT_INSECURE=1 ;;
     --cron) USE_CRON=1 ;;
@@ -121,7 +130,7 @@ fi
 
 # Environment wins over the config file; options win over both.
 ENV_URL="${CHECKIN_URL:-}" ENV_KEY="${CHECKIN_API_KEY:-}" ENV_ID="${CHECKIN_ID:-}" ENV_FIELDS="${CHECKIN_FIELDS:-}"
-ENV_EXCLUDE="${CHECKIN_EXCLUDE:-}" ENV_EXTRA="${CHECKIN_EXTRA:-}" ENV_INSECURE="${CHECKIN_INSECURE:-}"
+ENV_EXCLUDE="${CHECKIN_EXCLUDE:-}" ENV_EXTRA="${CHECKIN_EXTRA:-}" ENV_INSECURE="${CHECKIN_INSECURE:-}" ENV_CHECK_PORTS="${CHECKIN_CHECK_PORTS:-}"
 CONFIG="${OPT_CONFIG:-${CHECKIN_CONFIG:-$DEFAULT_CONFIG}}"
 if [ -r "$CONFIG" ]; then
   # shellcheck disable=SC1090
@@ -135,6 +144,12 @@ FIELDS=$(pick "$OPT_FIELDS" "$ENV_FIELDS" "${CHECKIN_FIELDS:-}" "$DEFAULT_FIELDS
 EXCLUDE=$(pick "$OPT_EXCLUDE" "$ENV_EXCLUDE" "${CHECKIN_EXCLUDE:-}" "$DEFAULT_EXCLUDE")
 EXTRA=$(pick "$OPT_EXTRA" "$ENV_EXTRA" "${CHECKIN_EXTRA:-}" "$DEFAULT_EXTRA")
 INSECURE=$(pick "$OPT_INSECURE" "$ENV_INSECURE" "${CHECKIN_INSECURE:-}")
+CHECK_PORTS=$(pick "$OPT_CHECK_PORTS" "$ENV_CHECK_PORTS" "${CHECKIN_CHECK_PORTS:-}" "$DEFAULT_CHECK_PORTS")
+valid_ports() { [[ "$1" =~ ^[0-9]{1,5}(,[0-9]{1,5})*$ ]]; }
+CHECK_PORTS="${CHECK_PORTS// /}"
+[ -z "$CHECK_PORTS" ] || valid_ports "$CHECK_PORTS" || die "--check-ports must be port numbers separated by commas, e.g. 22 or 22,443"
+PORT_CHECK="${PORT_CHECK// /}"
+[ "$ACTION" != portcheck ] || valid_ports "$PORT_CHECK" || die "--port-check must be port numbers separated by commas, e.g. 22 or 22,443"
 
 # Resolve the group list.
 SELECTED=" "
@@ -204,6 +219,7 @@ if [ "$ACTION" = "install" ]; then
       [ -n "$EXCLUDE" ] && printf 'CHECKIN_EXCLUDE=%q\n' "$EXCLUDE"
       [ -n "$EXTRA" ] && printf 'CHECKIN_EXTRA=%q\n' "$EXTRA"
       [ -n "$INSECURE" ] && echo 'CHECKIN_INSECURE=1'
+      [ -n "$CHECK_PORTS" ] && printf 'CHECKIN_CHECK_PORTS=%q\n' "$CHECK_PORTS"
     } > "$DEFAULT_CONFIG" )
   chmod 600 "$DEFAULT_CONFIG"
   if [ "$USE_CRON" = 0 ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
@@ -282,6 +298,26 @@ human_duration() {
   if [ $d -gt 0 ]; then printf '%dd %dh %dm' $d $h $m; elif [ $h -gt 0 ]; then printf '%dh %dm' $h $m; else printf '%dm' $m; fi
 }
 iso_time() { date -d "@$1" +%Y-%m-%dT%H:%M:%S%:z 2>/dev/null; }
+
+# Pull "ports":{"22":"open",...} out of a server reply and print one line per port.
+print_ports() {
+  local m p st
+  m=$(printf '%s' "$1" | grep -o '"ports"[[:space:]]*:[[:space:]]*{[^}]*}' | head -1)
+  [ -n "$m" ] || return 1
+  while read -r p st; do [ -n "$p" ] && log "  port $p: $st"; done < <(printf '%s' "$m" | grep -o '"[0-9]*"[[:space:]]*:[[:space:]]*"[a-z]*"' | tr -d '"' | tr ':' ' ')
+}
+
+# ---- --port-check: ask once, print, exit ----------------------------------------------
+if [ "$ACTION" = portcheck ]; then
+  RESP=$(api -w '\n%{http_code}' "$URL/api/portcheck?ports=$PORT_CHECK") || die "could not reach $URL/api/portcheck"
+  CODE="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
+  [ "$CODE" = 200 ] || die "port check failed (HTTP $CODE): ${BODY:0:200}"
+  IP=$(printf '%s' "$BODY" | grep -o '"ip"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/')
+  log "Ports on ${IP:-this machine}, as seen from $URL:"
+  print_ports "$BODY"
+  printf '%s' "$BODY" | grep -o '"ports"[[:space:]]*:[[:space:]]*{[^}]*}' | grep -Eq '"(closed|filtered|error)"' && exit 3
+  exit 0
+fi
 
 # ---- 1. is the server accepting check-ins? ---------------------------------------------
 if [ "$DRY_RUN" = 0 ] && [ "$FORCE" = 0 ]; then
@@ -545,6 +581,7 @@ if [ -n "$EXTRA" ]; then
 fi
 add_str agent_version "$VERSION"
 add_str agent_os linux
+add_str check_ports "$CHECK_PORTS"   # an instruction to the server, not stored as a field
 
 JSON="{$(IFS=,; echo "${FIELDS_JSON[*]}")}"
 
@@ -554,7 +591,13 @@ RESP=$(api -w '\n%{http_code}' -X POST -H 'content-type: application/json' --dat
   || die "could not reach $URL/api/checkin"
 CODE="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
 case "$CODE" in
-  200|201) log "Checked in as ${ID:-$HOST_SHORT} ($( [ "$CODE" = 201 ] && echo created || echo updated ), ${#FIELDS_JSON[@]} fields)."; exit 0 ;;
+  200|201)
+    log "Checked in as ${ID:-$HOST_SHORT} ($( [ "$CODE" = 201 ] && echo created || echo updated ), ${#FIELDS_JSON[@]} fields)."
+    if [ -n "$CHECK_PORTS" ]; then
+      if printf '%s' "$BODY" | grep -q '"portCheck"[[:space:]]*:[[:space:]]*"off"'; then log "  port checks are turned off on the server (Admin → Port checks)"
+      elif ! print_ports "$BODY"; then log "  port check: $(printf '%s' "$BODY" | grep -o '"portCheckError"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*:[[:space:]]*"//; s/"$//')"; fi
+    fi
+    exit 0 ;;
   503) log "Server paused while sending. Nothing saved."; exit 2 ;;
   401|403) die "server refused the API key (HTTP $CODE): ${BODY:0:200}" ;;
   *) die "check-in failed (HTTP $CODE): ${BODY:0:200}" ;;

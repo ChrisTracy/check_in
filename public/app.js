@@ -51,9 +51,9 @@
       : d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   };
 
-  const GOOD = /^(ok|okay|online|up|healthy|success|succeeded|pass|passed|active|running|true|yes|green|ready|complete|completed|done)$/i;
+  const GOOD = /^(ok|okay|online|up|healthy|success|succeeded|pass|passed|active|running|true|yes|green|ready|complete|completed|done|open)$/i;
   const WARN = /^(warn|warning|degraded|pending|slow|busy|yellow|amber|starting|partial|retry|retrying)$/i;
-  const BAD = /^(error|err|fail|failed|failure|down|offline|critical|crit|dead|false|no|red|stopped|unhealthy|fatal|timeout)$/i;
+  const BAD = /^(error|err|fail|failed|failure|down|offline|critical|crit|dead|false|no|red|stopped|unhealthy|fatal|timeout|closed)$/i;
   const INFO = /^(info|new|idle|maintenance|paused|unknown|blue)$/i;
   function pillClass(v) {
     if (typeof v !== 'string' && typeof v !== 'boolean') return '';
@@ -1015,6 +1015,10 @@
     { key: 'disk', label: 'Low disk space', box: { name: 'Low disk space', field: 'disk_max_pct', op: 'gte', value: '90', minutes: 0, tone: 'warn' } },
     { key: 'reboot', label: 'Reboot required', box: { name: 'Reboot required', field: 'reboot_required', op: 'eq', value: 'true', minutes: 0, tone: 'info' } },
     { key: 'domain', label: 'Not domain joined', box: { name: 'Not domain joined', field: 'domain_joined', op: 'eq', value: 'false', minutes: 0, tone: 'neutral' } },
+    { key: 'rdp-closed', label: 'RDP closed', box: { name: 'RDP closed', field: 'port_3389', op: 'eq', value: 'closed', minutes: 0, tone: 'bad' } },
+    { key: 'rdp-open', label: 'RDP open', box: { name: 'RDP open', field: 'port_3389', op: 'eq', value: 'open', minutes: 0, tone: 'info' } },
+    { key: 'ssh-closed', label: 'SSH closed', box: { name: 'SSH closed', field: 'port_22', op: 'eq', value: 'closed', minutes: 0, tone: 'bad' } },
+    { key: 'ssh-open', label: 'SSH open', box: { name: 'SSH open', field: 'port_22', op: 'eq', value: 'open', minutes: 0, tone: 'info' } },
     { key: 'custom', label: 'Custom…', box: { name: '', field: '', op: 'gt', value: '', minutes: 0, tone: 'warn' } },
   ];
   const fmtMinutes = (m) => (m < 60 ? `${m} min` : m % 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m / 60}h`);

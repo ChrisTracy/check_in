@@ -26,6 +26,7 @@ A self-hosted dashboard that keeps track of your devices. Each device checks in 
 - **Filters** on any field, status, or created/modified time; match all or any; save them as personal or team views.
 - **History and graphs** for every record: what changed and when, plus CPU, RAM, disk space and disk activity over time.
 - **Windows and Linux agents** that report system details (OS, CPU, memory, disk, network, domain join, uptime and more). **Add Device** gives you a one-line install command.
+- **Port checks** (optional, turned on by an admin): devices can ask the server whether a port such as RDP (3389) or SSH (22) is reachable, with the answer saved on the record or sent straight back.
 - **CSV import and export**, multi-select delete, and a pause switch to stop accepting check-ins.
 - **Users and roles** (Admin, Power user, User, Reader), an API key for devices, and Microsoft Entra ID single sign-on.
 - **Built-in HTTPS** if you don't have a reverse proxy.

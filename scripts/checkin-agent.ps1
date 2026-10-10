@@ -45,6 +45,12 @@
   Extra fields, e.g. "site=Dallas,owner=it-infra". A value can use environment variables, read on
   every run: %NAME%, ${NAME} or ${NAME:-fallback}, e.g. 'site=%SITE%,owner=${OWNER:-it}'.
   Use single quotes in PowerShell so the reference is stored, not today's value.
+.PARAMETER CheckPorts
+  With each check-in, ask the server to test these TCP ports on this computer (e.g. 3389) and save
+  port_3389 = open / closed on its record. Needs port checks turned on (dashboard: Admin → Port checks).
+.PARAMETER PortCheck
+  Just ask the server whether these ports on this computer are reachable from it, print the answer
+  and exit (exit code 0 = all open, 3 = some not open). Sends no check-in.
 .PARAMETER Insecure
   Accept a self-signed certificate.
 .PARAMETER DryRun
@@ -85,6 +91,8 @@ param(
   [string[]]$Fields,
   [string[]]$Exclude,
   [string]$Extra,
+  [string[]]$CheckPorts,
+  [string[]]$PortCheck,
   [switch]$Insecure,
   [switch]$DryRun,
   [switch]$Force,
@@ -107,6 +115,7 @@ $DefaultFields = 'default'       # field groups to send: default, all, or e.g. c
 $DefaultExclude = ''             # field groups to skip
 $DefaultExtra = ''               # extra fields, e.g. 'site=Dallas,owner=%OWNER%' (see -Extra)
 $DefaultEvery = 5                # minutes between runs when installing (1-1439)
+$DefaultCheckPorts = ''          # ports the server tests on each check-in, e.g. '3389' (needs Admin → Port checks)
 # What "default" means (the groups sent when nothing else is chosen):
 $DefaultGroups = @('system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 'domain', 'users', 'health')
 # ----------------------------------------------------------------------------------------------
@@ -178,6 +187,11 @@ $Fields = Get-Setting ($Fields -join ',') 'CHECKIN_FIELDS' 'Fields' $DefaultFiel
 $Exclude = Get-Setting ($Exclude -join ',') 'CHECKIN_EXCLUDE' 'Exclude' $DefaultExclude
 $Proxy = Get-Setting $Proxy 'CHECKIN_PROXY' 'Proxy'
 $Extra = Get-Setting $Extra 'CHECKIN_EXTRA' 'Extra' $DefaultExtra
+# -CheckPorts 3389,443 (a list) and -CheckPorts "3389,443" (text) both work.
+$CheckPorts = (Get-Setting ($CheckPorts -join ',') 'CHECKIN_CHECK_PORTS' 'CheckPorts' $DefaultCheckPorts) -replace '\s', ''
+if ($CheckPorts -and $CheckPorts -notmatch '^\d{1,5}(,\d{1,5})*$') { Stop-Agent '-CheckPorts must be port numbers separated by commas, e.g. 3389 or 3389,443' }
+$PortCheck = ($PortCheck -join ',') -replace '\s', ''
+if ($PortCheck -and $PortCheck -notmatch '^\d{1,5}(,\d{1,5})*$') { Stop-Agent '-PortCheck must be port numbers separated by commas, e.g. 3389 or 3389,443' }
 if (-not $Insecure) { $Insecure = [bool](($env:CHECKIN_INSECURE -eq '1') -or ($cfg.ContainsKey('Insecure') -and $cfg['Insecure'])) }
 
 # Resolve the group list.
@@ -241,7 +255,7 @@ if ($Install) {
     if ($Insecure -and $PSVersionTable.PSVersion.Major -ge 6) { $dl.SkipCertificateCheck = $true }
     Invoke-WebRequest @dl
   }
-  $settings = [ordered]@{ Url = $Url; ApiKey = $ApiKey; Id = $Id; Fields = $Fields; Exclude = $Exclude; Extra = $Extra; Insecure = [bool]$Insecure; Proxy = $Proxy }
+  $settings = [ordered]@{ Url = $Url; ApiKey = $ApiKey; Id = $Id; Fields = $Fields; Exclude = $Exclude; Extra = $Extra; CheckPorts = $CheckPorts; Insecure = [bool]$Insecure; Proxy = $Proxy }
   $settings | ConvertTo-Json | Out-File -FilePath $DefaultConfig -Encoding utf8 -Force
   # The task is defined in XML so it also runs on battery, can't pile up, and is stopped if a run hangs.
   $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -331,6 +345,22 @@ function Format-Duration([TimeSpan]$t) {
 function Format-Time([datetime]$d) { return $d.ToString('yyyy-MM-ddTHH:mm:sszzz') }
 function Pct($used, $total) { if ($total -gt 0) { return [Math]::Round(100.0 * $used / $total, 1) } }
 $isAdmin = Test-Admin
+
+# "port 3389: open" lines from a server reply's ports object.
+function Format-Ports($ports) {
+  if ($null -eq $ports) { return @() }
+  return @($ports.PSObject.Properties | ForEach-Object { "  port $($_.Name): $($_.Value)" })
+}
+
+# ---- -PortCheck: ask once, print, exit -----------------------------------------------------
+if ($PortCheck) {
+  try { $pc = Invoke-Api 'GET' "/api/portcheck?ports=$PortCheck" } catch { Stop-Agent "could not reach $Url/api/portcheck : $($_.Exception.Message)" }
+  if ($pc.Status -ne 200) { Stop-Agent "port check failed (HTTP $($pc.Status)): $($pc.Body)" }
+  $res = $pc.Body | ConvertFrom-Json
+  Write-Log ((@("Ports on $($res.ip), as seen from ${Url}:") + (Format-Ports $res.ports)) -join [Environment]::NewLine)
+  if (@($res.ports.PSObject.Properties | Where-Object { $_.Value -ne 'open' }).Count) { exit 3 }
+  exit 0
+}
 
 # ---- 1. is the server accepting check-ins? -------------------------------------------------
 if (-not $DryRun -and -not $Force) {
@@ -611,6 +641,7 @@ foreach ($pair in ($Extra -split ',' | Where-Object { $_ -match '=' })) {
 if ($groupErrors.Count) { Add-Field 'agent_errors' ($groupErrors -join '; ') }
 Add-Field 'agent_version' $Version
 Add-Field 'agent_os' 'windows'
+Add-Field 'check_ports' $CheckPorts   # an instruction to the server, not stored as a field
 
 $body = $data | ConvertTo-Json -Compress -Depth 3
 
@@ -620,7 +651,14 @@ try { $r = Invoke-Api 'POST' '/api/checkin' $body } catch { Stop-Agent "could no
 switch ($r.Status) {
   { $_ -eq 200 -or $_ -eq 201 } {
     $how = if ($r.Status -eq 201) { 'created' } else { 'updated' }
-    Write-Log "Checked in as $($data['id']) ($how, $($data.Count) fields)."
+    $lines = @("Checked in as $($data['id']) ($how, $($data.Count) fields).")
+    if ($CheckPorts) {
+      try { $res = $r.Body | ConvertFrom-Json } catch { $res = $null }
+      if ($res.portCheck -eq 'off') { $lines += '  port checks are turned off on the server (Admin → Port checks)' }
+      elseif ($res.ports) { $lines += Format-Ports $res.ports }
+      elseif ($res.portCheckError) { $lines += "  port check: $($res.portCheckError)" }
+    }
+    Write-Log ($lines -join [Environment]::NewLine)
     exit 0
   }
   503 { Write-Log 'Server paused while sending. Nothing saved.'; exit 2 }

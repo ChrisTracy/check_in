@@ -154,7 +154,7 @@ Notes:
 | Delete records (single or multi-select) | | ✓ | ✓ | ✓ |
 | **Clear all**, pause/resume check-ins, change the active threshold, create/edit/delete team views, set up status boxes | | | ✓ | ✓ |
 | See and regenerate the API key | | | ✓ | ✓ |
-| Manage users and single sign-on; use a custom API key or stop requiring one | | | | ✓ |
+| Manage users and single sign-on; use a custom API key or stop requiring one; turn port checks on or off | | | | ✓ |
 
 The active threshold is now a shared, server-side setting. When a power user changes it, every open dashboard updates. Permissions are enforced by the server; the dashboard also hides what your role can't do.
 
@@ -315,6 +315,20 @@ curl -u admin:password -X PUT http://localhost:3000/api/status -H "Content-Type:
 (Invoke-RestMethod http://localhost:3000/api/status).accepting
 ```
 
+### Port checks
+
+Off until an admin turns them on in **Admin → Port checks**. A device asks the server to try a TCP connection back to it on a few ports. The server only ever checks **the address the request came from** (there's no way to name another host), so it can't be used to scan other machines. "Open" means reachable from the server: firewalls in between count, and a device behind NAT, a VPN gateway or a proxy is checked at that gateway's address. Behind a reverse proxy, set `TRUST_PROXY` so the server sees each device's real address.
+
+| Method & path | Role | Description |
+|---|---|---|
+| `GET` or `POST /api/portcheck?ports=22,443` | User role or the API key | Checks those ports and returns `{ "ip": "10.0.0.15", "ports": { "22": "open", "443": "closed" }, "ms": 3 }`. Nothing is saved |
+| `POST /api/checkin` with `check_ports=3389` | as a check-in | Checks the ports first and saves `port_3389` = `open` or `closed` with the check-in (`check_ports` itself isn't stored). The reply includes `ports` with the details, `portCheck: "off"` when port checks are off (the check-in is still saved), or `portCheckError` |
+| `GET` / `PUT /api/admin/portcheck` | Admin | `{ "enabled": true, "timeoutMs": 2000, "maxPorts": 5 }` |
+
+Each port comes back as `open` (connected), `closed` (refused), `filtered` (no answer within the wait, 2 seconds by default) or `error`. Saved fields use just `open` / `closed`, where `closed` is anything but open. Limits: up to 5 ports per request (an admin can change this), 300 ports a minute per address, and 5,000 checks waiting at once across the server. The cost is small: under 0.1 ms of CPU per port, so thousands of checks a minute add a percent or two of one core.
+
+The Status box presets include **RDP open / closed** (`port_3389`) and **SSH open / closed** (`port_22`).
+
 ### CSV
 
 | Method & path | Description |
@@ -451,6 +465,8 @@ Every agent also sends `agent_version` and `agent_os`. Anything a machine can't 
 | `-Fields` | `--fields` | Groups to send, e.g. `cpu,ram,disk,domain` |
 | `-Exclude` | `--exclude` | Groups to skip |
 | `-Extra` | `--extra` | Extra fields, e.g. `"site=Dallas,owner=it-infra"`. Values can use environment variables (see below) |
+| `-CheckPorts 3389` | `--check-ports 22` | With each check-in, have the server test these ports on this machine and save `port_3389` = open / closed (needs port checks turned on) |
+| `-PortCheck 3389,443` | `--port-check 22,443` | Just ask the server whether these ports are reachable, print the answer and exit (exit code 0 = all open, 3 = some not). No check-in |
 | `-Insecure` | `--insecure` | Accept a self-signed certificate |
 | `-Proxy` | `https_proxy` env var | Web proxy |
 | `-DryRun` | `--dry-run` | Print the JSON instead of sending it |
@@ -498,6 +514,8 @@ curl -fsSL 'https://checkin.example.com/install.sh' | sudo CHECKIN_API_KEY=ck_xx
 - **Linux:** a systemd timer, or cron where there's no systemd. Add `CHECKIN_CRON=1` to always use cron.
 
 Leave out `CHECKIN_API_KEY` only if an admin has turned off the API key requirement.
+
+When port checks are on, Add Device also offers **Check that Remote Desktop / SSH is reachable** (port 3389 on Windows, 22 on Linux; you can change or add ports). It adds `?ports=3389` to the install URL, so each check-in saves `port_3389` = open / closed. The option is greyed out while port checks are off.
 
 Options go on the install URL and become that machine's settings: `?every=10&fields=default,security&exclude=users&extra=site=Dallas,owner=it&insecure=1`. Add `&url=https://...` if machines should use a different address from the one in your browser. Open an install URL in the browser to read exactly what it will run. The address comes from the request, so behind a reverse proxy set `TRUST_PROXY`; otherwise the installer may say `http://` instead of `https://`. The Add Device page warns you when that happens.
 
@@ -579,6 +597,7 @@ src/
   tls.js      built-in HTTPS: certificate storage, validation, hot reload, redirects
   views.js    saved views (personal and team)
   boxes.js    status boxes: rules, per-device "since" tracking, routes
+  portcheck.js port checks: TCP probes back to the caller, limits, routes
   compress.js Brotli / gzip response compression
   agents.js   agent downloads and the /install.sh, /install.ps1 one-line installers
   config.js   env/.env loading
