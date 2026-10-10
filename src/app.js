@@ -207,7 +207,7 @@ export function buildApp({ config, store, accounts, oidc }) {
     let site = null;
     try { site = siteUrl(req); } catch { /* unusual Host header */ }
     const k = accounts.apiKeyInfo();
-    return { historyLimit: config.historyLimit, apiKeySet: k.set, apiKeyRequired: k.required, siteUrl: site, portCheck: { enabled: portChecker.enabled, maxPorts: portChecker.settings.maxPorts } };
+    return { historyLimit: config.historyLimit, apiKeySet: k.set, apiKeyRequired: k.required, siteUrl: site, portCheck: { enabled: portChecker.enabled, maxPorts: portChecker.settings.maxPorts, perIpPerMinute: portChecker.settings.perIpPerMinute } };
   });
 
   // ---- check-in (create or update) --------------------------------------

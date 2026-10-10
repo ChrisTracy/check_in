@@ -16,6 +16,15 @@
     Stale      devices check in once (only if they don't exist yet) and then never again.
     Conditions (-HighCpu, -HighMemory, ...) are given to that many of the active devices, and stay
                true on every check-in, so boxes like "cpu_pct > 90 for 10 min" pick them up.
+    Ports      -RdpOpen / -RdpClosed (Windows devices, port_3389) and -SshOpen / -SshClosed (Linux
+               devices, port_22) are written as fields on those active devices, so the RDP / SSH
+               status boxes fill in.
+               With -ServerPortChecks those devices also send check_ports, so the server really
+               tests ports on the machine running this script (port checks must be on in Admin →
+               Port checks). Every simulated device comes from this one address, so the script
+               opens a listener on -OpenPort for the "open" devices and points the "closed" ones at
+               -ClosedPort, where nothing listens. The server saves its real results as
+               port_<OpenPort> / port_<ClosedPort>, and the status line counts them.
 
   "Active", "aging" and "stale" depend on the dashboard's active threshold (Settings), which the
   script reads from the server. The server decides status from the time of the last check-in, so
@@ -34,6 +43,10 @@
 
 .EXAMPLE
   .\scripts\loadtest-fleet.ps1 -Url http://localhost:3000 -Active 10000 -Aging 300 -Stale 200 -HighCpu 150 -HighMemory 80 -IntervalSeconds 60
+
+.EXAMPLE
+  .\scripts\loadtest-fleet.ps1 -Active 2000 -RdpOpen 300 -RdpClosed 50 -SshOpen 200 -SshClosed 20 -ServerPortChecks
+  # 570 devices also have the server test a port on this machine with each check-in
 
 .EXAMPLE
   .\scripts\loadtest-fleet.ps1 -Active 500 -IntervalSeconds 30 -Burst -Minutes 15
@@ -61,6 +74,15 @@ param(
   [ValidateRange(0, 1000000)][int]$NotDomainJoined = 5,    # domain_joined = false
   [ValidateRange(0, 1000000)][int]$FailedServices = 10,    # failed_services 1-3
 
+  # ---- port checks (Windows devices get port_3389, Linux devices port_22) ----
+  [ValidateRange(0, 1000000)][int]$RdpOpen = 0,            # port_3389 = open
+  [ValidateRange(0, 1000000)][int]$RdpClosed = 0,          # port_3389 = closed
+  [ValidateRange(0, 1000000)][int]$SshOpen = 0,            # port_22 = open
+  [ValidateRange(0, 1000000)][int]$SshClosed = 0,          # port_22 = closed
+  [switch]$ServerPortChecks,                               # those devices also make the server test a real port here
+  [ValidateRange(1, 65535)][int]$OpenPort = 45389,         # this script listens here ("open" devices)
+  [ValidateRange(1, 65535)][int]$ClosedPort = 45390,       # nothing listens here ("closed" devices)
+
   # ---- timing ----
   [ValidateRange(1, 86400)][int]$IntervalSeconds = 60,     # how often each active device checks in
   [switch]$Burst,                                          # all active devices at once, instead of spread out
@@ -85,7 +107,7 @@ if ($Prefix -notmatch '^[A-Za-z0-9._-]{1,20}$') { throw '-Prefix may only contai
 # ---------------------------------------------------------------- HTTP
 Add-Type -AssemblyName System.Net.Http
 $isCore = $PSVersionTable.PSEdition -eq 'Core'
-if (-not ('CheckinFleetLoad' -as [type])) {
+if (-not ('CheckinFleetLoad3' -as [type])) {
   # A small C# sender: each check-in is its own async request, timed individually, without
   # blocking the PowerShell loop. (C# 5 syntax so Windows PowerShell 5.1 can compile it.)
   $source = @'
@@ -94,11 +116,13 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
-public class CheckinFleetLoad {
+public class CheckinFleetLoad3 {
   private readonly HttpClient client;
   private readonly string endpoint;
   public ConcurrentQueue<double> Latencies = new ConcurrentQueue<double>();
@@ -106,12 +130,43 @@ public class CheckinFleetLoad {
   public int InFlight;
   public long Sent;
   public string LastError = "";
+  // When set, successful replies are read for the server's port check results.
+  public bool InspectPorts;
+  public ConcurrentDictionary<string, int> PortResults = new ConcurrentDictionary<string, int>();
+  public string LastPortError = "";
+  private static readonly Regex PortsObject = new Regex("\"ports\"\\s*:\\s*\\{([^}]*)\\}", RegexOptions.Compiled);
+  private static readonly Regex PortState = new Regex("\"\\d+\"\\s*:\\s*\"([a-z]+)\"", RegexOptions.Compiled);
 
-  public CheckinFleetLoad(HttpMessageHandler handler, string endpoint, string apiKey) {
+  public CheckinFleetLoad3(HttpMessageHandler handler, string endpoint, string apiKey) {
     this.client = new HttpClient(handler);
     this.client.Timeout = TimeSpan.FromSeconds(60);
     if (!String.IsNullOrEmpty(apiKey)) this.client.DefaultRequestHeaders.Add("X-API-Key", apiKey);
     this.endpoint = endpoint;
+  }
+
+  private static void Count(ConcurrentDictionary<string, int> d, string k) { d.AddOrUpdate(k, 1, delegate(string key, int v) { return v + 1; }); }
+
+  // Accepts and immediately closes connections, so the server's port checks find this port open.
+  public static TcpListener Listen(int port) {
+    TcpListener l;
+    try {
+      // IPv4 and IPv6 together where the machine supports it.
+      l = new TcpListener(IPAddress.IPv6Any, port);
+      l.Server.DualMode = true;
+      l.Start(1000);
+    } catch (SocketException) {
+      l = new TcpListener(IPAddress.Any, port);
+      l.Start(1000);
+    }
+    AcceptLoop(l);
+    return l;
+  }
+  private static async void AcceptLoop(TcpListener l) {
+    while (true) {
+      TcpClient c;
+      try { c = await l.AcceptTcpClientAsync().ConfigureAwait(false); } catch { return; }
+      try { c.Close(); } catch { }
+    }
   }
 
   public static void TrustAllCertificatesLegacy() {
@@ -131,6 +186,19 @@ public class CheckinFleetLoad {
       using (StringContent body = new StringContent(json, Encoding.UTF8, "application/json"))
       using (HttpResponseMessage res = await client.PostAsync(endpoint, body).ConfigureAwait(false)) {
         code = ((int)res.StatusCode).ToString();
+        if (res.IsSuccessStatusCode && InspectPorts) {
+          string text = await res.Content.ReadAsStringAsync().ConfigureAwait(false);
+          Match m = PortsObject.Match(text);
+          if (m.Success) {
+            foreach (Match p in PortState.Matches(m.Groups[1].Value)) Count(PortResults, p.Groups[1].Value);
+          } else if (text.Contains("\"portCheck\":\"off\"")) {
+            Count(PortResults, "off");
+          } else if (text.Contains("\"portCheckError\"")) {
+            Count(PortResults, "refused");
+            int i = text.IndexOf("\"portCheckError\"");
+            LastPortError = text.Substring(i, Math.Min(200, text.Length - i));
+          }
+        }
         if (!res.IsSuccessStatusCode) {
           string text = await res.Content.ReadAsStringAsync().ConfigureAwait(false);
           LastError = code + " " + (text.Length > 200 ? text.Substring(0, 200) : text);
@@ -162,9 +230,9 @@ if ($isCore) {
   # Windows PowerShell 5.1 (.NET Framework) allows only 2 connections per host by default.
   [System.Net.ServicePointManager]::DefaultConnectionLimit = $MaxConnections
   [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
-  if ($SkipCertificateCheck) { [CheckinFleetLoad]::TrustAllCertificatesLegacy() }
+  if ($SkipCertificateCheck) { [CheckinFleetLoad3]::TrustAllCertificatesLegacy() }
 }
-$sender = [CheckinFleetLoad]::new($handler, "$base/api/checkin", $ApiKey)
+$sender = [CheckinFleetLoad3]::new($handler, "$base/api/checkin", $ApiKey)
 
 # Plain requests for setup (threshold, existing ids, cleanup).
 $apiClient = [System.Net.Http.HttpClient]::new($handler, $false)
@@ -248,6 +316,7 @@ function New-Device([string]$Group, [int]$N, [double]$Period, [double]$FirstDue)
     Cpu = [double]$rand.Next(5, 40); Ram = [double]$rand.Next(30, 70)
     HighCpu = $false; HighMemory = $false; HighDiskActivity = $false; LowDiskSpace = $false
     RebootRequired = $false; NotDomainJoined = $false; FailedServices = $false
+    Rdp = ''; Ssh = ''   # 'open' / 'closed' when this device reports port_3389 / port_22
   }
   $devices.Add($d)
   return $d
@@ -264,6 +333,26 @@ if ($activeDevices.Count) {
   $slot = 0
   foreach ($name in $conditions.Keys) {
     for ($k = 0; $k -lt $conditions[$name]; $k++) { $activeDevices[$slot % $activeDevices.Count].$name = $true; $slot++ }
+  }
+}
+
+# Ports go to active devices from the other end of the list (so they mix less with the problems
+# above). RDP devices are made Windows machines and SSH devices Linux ones.
+$portPlan = @(@('Rdp', 'open', $RdpOpen), @('Rdp', 'closed', $RdpClosed), @('Ssh', 'open', $SshOpen), @('Ssh', 'closed', $SshClosed))
+$portTotal = $RdpOpen + $RdpClosed + $SshOpen + $SshClosed
+if ($portTotal -and $activeDevices.Count) {
+  $slot = 0
+  foreach ($pp in $portPlan) {
+    for ($k = 0; $k -lt $pp[2]; $k++) {
+      $d = $activeDevices[$activeDevices.Count - 1 - ($slot % $activeDevices.Count)]; $slot++
+      $d.Rdp = ''; $d.Ssh = ''
+      $d.($pp[0]) = $pp[1]
+      $wantOs = if ($pp[0] -eq 'Rdp') { 'windows' } else { 'linux' }
+      if ($d.Os -ne $wantOs) {
+        $d.Os = $wantOs
+        $d.OsName = if ($wantOs -eq 'windows') { 'Windows Server 2022 Standard' } else { 'Ubuntu 24.04.1 LTS' }
+      }
+    }
   }
 }
 
@@ -300,6 +389,12 @@ function Get-Body($d, [double]$elapsed) {
     failed_services = $failed; failed_service_names = $names
     system_time = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', $inv)
   }
+  $state = if ($d.Rdp) { $d.Rdp } else { $d.Ssh }
+  if ($state) {
+    $fields[$(if ($d.Rdp) { 'port_3389' } else { 'port_22' })] = $state
+    # The server's real check of this machine: the listener port for "open", the unused one for "closed".
+    if ($ServerPortChecks) { $fields['check_ports'] = [string]$(if ($state -eq 'open') { $OpenPort } else { $ClosedPort }) }
+  }
   # Hand-built JSON (ConvertTo-Json is slow in Windows PowerShell for thousands per second).
   $parts = foreach ($k in $fields.Keys) {
     $v = $fields[$k]
@@ -325,6 +420,10 @@ if ($Stale) {
 if ($agingActiveShare -gt $Active) { Write-Warning "Active will be about $agingActiveShare, not ${Active}: that many aging-group devices are in the active part of their cycle at any time." }
 $cond = ($conditions.GetEnumerator() | Where-Object Value | ForEach-Object { "$($_.Key) $($_.Value)" }) -join ', '
 if ($cond) { Write-Host "  Problems on active devices: $cond" }
+if ($portTotal) {
+  Write-Host ("  Ports on active devices: RDP open {0}, RDP closed {1}, SSH open {2}, SSH closed {3}{4}" -f $RdpOpen, $RdpClosed, $SshOpen, $SshClosed, $(if ($ServerPortChecks) { " (the server also tests port $OpenPort / $ClosedPort on this machine)" } else { '' }))
+  if ($portTotal -gt $activeDevices.Count) { Write-Warning "More port devices ($portTotal) than active devices ($($activeDevices.Count)): later ones replace earlier ones." }
+}
 if ($conditionTotal -gt $activeDevices.Count -and $activeDevices.Count) { Write-Warning "More problems ($conditionTotal) than active devices ($($activeDevices.Count)): some devices get more than one." }
 $perSec = $activePool / $IntervalSeconds + $agingPool / $agingCycle
 Write-Host ("  About {0:N0} check-ins/min ({1:N1}/s) to {2:N0} device records. Ctrl+C to stop." -f ($perSec * 60), $perSec, $devices.Count)
@@ -338,6 +437,27 @@ if ($DryRun) {
   return
 }
 if (-not $devices.Count) { Write-Host 'Nothing to send.'; return }
+
+# ---------------------------------------------------------------- server port checks
+$listener = $null
+if ($ServerPortChecks -and $portTotal) {
+  if ($OpenPort -eq $ClosedPort) { throw '-OpenPort and -ClosedPort must be different.' }
+  $pc = (Invoke-Api GET '/api/config').portCheck
+  if (-not $pc -or -not $pc.enabled) { throw 'Port checks are turned off on the server. Turn them on in Admin → Port checks, or leave out -ServerPortChecks.' }
+  # Something already answering on the "closed" port would make those devices report open.
+  $probe = [System.Net.Sockets.TcpClient]::new()
+  try { if ($probe.ConnectAsync('127.0.0.1', $ClosedPort).Wait(500)) { throw "Something is listening on port $ClosedPort; pick another with -ClosedPort." } } catch [System.AggregateException] { } finally { $probe.Dispose() }
+  try { $listener = [CheckinFleetLoad3]::Listen($OpenPort) }
+  catch { Write-Warning "Couldn't listen on port $OpenPort ($($_.Exception.Message)). If another program already answers there, the open checks still work; otherwise pick another with -OpenPort." }
+  $sender.InspectPorts = $true
+  $portPerMin = ($activeDevices | Where-Object { $_.Rdp -or $_.Ssh }).Count * 60 / $IntervalSeconds
+  $limit = if ($pc.PSObject.Properties.Name -contains 'perIpPerMinute') { [int]$pc.perIpPerMinute } else { 300 }
+  Write-Host ("  Server port checks: about {0:N0} a minute, all from this machine's address (server limit {1:N0} per address per minute)." -f $portPerMin, $limit)
+  if ($portPerMin -gt $limit) { Write-Warning "That's over the server's limit, so some checks will be refused. Raise 'Checks per address per minute' in Admin → Port checks for the test." }
+  Write-Host "  If 'open' checks come back as filtered, this machine's firewall is blocking inbound port $OpenPort." -ForegroundColor DarkGray
+  Write-Host ''
+}
+$portTotals = @{}
 
 # ---------------------------------------------------------------- run
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -369,6 +489,17 @@ function Write-Report([double]$elapsed, [switch]$Final) {
   $color = if ($bad) { 'Yellow' } else { 'Gray' }
   Write-Host $line -ForegroundColor $color
   if ($bad -and $sender.LastError) { Write-Host "          last error: $($sender.LastError)" -ForegroundColor DarkYellow }
+  if ($sender.InspectPorts) {
+    $pr = @{}
+    foreach ($k in @($sender.PortResults.Keys)) { $v = 0; if ($sender.PortResults.TryRemove($k, [ref]$v)) { $pr[$k] = $v; $script:portTotals[$k] = [int]$script:portTotals[$k] + $v } }
+    if ($pr.Count) {
+      $txt = ($pr.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name) $($_.Value)" }) -join ', '
+      $warn = $pr.ContainsKey('filtered') -or $pr.ContainsKey('refused') -or $pr.ContainsKey('off') -or $pr.ContainsKey('error')
+      Write-Host "          server port checks: $txt" -ForegroundColor $(if ($warn) { 'DarkYellow' } else { 'DarkGray' })
+      if ($pr.ContainsKey('refused') -and $sender.LastPortError) { Write-Host "          $($sender.LastPortError)" -ForegroundColor DarkYellow }
+      if ($pr.ContainsKey('off')) { Write-Host '          port checks were turned off on the server' -ForegroundColor DarkYellow }
+    }
+  }
   if ($script:skipped) { Write-Host "          $($script:skipped) check-ins skipped: more than $MaxInFlight were waiting for the server" -ForegroundColor DarkYellow; $script:skipped = 0 }
 }
 
@@ -425,5 +556,7 @@ try {
   if ($allLat.Count) {
     Write-Host ('Latency: p50 {0:N1} ms, p95 {1:N1} ms, p99 {2:N1} ms, max {3:N1} ms' -f $allLat[[int]($allLat.Count * 0.5)], $allLat[[Math]::Min($allLat.Count - 1, [int]($allLat.Count * 0.95))], $allLat[[Math]::Min($allLat.Count - 1, [int]($allLat.Count * 0.99))], $allLat[$allLat.Count - 1]) -ForegroundColor Cyan
   }
+  if ($portTotals.Count) { Write-Host ('Server port checks: ' + (($portTotals.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name) $('{0:N0}' -f $_.Value)" }) -join ', ')) -ForegroundColor Cyan }
+  if ($listener) { try { $listener.Stop() } catch { } }
   Write-Host "Simulated records stay on the server; remove them with:  .\scripts\loadtest-fleet.ps1 -Cleanup$(if ($Prefix -ne 'LT-') { " -Prefix $Prefix" })" -ForegroundColor DarkGray
 }

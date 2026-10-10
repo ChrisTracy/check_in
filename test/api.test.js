@@ -740,6 +740,13 @@ test('port checks: off by default, admin turns them on, results saved with the c
     assert.equal(rec[`port_${open}`], 'open');
     assert.equal(rec[`port_${closed}`], 'closed');
     assert.equal(rec.check_ports, undefined);
+    // Per-address limit (admin setting).
+    await admin({ method: 'PUT', url: '/api/admin/portcheck', payload: { perIpPerMinute: 10 } });
+    assert.equal((await call({ url: '/api/config' })).json().portCheck.perIpPerMinute, 10);
+    let last;
+    for (let i = 0; i < 6; i++) last = await call({ url: `/api/portcheck?ports=${open},${closed}` });
+    assert.equal(last.statusCode, 429);
+    assert.ok(last.headers['retry-after']);
   } finally {
     srv.close();
   }

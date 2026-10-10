@@ -323,9 +323,9 @@ Off until an admin turns them on in **Admin → Port checks**. A device asks the
 |---|---|---|
 | `GET` or `POST /api/portcheck?ports=22,443` | User role or the API key | Checks those ports and returns `{ "ip": "10.0.0.15", "ports": { "22": "open", "443": "closed" }, "ms": 3 }`. Nothing is saved |
 | `POST /api/checkin` with `check_ports=3389` | as a check-in | Checks the ports first and saves `port_3389` = `open` or `closed` with the check-in (`check_ports` itself isn't stored). The reply includes `ports` with the details, `portCheck: "off"` when port checks are off (the check-in is still saved), or `portCheckError` |
-| `GET` / `PUT /api/admin/portcheck` | Admin | `{ "enabled": true, "timeoutMs": 2000, "maxPorts": 5 }` |
+| `GET` / `PUT /api/admin/portcheck` | Admin | `{ "enabled": true, "timeoutMs": 2000, "maxPorts": 5, "perIpPerMinute": 300 }` |
 
-Each port comes back as `open` (connected), `closed` (refused), `filtered` (no answer within the wait, 2 seconds by default) or `error`. Saved fields use just `open` / `closed`, where `closed` is anything but open. Limits: up to 5 ports per request (an admin can change this), 300 ports a minute per address, and 5,000 checks waiting at once across the server. The cost is small: under 0.1 ms of CPU per port, so thousands of checks a minute add a percent or two of one core.
+Each port comes back as `open` (connected), `closed` (refused), `filtered` (no answer within the wait, 2 seconds by default) or `error`. Saved fields use just `open` / `closed`, where `closed` is anything but open. Limits: up to 5 ports per request and 300 ports a minute per address (an admin can change both; raise the per-address limit when many devices share an address, such as a site behind NAT or a load test), and 5,000 checks waiting at once across the server. The cost is small: under 0.1 ms of CPU per port, so thousands of checks a minute add a percent or two of one core.
 
 The Status box presets include **RDP open / closed** (`port_3389`) and **SSH open / closed** (`port_22`).
 
@@ -395,7 +395,10 @@ Run the load test yourself while the server is running:
 ```bash
 API_KEY=<key> npm run loadtest                         # 500 connections, 10s, 5000 ids
 node scripts/loadtest.js http://localhost:3000 1000 30 20000
+API_KEY=<key> CHECK_PORTS=45389 npm run loadtest       # every check-in also has the server test port 45389 here
 ```
+
+On the 2-vCPU test machine, a port check on every single check-in took throughput from about 6,200 to 3,700 check-ins a second (the load generator and a listener were on the same machine), so thousands of port checks a minute are nothing to worry about.
 
 From PowerShell (Windows PowerShell 5.1 or PowerShell 7), this fires 500 simultaneous check-ins:
 
@@ -422,6 +425,7 @@ From PowerShell (Windows PowerShell 5.1 or PowerShell 7), this fires 500 simulta
 - **Stale** devices check in once (only if they don't exist yet), then never again.
 - **Problems** (`-HighCpu`, `-HighMemory`, `-HighDiskActivity`, `-LowDiskSpace`, `-RebootRequired`, `-NotDomainJoined`, `-FailedServices`) go to that many active devices and hold on every check-in, with values that trip the Status box presets (for example `cpu_pct` 92-99).
 - The script reads the active threshold from the server. Status comes from the time of the last check-in, so aging settles after about twice the threshold and new stale devices turn stale after twice the threshold; for a quick demo, set the threshold to 1 or 2 minutes in Settings first.
+- **Ports** (`-RdpOpen`, `-RdpClosed`, `-SshOpen`, `-SshClosed`) write `port_3389` on that many active Windows devices and `port_22` on Linux ones, so the RDP / SSH status boxes fill in. Add `-ServerPortChecks` to also have the server really test a port with each of those check-ins. Every simulated device comes from the one machine running the script, so it listens on `-OpenPort` (default 45389) for the "open" devices and points the "closed" ones at `-ClosedPort` (45390). The server saves its real results as `port_45389` / `port_45390`, and the status line counts them (open, closed, filtered = no answer, refused = over the server's limit). Turn port checks on first, and raise **Checks per address per minute** in Admin → Port checks to more than the script says it needs; if "open" checks come back filtered, the machine's firewall is blocking that port.
 - Every few seconds it prints check-ins sent, failures by HTTP status, and latency (p50 / p95 / p99 / max); totals when it stops. Simulated ids start with `-Prefix` (default `LT-`) and carry `sim_group` (active, aging, stale), so they're easy to filter.
 
 ## Agents (Windows and Linux)

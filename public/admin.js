@@ -634,7 +634,7 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
     head('Port checks', 'Devices ask the server whether their ports can be reached');
     const origin = location.origin;
     const s = pc.stats || {};
-    UI.state.config.portCheck = { enabled: pc.enabled, maxPorts: pc.maxPorts };
+    UI.state.config.portCheck = { enabled: pc.enabled, maxPorts: pc.maxPorts, perIpPerMinute: pc.perIpPerMinute };
     $('#aBody').innerHTML = `
       <div class="admin-section">
         <label class="switch"><input type="checkbox" id="pcEnabled" ${pc.enabled ? 'checked' : ''}><span class="track"></span><b>Allow port checks</b></label>
@@ -642,11 +642,12 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
       </div>
       <div class="admin-section">
         <h4>Limits</h4>
-        <div class="row" style="display:flex;gap:12px;flex-wrap:wrap;max-width:520px">
+        <div class="row" style="display:flex;gap:12px;flex-wrap:wrap;max-width:720px">
           <label class="field" style="flex:1;min-width:180px">Wait for an answer (ms)<input class="input" id="pcTimeout" type="number" min="200" max="10000" step="100" value="${esc(pc.timeoutMs)}"></label>
           <label class="field" style="flex:1;min-width:180px">Ports per request<input class="input" id="pcMax" type="number" min="1" max="20" value="${esc(pc.maxPorts)}"></label>
+          <label class="field" style="flex:1;min-width:180px">Checks per address per minute<input class="input" id="pcRate" type="number" min="10" max="1000000" step="10" value="${esc(pc.perIpPerMinute)}"></label>
         </div>
-        <p class="muted" style="margin:6px 0 10px;font-size:12px">A port that doesn't answer within the wait counts as closed (shown as <i>filtered</i> in the details). Each address can check up to 300 ports a minute.</p>
+        <p class="muted" style="margin:6px 0 10px;font-size:12px">A port that doesn't answer within the wait counts as closed (shown as <i>filtered</i> in the details). The per-address limit stops one caller from keeping the server busy; raise it when many devices share one address (a site behind NAT, or a load test).</p>
         <button class="btn primary" id="pcSave" style="align-self:flex-start">Save limits</button>
       </div>
       <div class="admin-section">
@@ -683,7 +684,7 @@ checkin-agent.ps1 -PortCheck 3389                (Windows: ask once)
     });
     $('#pcSave').addEventListener('click', async () => {
       try {
-        renderPorts(await apiJson('/api/admin/portcheck', json('PUT', { timeoutMs: Number($('#pcTimeout').value), maxPorts: Number($('#pcMax').value) })));
+        renderPorts(await apiJson('/api/admin/portcheck', json('PUT', { timeoutMs: Number($('#pcTimeout').value), maxPorts: Number($('#pcMax').value), perIpPerMinute: Number($('#pcRate').value) })));
         toast('Port check limits saved');
       } catch (err) { toast(err.message, 'error'); }
     });

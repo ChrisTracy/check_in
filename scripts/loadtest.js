@@ -1,6 +1,9 @@
 // Load test with no dependencies: fires many concurrent check-ins at the API.
 // Usage: node scripts/loadtest.js [url] [connections] [seconds] [distinctIds]
 // Set API_KEY in the environment if the server requires one.
+// Set CHECK_PORTS=45389 (for example) to add check_ports to every check-in, so the server also tests
+// that port on this machine each time (port checks must be on in Admin → Port checks, and the
+// per-address limit raised there, since every request comes from this one address).
 import http from 'node:http';
 import https from 'node:https';
 
@@ -19,6 +22,8 @@ let total = 0;
 let ok = 0;
 let non2xx = 0;
 let errors = 0;
+const checkPorts = process.env.CHECK_PORTS || '';
+const portResults = {};
 const latencies = [];
 const end = Date.now() + duration * 1000;
 
@@ -31,11 +36,20 @@ function once() {
       site: sites[n % sites.length],
       cpu: Math.round(Math.random() * 100),
       version: `1.${n % 7}.0`,
+      ...(checkPorts ? { check_ports: checkPorts } : {}),
     });
     const t0 = performance.now();
     const req = lib.request(new URL('/api/checkin', base), { method: 'POST', agent, headers: { ...headers, 'content-length': Buffer.byteLength(body) } }, (res) => {
-      res.resume();
+      let text = '';
+      if (checkPorts) res.on('data', (c) => { text += c; }); else res.resume();
       res.on('end', () => {
+        if (checkPorts && text) {
+          try {
+            const r = JSON.parse(text);
+            const keys = r.ports ? Object.values(r.ports) : [r.portCheck === 'off' ? 'off' : r.portCheckError ? 'refused' : 'none'];
+            for (const k of keys) portResults[k] = (portResults[k] || 0) + 1;
+          } catch { /* not JSON */ }
+        }
         latencies.push(performance.now() - t0);
         total++;
         if (res.statusCode >= 200 && res.statusCode < 300) ok++; else non2xx++;
@@ -52,7 +66,7 @@ async function worker() {
   while (Date.now() < end) await once();
 }
 
-console.log(`POST ${base.origin}/api/checkin — ${connections} concurrent connections, ${duration}s, ${ids} distinct ids`);
+console.log(`POST ${base.origin}/api/checkin — ${connections} concurrent connections, ${duration}s, ${ids} distinct ids${checkPorts ? `, server checks port ${checkPorts} each time` : ''}`);
 const started = Date.now();
 await Promise.all(Array.from({ length: connections }, worker));
 const secs = (Date.now() - started) / 1000;
@@ -62,5 +76,6 @@ const avg = latencies.length ? (latencies.reduce((a, b) => a + b, 0) / latencies
 console.log(`\nRequests: ${total}  (${Math.round(total / secs)}/s avg)`);
 console.log(`Latency:  avg ${avg} ms, p50 ${pct(0.5)} ms, p99 ${pct(0.99)} ms`);
 console.log(`2xx: ${ok}   Non-2xx: ${non2xx}   Errors: ${errors}`);
+if (checkPorts) console.log(`Port checks: ${Object.entries(portResults).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}`);
 agent.destroy();
 if (non2xx && ok === 0) console.log('Every request failed. Is API_KEY set correctly?');

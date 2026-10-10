@@ -15,9 +15,10 @@ import { HttpError } from './store.js';
  *     error (e.g. network unreachable). Saved fields use just open / closed (anything but open).
  *   - Limits: a few ports per request, a per-address rate limit, and a cap on checks in flight.
  */
-export const PORTCHECK_DEFAULTS = { enabled: false, timeoutMs: 2000, maxPorts: 5 };
+// perIpPerMinute: ports checked per caller address per minute (raise it when many devices share
+// one address, e.g. a load test or a site behind NAT).
+export const PORTCHECK_DEFAULTS = { enabled: false, timeoutMs: 2000, maxPorts: 5, perIpPerMinute: 300 };
 const MAX_IN_FLIGHT = 5000;             // probes waiting for an answer, server-wide
-const PER_IP_PER_MINUTE = 300;          // ports checked per caller address per minute
 
 /** "22, 3389" → [22, 3389]. Throws a 400 for anything that isn't a list of ports. */
 export function parsePorts(value, maxPorts) {
@@ -68,6 +69,11 @@ export class PortChecker {
       if (!Number.isFinite(m) || m < 1 || m > 20) throw new HttpError(400, 'Ports per request must be between 1 and 20');
       next.maxPorts = m;
     }
+    if ('perIpPerMinute' in patch) {
+      const n = Math.round(Number(patch.perIpPerMinute));
+      if (!Number.isFinite(n) || n < 10 || n > 1_000_000) throw new HttpError(400, 'Checks per address per minute must be between 10 and 1,000,000');
+      next.perIpPerMinute = n;
+    }
     this.accounts.setSetting('portCheck', next);
     return next;
   }
@@ -102,7 +108,7 @@ export class PortChecker {
     const now = Date.now();
     let b = this.buckets.get(ip);
     if (!b || b.reset <= now) { b = { count: 0, reset: now + 60_000 }; this.buckets.set(ip, b); }
-    if (b.count + ports.length > PER_IP_PER_MINUTE) {
+    if (b.count + ports.length > s.perIpPerMinute) {
       throw Object.assign(new HttpError(429, `Too many port checks from ${ip}; try again in a minute`), { retryAfter: Math.ceil((b.reset - now) / 1000) });
     }
     if (this.inFlight + ports.length > MAX_IN_FLIGHT) throw new HttpError(503, 'The server is busy with other port checks; try again shortly');
