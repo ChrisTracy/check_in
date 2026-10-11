@@ -33,6 +33,11 @@
 #   --list                                Show the field groups and exit
 #   --install [--every N] [--cron]        Install, save settings, run every N minutes (root).
 #                                         Uses a systemd timer when available; --cron forces cron.
+#                                         Settings not given keep their saved values, unless
+#   --replace-settings                    is added (the one-line installer does): then exclude,
+#                                         extra fields, port checks and --insecure are exactly what
+#                                         this command says, and anything left out is cleared.
+#                                         The saved API key and --id are always kept unless given.
 #   --uninstall [--remove-record]         Remove the timer/cron job and settings (root);
 #                                         --remove-record also deletes this machine's record on the server
 #
@@ -94,7 +99,7 @@ die() { log "check-in agent: $*"; exit 1; }
 
 # ---- options ------------------------------------------------------------------------
 OPT_URL="" OPT_KEY="" OPT_ID="" OPT_FIELDS="" OPT_EXCLUDE="" OPT_EXTRA="" OPT_INSECURE="" OPT_CONFIG="" OPT_CHECK_PORTS="" PORT_CHECK=""
-DRY_RUN=0 FORCE=0 ACTION="run" EVERY="$DEFAULT_EVERY" USE_CRON=0 REMOVE_RECORD=0
+DRY_RUN=0 FORCE=0 ACTION="run" EVERY="$DEFAULT_EVERY" USE_CRON=0 REMOVE_RECORD=0 REPLACE=0
 need() { [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#--}" = "$2" ] || die "$1 needs a value (see --help)"; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -115,6 +120,7 @@ while [ $# -gt 0 ]; do
     --install) ACTION="install" ;;
     --uninstall) ACTION="uninstall" ;;
     --remove-record) REMOVE_RECORD=1 ;;
+    --replace-settings) REPLACE=1 ;;
     --list) ACTION="list" ;;
     --version) echo "$VERSION"; exit 0 ;;
     -h|--help) sed -n '3,/^# =====/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -137,14 +143,17 @@ if [ -r "$CONFIG" ]; then
   . "$CONFIG"
 fi
 pick() { local v; for v in "$@"; do [ -n "$v" ] && { printf '%s' "$v"; return; }; done; }
+# A saved value from the config file, or nothing with --replace-settings (for the options the
+# installer manages, so re-running it leaves exactly what was chosen).
+saved() { [ "$REPLACE" = 1 ] || printf '%s' "$1"; }
 URL=$(pick "$OPT_URL" "$ENV_URL" "${CHECKIN_URL:-}" "$DEFAULT_URL"); URL="${URL%/}"
 KEY=$(pick "$OPT_KEY" "$ENV_KEY" "${CHECKIN_API_KEY:-}")
 ID=$(pick "$OPT_ID" "$ENV_ID" "${CHECKIN_ID:-}")
 FIELDS=$(pick "$OPT_FIELDS" "$ENV_FIELDS" "${CHECKIN_FIELDS:-}" "$DEFAULT_FIELDS" "default")
-EXCLUDE=$(pick "$OPT_EXCLUDE" "$ENV_EXCLUDE" "${CHECKIN_EXCLUDE:-}" "$DEFAULT_EXCLUDE")
-EXTRA=$(pick "$OPT_EXTRA" "$ENV_EXTRA" "${CHECKIN_EXTRA:-}" "$DEFAULT_EXTRA")
-INSECURE=$(pick "$OPT_INSECURE" "$ENV_INSECURE" "${CHECKIN_INSECURE:-}")
-CHECK_PORTS=$(pick "$OPT_CHECK_PORTS" "$ENV_CHECK_PORTS" "${CHECKIN_CHECK_PORTS:-}" "$DEFAULT_CHECK_PORTS")
+EXCLUDE=$(pick "$OPT_EXCLUDE" "$ENV_EXCLUDE" "$(saved "${CHECKIN_EXCLUDE:-}")" "$DEFAULT_EXCLUDE")
+EXTRA=$(pick "$OPT_EXTRA" "$ENV_EXTRA" "$(saved "${CHECKIN_EXTRA:-}")" "$DEFAULT_EXTRA")
+INSECURE=$(pick "$OPT_INSECURE" "$ENV_INSECURE" "$(saved "${CHECKIN_INSECURE:-}")")
+CHECK_PORTS=$(pick "$OPT_CHECK_PORTS" "$ENV_CHECK_PORTS" "$(saved "${CHECKIN_CHECK_PORTS:-}")" "$DEFAULT_CHECK_PORTS")
 valid_ports() { [[ "$1" =~ ^[0-9]{1,5}(,[0-9]{1,5})*$ ]]; }
 CHECK_PORTS="${CHECK_PORTS// /}"
 [ -z "$CHECK_PORTS" ] || valid_ports "$CHECK_PORTS" || die "--check-ports must be port numbers separated by commas, e.g. 22 or 22,443"
@@ -208,7 +217,10 @@ if [ "$ACTION" = "install" ]; then
     # Piped in (curl ... | bash): download a copy to install.
     SRC=$(mktemp); curl -fsS ${INSECURE:+-k} "$URL/agent/checkin-agent.sh" -o "$SRC" || die "could not download the agent from $URL/agent/checkin-agent.sh"
   fi
-  install -m 0755 "$SRC" "$INSTALL_PATH" || die "could not copy the agent to $INSTALL_PATH"
+  # Running the installed copy itself (checkin-agent --install ...) only rewrites the settings.
+  if [ "$(readlink -f "$SRC" 2>/dev/null)" != "$(readlink -f "$INSTALL_PATH" 2>/dev/null)" ]; then
+    install -m 0755 "$SRC" "$INSTALL_PATH" || die "could not copy the agent to $INSTALL_PATH"
+  fi
   mkdir -p "$(dirname "$DEFAULT_CONFIG")"
   ( umask 077
     { echo "# Check-In agent settings, written by --install on $(date -Is). Edit freely."
@@ -249,7 +261,9 @@ Persistent=true
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now checkin-agent.timer >/dev/null || die "could not enable checkin-agent.timer"
+    systemctl enable checkin-agent.timer >/dev/null 2>&1 || die "could not enable checkin-agent.timer"
+    # Restart (not just start) so a changed interval applies to a timer that was already running.
+    systemctl restart checkin-agent.timer || die "could not start checkin-agent.timer"
     echo "Installed: systemd timer runs $INSTALL_PATH every $EVERY minute(s). Settings: $DEFAULT_CONFIG"
     echo "Check it: systemctl list-timers checkin-agent.timer ; journalctl -t checkin-agent -u checkin-agent"
   else

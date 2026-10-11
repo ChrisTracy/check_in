@@ -29,7 +29,7 @@ A self-hosted dashboard that keeps track of your devices. Each device checks in 
 - **Port checks** (optional, turned on by an admin): devices can ask the server whether a port such as RDP (3389) or SSH (22) is reachable, with the answer saved on the record or sent straight back.
 - **CSV import and export**, multi-select delete, and a pause switch to stop accepting check-ins.
 - **Users and roles** (Admin, Power user, User, Reader), an API key for devices, and Microsoft Entra ID single sign-on.
-- **Built-in HTTPS** if you don't have a reverse proxy.
+- **Built-in HTTPS** if you don't have a reverse proxy, with free automatic certificates from Let's Encrypt, or deploy keys so your own renewal tools can push certificates.
 - **Works on phones**, with a light and dark theme.
 - **Fast and small**: one container with a built-in SQLite database. It handles thousands of check-ins at once.
 

@@ -17,7 +17,7 @@ const basic = (u, p) => 'Basic ' + Buffer.from(`${u}:${p}`).toString('base64');
 async function setup(overrides = {}, { apiKey = true } = {}) {
   const config = { historyLimit: 3, maxBatch: 5000, maxFieldsPerRecord: 500, bodyLimitMb: 10, importLimitMb: 50,
     logLevel: 'silent', corsOrigin: '', cookieSecure: 'auto', trustProxy: false, oidcIssuerOverride: '',
-    host: '127.0.0.1', httpsPort: 0, tlsDir: fs.mkdtempSync(path.join(os.tmpdir(), 'ci-tls-')), tlsDisable: false, tlsPollMs: 0, ...overrides };
+    host: '127.0.0.1', httpsPort: 0, tlsDir: fs.mkdtempSync(path.join(os.tmpdir(), 'ci-tls-')), tlsDisable: false, tlsPollMs: 0, acmeCheckMs: 0, ...overrides };
   const db = openDb(':memory:');
   const store = new Store(db, { historyLimit: config.historyLimit, maxBatch: config.maxBatch });
   const accounts = new Accounts(db, { secret: crypto.randomBytes(32), sessionTtlHours: 1 });
@@ -750,4 +750,15 @@ test('port checks: off by default, admin turns them on, results saved with the c
   } finally {
     srv.close();
   }
+});
+
+test('installers replace the machine settings and pass port checks through', async () => {
+  const { app } = await setup();
+  const sh = (await app.inject({ url: '/install.sh?ports=22', headers: { host: 'checkin.example.com' } })).body;
+  assert.match(sh, /--install --replace-settings/);
+  assert.match(sh, /CHECK_PORTS="\$\{CHECKIN_CHECK_PORTS:-22\}"/);
+  const ps = (await app.inject({ url: '/install.ps1?ports=3389', headers: { host: 'checkin.example.com' } })).body;
+  assert.match(ps, /'-Install', '-ReplaceSettings'/);
+  assert.match(ps, /else \{ '3389' \}/);
+  assert.equal((await app.inject({ url: '/install.sh?ports=22;rm' })).statusCode, 400);
 });

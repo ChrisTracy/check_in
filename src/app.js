@@ -15,6 +15,8 @@ import { csvRow, parseCsv, decodeCell } from './csv.js';
 import { ROOT } from './config.js';
 import { registerAuth } from './auth/plugin.js';
 import { TlsManager } from './tls.js';
+import { CertDeployKeys } from './certdeploy.js';
+import { AcmeManager, registerAcme } from './acme.js';
 
 const AUTH_QUERY_KEYS = new Set(['api_key', 'apikey']);
 const MAX_BULK_DELETE = 100_000;
@@ -120,8 +122,10 @@ export function buildApp({ config, store, accounts, oidc }) {
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (req, body, done) => {
     try { done(null, querystring.parse(body)); } catch (e) { done(e); }
   });
-  app.addContentTypeParser(['text/csv', 'text/plain', 'application/csv', 'application/vnd.ms-excel'],
+  app.addContentTypeParser(['text/csv', 'text/plain', 'application/csv', 'application/vnd.ms-excel', 'application/x-pem-file'],
     { parseAs: 'string' }, (req, body, done) => done(null, body));
+  // Certificate deploys (PUT /api/tls/certificate) can send a .pfx as-is.
+  app.addContentTypeParser(['application/x-pkcs12', 'application/x-pfx'], { parseAs: 'buffer', bodyLimit: 1024 * 1024 }, (req, body, done) => done(null, body));
 
   app.register(fastifyCookie);
   // Compress JSON, CSV, scripts and styles (the full record list is ~10x smaller compressed).
@@ -177,6 +181,21 @@ export function buildApp({ config, store, accounts, oidc }) {
   app.post('/api/admin/tls/certificate', { ...tlsCap, bodyLimit: 2 * 1024 * 1024 }, async (req) =>
     tlsManager.install(req.body, req.auth.user?.username || req.auth.name));
   app.delete('/api/admin/tls/certificate', tlsCap, async () => tlsManager.remove());
+
+  // Certificate deploy keys: automation can replace the certificate and nothing else.
+  const deployKeys = new CertDeployKeys({ accounts, tls: tlsManager });
+  app.get('/api/admin/tls/deploy-keys', tlsCap, async () => ({ keys: deployKeys.list() }));
+  app.post('/api/admin/tls/deploy-keys', tlsCap, async (req, reply) =>
+    reply.code(201).header('cache-control', 'no-store').send(deployKeys.create(req.body || {}, req.auth.user?.username || req.auth.name)));
+  app.put('/api/admin/tls/deploy-keys/:id', tlsCap, async (req) => ({ deployKey: deployKeys.update(req.params.id, req.body || {}) }));
+  app.delete('/api/admin/tls/deploy-keys/:id', tlsCap, async (req) => { deployKeys.revoke(req.params.id); return { ok: true }; });
+  // Authenticated by X-Deploy-Key inside (not by a session or the API key).
+  app.put('/api/tls/certificate', { config: { cap: 'public' }, bodyLimit: 2 * 1024 * 1024 }, async (req) => deployKeys.deploy(req));
+
+  // Automatic certificates (Let's Encrypt or any ACME CA, HTTP-01).
+  const acme = new AcmeManager({ accounts, tls: tlsManager, log: app.log, checkEveryMs: config.acmeCheckMs ?? undefined });
+  app.decorate('acme', acme);
+  registerAcme(app, { acme });
   app.get('/api/admin/tls/certificate.pem', tlsCap, async (req, reply) => {
     const pem = tlsManager.certificatePem();
     if (!pem) return reply.code(404).send({ ok: false, error: 'No certificate installed' });
@@ -430,6 +449,7 @@ export function buildApp({ config, store, accounts, oidc }) {
     clients.clear();
   });
   app.addHook('onClose', async () => {
+    acme.close();
     await tlsManager.close();
   });
 

@@ -124,7 +124,9 @@ K=""; [ "$INSECURE" = 1 ] && K="-k"
 TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
 echo "Downloading the Check-In agent from $SERVER ..."
 curl -fsS $K "$SERVER/agent/checkin-agent.sh" -o "$TMP"
-set -- --install --url "$SERVER" --every "$EVERY" --fields "$FIELDS"
+# --replace-settings: the machine ends up with exactly these settings; anything left out here
+# (extra fields, port checks...) is cleared. The saved API key is kept unless a new one is given.
+set -- --install --replace-settings --url "$SERVER" --every "$EVERY" --fields "$FIELDS"
 [ -n "$EXCLUDE" ] && set -- "$@" --exclude "$EXCLUDE"
 [ -n "$EXTRA" ] && set -- "$@" --extra "$EXTRA"
 [ -n "$CHECK_PORTS" ] && set -- "$@" --check-ports "$CHECK_PORTS"
@@ -172,7 +174,9 @@ function windowsInstaller(site, o) {
   }
   Write-Host "Downloading the Check-In agent from $Server ..."
   Invoke-WebRequest @dl
-  $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dl.OutFile, '-Install', '-Url', $Server, '-Every', $Every, '-Fields', $Fields)
+  # -ReplaceSettings: the computer ends up with exactly these settings; anything left out here
+  # (extra fields, port checks...) is cleared. The saved API key is kept unless a new one is given.
+  $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dl.OutFile, '-Install', '-ReplaceSettings', '-Url', $Server, '-Every', $Every, '-Fields', $Fields)
   if ($Exclude) { $a += @('-Exclude', $Exclude) }
   if ($Extra) { $a += @('-Extra', $Extra) }
   if ($CheckPorts) { $a += @('-CheckPorts', $CheckPorts) }

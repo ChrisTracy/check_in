@@ -185,7 +185,8 @@
           <a class="btn" href="/agent/${agentFile}" download>Download the agent</a>
         </div>
         <ul class="ag-where">
-          <li><b>One machine, after installing:</b> edit <code>${cfgPath}</code> (URL, API key, fields, extra fields). It applies on the next run.${st.os === 'linux' ? ' Change the schedule by running the install command again with a new interval.' : ' Change the schedule by running the command again with a new interval.'}</li>
+          <li><b>One machine, after installing:</b> edit <code>${cfgPath}</code> (URL, API key, fields, extra fields). It applies on the next run.</li>
+          <li><b>Upgrade or change a machine:</b> run the install command again. It updates the agent and leaves the machine with exactly the options above: interval, fields, extra fields and port checks you've turned off here are removed. The saved API key is kept if the command doesn't include one.</li>
           <li><b>Defaults for future installs:</b> pick them above (they're carried in the command's URL), or change <code>INSTALL_DEFAULTS</code> in <code>src/agents.js</code> on the server.</li>
           <li><b>What the agent collects:</b> the <code>SETTINGS - change these</code> block at the top of <code>scripts/${agentFile}</code>, then the field groups below it. Machines pick up a new version when the install command is run again.</li>
           <li><b>Try it first:</b> ${st.os === 'linux' ? '<code>sudo checkin-agent --dry-run --fields all</code>' : '<code>powershell -ExecutionPolicy Bypass -File C:\\ProgramData\\CheckIn\\checkin-agent.ps1 -DryRun -Fields all</code>'} prints what would be sent.</li>

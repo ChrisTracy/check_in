@@ -135,11 +135,62 @@ Notes:
 
 - Changes apply immediately, with no restart. Replacing a certificate swaps it on the running server. If HTTPS can't start (for example, the port is in use), the mode change is rolled back so HTTP never redirects to a dead port.
 - The status panel shows the certificate's names, issuer, expiry (with a warning under 30 days) and SHA-256 fingerprint. The startup log also warns when the certificate is close to expiry.
-- **Automated renewals:** copy `cert.pem` and `key.pem` into `data/tls` (for example from certbot or another ACME client). Changes are picked up within a minute.
+- **Files:** you can also copy `cert.pem` and `key.pem` into `data/tls` yourself (for example from certbot). Changes are picked up within a minute.
+- The dashboard shows admins a banner when HTTPS is on and the certificate expires in under 14 days (red under 3 days or once expired), or when automatic renewal is failing.
 - Minimum protocol is TLS 1.2.
 - **Locked out?** Start with `TLS_DISABLE=true` to force HTTP only, fix the settings, then remove the variable.
 - **Docker:** the container listens for HTTPS on `3443`. Publish it with `PUBLISH_HTTPS_PORT=443` in `.env` (compose maps `443:3443`). The container runs as a non-root user, so it can't bind port 443 itself. Set **Public HTTPS port** to `443` so redirects point at the right port.
 - Using Entra sign-in over HTTPS? Set **Public URL** in Admin → Single sign-on to your `https://` address, and register that redirect URI in Entra.
+
+### Automatic certificates (Let's Encrypt)
+
+**Admin → HTTPS → Automatic certificate** gets a free certificate from Let's Encrypt (or any ACME CA) and renews it by itself. It uses the **HTTP-01** check: the CA fetches `http://<domain>/.well-known/acme-challenge/<token>` on **port 80**, so:
+
+- each domain must resolve to this server from the internet, and
+- port 80 must reach the app's HTTP port. With Docker Compose that means `PUBLISH_PORT=80` (maps `80:3000`). Behind a firewall or NAT, forward port 80.
+
+Wildcards (`*.example.com`), IP addresses and internal names (`.local`, `.lan`) can't be validated over HTTP-01 and are rejected. DNS-01 isn't supported; for those cases use a deploy key (below) with your own ACME client.
+
+Settings: domain names (up to 20), an optional email for expiry notices, the CA (**Let's Encrypt**, **Let's Encrypt staging** for testing, or **Another ACME CA** with its directory URL and optional External Account Binding key ID and HMAC for ZeroSSL, Google Trust Services, Sectigo and others), and the key type (ECDSA P-256 by default, or RSA 2048). Turning it on the first time needs the CA's terms of service accepted. A private CA (such as step-ca) must be trusted by the server: set `NODE_EXTRA_CA_CERTS` to its root certificate.
+
+How it behaves:
+
+- **Get certificate now** requests one straight away (usually 10-30 seconds) and shows progress. The certificate is installed and swapped in live; turn HTTPS on under **Mode** if it isn't already.
+- It works in every mode. In **HTTPS only**, the challenge path stays on HTTP so renewals keep working.
+- The server checks every 6 hours and renews when a third of the lifetime is left (30 days for a 90-day certificate), when the domain list changes, or when the installed certificate didn't come from ACME.
+- **Failures** keep the current certificate and are retried after 1 hour, then 2, 4 and so on up to once a day. The error is shown in plain words (for example "couldn't fetch the challenge over port 80", rate limits, CAA records, a bad EAB key).
+- The ACME account key and the EAB HMAC are stored encrypted with the app secret. Changing the CA or the EAB key starts a new account.
+- Uploading your own certificate or using a deploy key while automatic renewal is on means the next check replaces it with an ACME certificate. Turn automatic renewal off first if you want to keep yours.
+
+### Deploy keys (renewals from other tools)
+
+If certificates come from somewhere else, such as certbot or acme.sh with DNS-01, a CI job, or a key vault, a **deploy key** lets that tool push the new certificate. A deploy key can **only replace the HTTPS certificate**. It can't read records or change any other setting, and it isn't the device API key.
+
+Create one in **Admin → HTTPS → Deploy keys**. It is shown once and stored as a SHA-256 hash. You can limit it to addresses or ranges (`10.0.0.5, 10.0.0.0/24, 2001:db8::/48`). Behind a reverse proxy, set `TRUST_PROXY` so the server sees the real client address. Keys can be renamed, re-scoped or revoked at any time, and each key shows when and from where it was last used.
+
+```bash
+# PEM: certificate chain + key in one body
+cat fullchain.pem privkey.pem | curl -fsS -X PUT "https://checkin.example.com/api/tls/certificate" \
+  -H "X-Deploy-Key: ckd_..." -H "Content-Type: application/x-pem-file" --data-binary @-
+
+# certbot: run after every renewal
+certbot renew --deploy-hook 'cat "$RENEWED_LINEAGE/fullchain.pem" "$RENEWED_LINEAGE/privkey.pem" | curl -fsS -X PUT "https://checkin.example.com/api/tls/certificate" -H "X-Deploy-Key: ckd_..." -H "Content-Type: application/x-pem-file" --data-binary @-'
+```
+
+```powershell
+# PFX / P12
+Invoke-RestMethod -Method Put "https://checkin.example.com/api/tls/certificate" `
+  -Headers @{ "X-Deploy-Key" = "ckd_..."; "X-Pfx-Password" = "<pfx password>" } `
+  -ContentType "application/x-pkcs12" -InFile .\cert.pfx
+```
+
+JSON works too: `{ "cert": "<PEM chain>", "key": "<PEM key>" }` or `{ "pfx": "<base64>", "passphrase": "..." }`.
+
+**Safety checks:** the new certificate must not expire before the current one, and must share at least one name with it (wildcards count). This stops a stale or wrong certificate from replacing a good one. Add `?force=1` to skip the checks. They're also skipped when the current certificate is self-signed or expired. The certificate itself is always validated: it must be unexpired and match its key. Responses are `200` with the installed certificate's details, `400` for an unreadable certificate, `401` for a missing or wrong key, `403` for a disallowed address, `409` when a safety check fails, `415` for an unsupported body type, and `429` after 10 bad keys from one address in 10 minutes.
+
+### Certificate history
+
+**Admin → HTTPS → Certificate history** lists the last 50 certificate changes and attempts: uploads, deploy-key pushes (with the key name and address), Let's Encrypt issues and failures, and files picked up from `data/tls`.
 
 ## Users, roles and sign-in
 
@@ -290,6 +341,11 @@ curl -X POST http://localhost:3000/api/checkin -H "Content-Type: application/jso
 | `GET/PUT /api/admin/tls` | Admin | HTTPS status and settings: `{ "mode": "off" \| "both" \| "redirect", "hsts": false, "publicPort": 443 }` |
 | `POST /api/admin/tls/certificate` | Admin | Install a certificate: `{ "type": "pem", "cert", "key", "passphrase" }`, `{ "type": "pfx", "pfx": "<base64>", "passphrase" }` or `{ "type": "self-signed", "hostnames": "host, 10.0.0.5", "days": 365 }` |
 | `GET /api/admin/tls/certificate.pem` · `DELETE /api/admin/tls/certificate` | Admin | Download the public certificate · remove it (HTTPS must be off) |
+| `GET/PUT /api/admin/tls/acme` | Admin | Automatic certificate settings and status: `{ "enabled", "agreeTos", "domains": "a.example.com, b.example.com", "email", "ca": "letsencrypt" \| "letsencrypt-staging" \| "custom", "directoryUrl", "eabKid", "eabHmac", "keyType": "ecdsa" \| "rsa" }` |
+| `POST /api/admin/tls/acme/obtain` | Admin | Request a certificate now (waits for it; `502` with the reason on failure) |
+| `GET/POST /api/admin/tls/deploy-keys` · `PUT/DELETE /api/admin/tls/deploy-keys/:id` | Admin | Deploy keys: `{ "name", "allowIps": "10.0.0.0/24" }`. `POST` returns the key once |
+| `PUT /api/tls/certificate` | Deploy key | Replace the certificate (`X-Deploy-Key` header). See [Deploy keys](#deploy-keys-renewals-from-other-tools) |
+| `GET /.well-known/acme-challenge/:token` | public | HTTP-01 challenge responses (only while a request is running) |
 
 ### Accepting check-ins (pause / resume)
 
@@ -528,7 +584,7 @@ Options go on the install URL and become that machine's settings: `?every=10&fie
 | To change... | Edit |
 |---|---|
 | One installed machine (server, key, fields, extra fields) | `C:\ProgramData\CheckIn\agent.json` (Windows) or `/etc/check-in/agent.conf` (Linux). Used on the next run, no reinstall |
-| Its schedule | Run the install command again with a new interval (reinstalling also updates the agent) |
+| Its schedule, or anything else on the Add Device page | Run the install command again. It updates the agent and replaces the machine's settings with exactly what the command says: interval, field groups, extra fields, port checks and the self-signed certificate option. Anything not in the command is cleared, except the saved API key and a custom `--id` / `-Id` (and `-Proxy` on Windows), which are kept unless the command gives new ones. Running the agent's own `--install` / `-Install` by hand without `--replace-settings` / `-ReplaceSettings` keeps saved values for anything you leave out |
 | Defaults for all future installs | `INSTALL_DEFAULTS` in `src/agents.js`, or pick options on the Add Device page (they ride along in the command) |
 | The installers themselves | `linuxInstaller()` / `windowsInstaller()` in `src/agents.js` |
 | What the agents collect, and their built-in defaults | The **SETTINGS - change these** block at the top of `scripts/checkin-agent.ps1` and `scripts/checkin-agent.sh`, and the field groups below it. Keep the field names the same in both so filters work across Windows and Linux |
@@ -589,6 +645,16 @@ A key typed on these command lines is visible to other administrators in the tas
 npm test
 ```
 
+The automatic certificate tests run against [Pebble](https://github.com/letsencrypt/pebble), Let's Encrypt's test CA, and are skipped unless `PEBBLE_DIR` is set:
+
+```bash
+git clone https://github.com/letsencrypt/pebble && cd pebble
+go build -o bin/pebble ./cmd/pebble && go build -o bin/pebble-challtestsrv ./cmd/pebble-challtestsrv
+cd ../check_in && PEBBLE_DIR=../pebble npm test
+```
+
+They use ports 5402, 8053, 8055, 14000-14002 and 15000-15002 on 127.0.0.1.
+
 ## Project layout
 
 ```
@@ -599,6 +665,8 @@ src/
   db.js       SQLite (built-in node:sqlite) schema, pragmas, transaction helper
   csv.js      CSV helpers
   tls.js      built-in HTTPS: certificate storage, validation, hot reload, redirects
+  acme.js     automatic certificates (ACME HTTP-01): issue, renew, backoff, routes
+  certdeploy.js deploy keys: certificate pushes from automation, safety checks
   views.js    saved views (personal and team)
   boxes.js    status boxes: rules, per-device "since" tracking, routes
   portcheck.js port checks: TCP probes back to the caller, limits, routes

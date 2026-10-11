@@ -49,7 +49,7 @@
     $('#adminBack').hidden = false;
     select(t);
   }
-  function close() { $('#adminBack').hidden = true; }
+  function close() { $('#adminBack').hidden = true; UI.refreshCertWarning?.(); }
 
   function select(t) {
     tab = t;
@@ -433,9 +433,16 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
   // ================================================================== HTTPS / TLS
   let tlsState = null;
   let tlsSource = 'pem';
+  let acmeState = null;
+  let deployKeys = [];
 
   async function loadTls() {
-    try { tlsState = await apiJson('/api/admin/tls'); renderTls(); } catch (e) { $('#aBody').innerHTML = `<div class="warn-box">${esc(e.message)}</div>`; }
+    try {
+      [tlsState, acmeState, deployKeys] = await Promise.all([
+        apiJson('/api/admin/tls'), apiJson('/api/admin/tls/acme'), apiJson('/api/admin/tls/deploy-keys').then((r) => r.keys),
+      ]);
+      renderTls();
+    } catch (e) { $('#aBody').innerHTML = `<div class="warn-box">${esc(e.message)}</div>`; }
   }
 
   function tlsStatusTag(st) {
@@ -449,7 +456,7 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
     if (!c) return '<div class="radio-card" style="cursor:default"><span><b>No certificate installed</b><small>Install one below: your own certificate (PEM or PFX), or a self-signed one for testing.</small></span></div>';
     const days = c.daysLeft;
     const exp = c.expired ? '<span class="tag off">Expired</span>' : days < 30 ? `<span class="tag off">Expires in ${days} days</span>` : `<span class="tag ok">${days} days left</span>`;
-    const src = { pem: 'PEM upload', pfx: 'PFX upload', 'self-signed': 'Generated (self-signed)' }[st.source] || 'Files in the data volume';
+    const src = { pem: 'PEM upload', pfx: 'PFX upload', 'self-signed': 'Generated (self-signed)', acme: 'Automatic (ACME)', deploy: 'Deploy key' }[st.source] || 'Files in the data volume';
     return `<div class="radio-card" style="cursor:default;flex-direction:column;align-items:stretch;gap:10px">
       <div class="status-line" style="justify-content:space-between;flex-wrap:wrap">
         <span class="status-line"><i class="dot ${c.expired ? 'stale' : days < 30 ? 'aging' : 'fresh'}"></i><b>${esc(c.subject)}</b>${c.selfSigned ? '<span class="tag">Self-signed</span>' : ''}</span>${exp}</div>
@@ -504,11 +511,6 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
         ${certCard(st.cert, st)}
       </div>
       <div class="admin-section">
-        <h4>${st.cert ? 'Replace certificate' : 'Install a certificate'}</h4>
-        <div id="tForm" class="install-form">${installForm()}</div>
-        <p class="muted" style="margin:0;font-size:12px">Certificates are saved in the data volume (<code>data/tls</code>) and survive container rebuilds. You can also copy <code>cert.pem</code> and <code>key.pem</code> into that folder (for example from certbot); changes are picked up within a minute.</p>
-      </div>
-      <div class="admin-section">
         <h4>Mode</h4>
         <div style="display:grid;gap:8px">
           ${radio('off', 'Off', 'HTTP only. Use this when a reverse proxy or load balancer handles HTTPS.')}
@@ -523,6 +525,17 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
             <small>Set with the <code>HTTPS_PORT</code> environment variable. In Docker, publish it: <code>"443:${st.httpsPort}"</code>.</small></div>
         </div>
         <p class="muted" style="margin:0;font-size:12px">Using Entra sign-in over HTTPS? Set <b>Public URL</b> in Single sign-on to your <code>https://</code> address and add that redirect URI in Entra. If you lock yourself out, start the container with <code>TLS_DISABLE=true</code>.</p>
+      </div>
+      <div class="admin-section" id="acmeSection">${acmeHtml()}</div>
+      <div class="admin-section">
+        <h4>${st.cert ? 'Replace with your own certificate' : 'Install your own certificate'}</h4>
+        <div id="tForm" class="install-form">${installForm()}</div>
+        <p class="muted" style="margin:0;font-size:12px">Certificates are saved in the data volume (<code>data/tls</code>) and survive container rebuilds. You can also copy <code>cert.pem</code> and <code>key.pem</code> into that folder (for example from certbot); changes are picked up within a minute.</p>
+      </div>
+      <div class="admin-section" id="deploySection">${deployHtml()}</div>
+      <div class="admin-section">
+        <h4>Certificate history</h4>
+        ${historyHtml(st.events || [])}
       </div>`;
     foot('<button class="btn primary" id="tSave">Save HTTPS settings</button>');
 
@@ -544,6 +557,176 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
       } }],
     }));
     $('#tSave').addEventListener('click', saveTls);
+    wireAcme();
+    wireDeploy();
+  }
+
+  // ---- history ----
+  function historyHtml(events) {
+    if (!events.length) return '<p class="muted" style="margin:0">Nothing yet. Uploads, deploys, automatic renewals and files picked up from the data volume are listed here.</p>';
+    const what = { upload: 'Uploaded', deploy: 'Deploy', acme: 'ACME', file: 'Picked up from files' };
+    return `<table class="utable cert-history"><thead><tr><th>When</th><th>What</th><th>Result</th></tr></thead><tbody>${events.map((e) => `<tr>
+      <td title="${esc(absTime(e.at))}">${esc(relTime(e.at))}</td>
+      <td>${esc(what[e.action] || e.action)}${e.by ? ` <span class="muted">· ${esc(e.by)}</span>` : ''}${e.ip ? ` <span class="muted">from ${esc(e.ip)}</span>` : ''}${e.reason === 'renewal' ? ' <span class="tag">automatic renewal</span>' : ''}${e.forced ? ' <span class="tag">forced</span>' : ''}</td>
+      <td>${e.ok ? `<span class="tag ok">OK</span> ${esc(e.subject || '')}${e.validTo ? ` <span class="muted">until ${esc(new Date(e.validTo).toLocaleDateString())}</span>` : ''}` : `<span class="tag off">Failed</span> <span class="cert-err">${esc(e.error || '')}</span>`}</td></tr>`).join('')}</tbody></table>`;
+  }
+
+  // ---- automatic certificates (ACME / Let's Encrypt, HTTP-01) ----
+  function acmeHtml() {
+    const a = acmeState || {};
+    const custom = a.ca === 'custom';
+    const status = a.running ? `<span class="tag">Working…</span> <span class="muted" id="acmeProgress">${esc(a.progress || '')}</span>`
+      : a.lastError ? `<span class="tag off">Last attempt failed</span> <span class="muted">${esc(relTime(a.lastAttempt))}${a.nextAttempt && Date.parse(a.nextAttempt) > Date.now() + 60_000 ? ` · retrying automatically at ${esc(new Date(a.nextAttempt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }))}` : a.enabled ? ' · retrying soon' : ''}</span>`
+        : a.active ? `<span class="tag ok">Active</span> <span class="muted">renews automatically around ${esc(new Date(a.renewAt).toLocaleDateString())}</span>`
+          : a.enabled ? '<span class="tag">On</span> <span class="muted">no certificate from it yet: click Get certificate now</span>' : '<span class="tag">Off</span>';
+    return `<h4>Automatic certificate (Let's Encrypt)</h4>
+      <div class="status-line" style="flex-wrap:wrap;gap:6px">${status}</div>
+      ${a.lastError ? `<div class="warn-box" style="margin:0">${esc(a.lastError)}</div>` : ''}
+      <div class="callout">Gets a free certificate and renews it on its own (30 days before it expires) using the <b>HTTP-01</b> check:
+        the certificate authority fetches <code>http://&lt;your domain&gt;/.well-known/acme-challenge/…</code> on <b>port 80</b>, so each domain must point here and port 80 must reach this server's HTTP port
+        (in Docker: <code>"80:3000"</code>). It works in every HTTPS mode. Behind a reverse proxy that already gets certificates (Caddy, Traefik), you don't need this.</div>
+      <label class="switch"><input type="checkbox" id="acEnabled" ${a.enabled ? 'checked' : ''}><span class="track"></span><b>Get and renew a certificate automatically</b></label>
+      <div class="grid2">
+        <label class="field">Domain names<input class="input" id="acDomains" value="${esc((a.domains || []).join(', '))}" placeholder="checkin.example.com" spellcheck="false"><small>Comma-separated; every name devices and browsers use. No wildcards, IP addresses or internal names.</small></label>
+        <label class="field"><span class="field-label">Email <small>(optional)</small></span><input class="input" id="acEmail" type="email" value="${esc(a.email || '')}" placeholder="it@example.com"><small>For notices from the certificate authority.</small></label>
+        <label class="field">Certificate authority<select class="select" id="acCa">
+          <option value="letsencrypt" ${a.ca === 'letsencrypt' ? 'selected' : ''}>Let's Encrypt</option>
+          <option value="letsencrypt-staging" ${a.ca === 'letsencrypt-staging' ? 'selected' : ''}>Let's Encrypt staging (testing: not trusted by browsers)</option>
+          <option value="custom" ${custom ? 'selected' : ''}>Another ACME CA…</option></select></label>
+        <label class="field">Key type<select class="select" id="acKey">
+          <option value="ecdsa" ${a.keyType !== 'rsa' ? 'selected' : ''}>ECDSA P-256 (recommended)</option>
+          <option value="rsa" ${a.keyType === 'rsa' ? 'selected' : ''}>RSA 2048 (for old clients)</option></select></label>
+      </div>
+      <div class="grid2" id="acCustom" ${custom ? '' : 'hidden'}>
+        <label class="field">ACME directory URL<input class="input" id="acDir" value="${esc(a.directoryUrl || '')}" placeholder="https://acme.example.com/directory" spellcheck="false"><small>e.g. ZeroSSL, Google Trust Services, Sectigo, DigiCert, or your own step-ca. Its certificate must be trusted by this server (<code>NODE_EXTRA_CA_CERTS</code> for a private CA).</small></label>
+        <div class="grid2" style="gap:10px">
+          <label class="field"><span class="field-label">EAB key ID <small>(if required)</small></span><input class="input" id="acKid" value="${esc(a.eabKid || '')}" spellcheck="false"></label>
+          <label class="field"><span class="field-label">EAB HMAC key</span><input class="input" id="acHmac" type="password" autocomplete="off" placeholder="${a.eabHmacSet ? 'saved (leave empty to keep)' : ''}"></label>
+        </div>
+      </div>
+      ${a.enabled ? '' : `<label class="checkline"><input type="checkbox" id="acTos"> I accept the certificate authority's terms of service (<a href="https://letsencrypt.org/repository/" target="_blank" rel="noopener">Let's Encrypt</a>)</label>`}
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" id="acSave">Save</button>
+        <button class="btn primary" id="acObtain" ${a.enabled && !a.running ? '' : 'disabled'} title="${a.enabled ? 'Request a certificate now (takes up to a minute)' : 'Turn it on and save first'}">Get certificate now</button>
+      </div>
+      ${a.account ? `<small class="muted">ACME account: <code style="word-break:break-all">${esc(a.account)}</code></small>` : ''}`;
+  }
+
+  function wireAcme() {
+    $('#acCa').addEventListener('change', (e) => { $('#acCustom').hidden = e.target.value !== 'custom'; });
+    $('#acSave').addEventListener('click', saveAcme);
+    $('#acObtain').addEventListener('click', obtainAcme);
+  }
+
+  async function saveAcme() {
+    const body = {
+      enabled: $('#acEnabled').checked,
+      domains: $('#acDomains').value,
+      email: $('#acEmail').value,
+      ca: $('#acCa').value,
+      keyType: $('#acKey').value,
+    };
+    if (body.ca === 'custom') {
+      body.directoryUrl = $('#acDir').value;
+      body.eabKid = $('#acKid').value;
+      if ($('#acHmac').value) body.eabHmac = $('#acHmac').value;
+    }
+    if ($('#acTos')) body.agreeTos = $('#acTos').checked;
+    try {
+      acmeState = await apiJson('/api/admin/tls/acme', json('PUT', body));
+      $('#acmeSection').innerHTML = acmeHtml();
+      wireAcme();
+      toast(body.enabled && !acmeState.active ? 'Saved. Click "Get certificate now" to request one.' : 'Saved');
+    } catch (e) { toast(e.message, 'error'); }
+  }
+
+  async function obtainAcme() {
+    $('#acObtain').disabled = true;
+    $('#acObtain').textContent = 'Working…';
+    // Show progress while the request runs (it waits for the certificate authority).
+    const poll = setInterval(async () => {
+      try {
+        const a = await apiJson('/api/admin/tls/acme');
+        if (a.progress && $('#acObtain')) $('#acObtain').textContent = a.progress.length > 70 ? a.progress.slice(0, 70) + '…' : a.progress;
+      } catch { /* ignore */ }
+    }, 1500);
+    try {
+      const r = await apiJson('/api/admin/tls/acme/obtain', { method: 'POST' });
+      toast(`Certificate installed for ${r.installed.names.join(', ')}${r.tls.listening ? '. HTTPS reloaded' : '. Turn HTTPS on under Mode to use it'}`);
+    } catch (e) { toast(e.message, 'error'); }
+    clearInterval(poll);
+    await loadTls();
+  }
+
+  // ---- deploy keys (automation replaces the certificate, nothing else) ----
+  function deployHtml() {
+    const rows = deployKeys.map((k) => `<tr data-id="${esc(k.id)}">
+      <td><b>${esc(k.name)}</b><br><code class="muted">${esc(k.prefix)}…</code></td>
+      <td>${k.allowIps.length ? k.allowIps.map((ip) => `<span class="tag">${esc(ip)}</span>`).join(' ') : '<span class="muted">anywhere</span>'}</td>
+      <td>${k.lastUsed ? `${esc(relTime(k.lastUsed))}<br><small class="muted">${esc(k.lastIp || '')} · ${nf.format(k.uses || 0)}×</small>` : '<span class="muted">never</span>'}</td>
+      <td style="text-align:right;white-space:nowrap"><button class="btn sm" data-dk-edit>Edit</button> <button class="btn sm danger" data-dk-revoke>Revoke</button></td></tr>`).join('');
+    return `<h4>Deploy keys</h4>
+      <p class="muted" style="margin:0;font-size:13px">For automation that renews certificates elsewhere (a certbot or acme.sh hook, a CI job, a key vault task). A deploy key can <b>only replace the certificate</b>: it can't read data or change anything else. Not the same as the device API key.</p>
+      ${acmeState?.enabled ? '<div class="warn-box" style="margin:0">Automatic certificates are on, so a pushed or uploaded certificate is replaced at the next check (within 6 hours). Turn automatic certificates off to manage the certificate with deploy keys.</div>' : ''}
+      ${deployKeys.length ? `<table class="utable"><thead><tr><th>Name</th><th>Allowed from</th><th>Last used</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : ''}
+      <div><button class="btn" id="dkNew">${ICON.plus}New deploy key</button></div>`;
+  }
+
+  function wireDeploy() {
+    $('#dkNew').addEventListener('click', () => deployKeyDialog());
+    $('#deploySection').querySelectorAll('[data-dk-edit]').forEach((b) => b.addEventListener('click', () => {
+      deployKeyDialog(deployKeys.find((k) => k.id === b.closest('tr').dataset.id));
+    }));
+    $('#deploySection').querySelectorAll('[data-dk-revoke]').forEach((b) => b.addEventListener('click', () => {
+      const k = deployKeys.find((x) => x.id === b.closest('tr').dataset.id);
+      modal({
+        title: 'Revoke deploy key?',
+        body: `<p><b>${esc(k.name)}</b> (<code>${esc(k.prefix)}…</code>) stops working immediately. The installed certificate isn't changed.</p>`,
+        actions: [{ label: 'Cancel' }, { label: 'Revoke', cls: 'danger solid', onClick: async () => {
+          try { await apiJson(`/api/admin/tls/deploy-keys/${k.id}`, { method: 'DELETE' }); toast('Deploy key revoked'); await loadTls(); } catch (e) { toast(e.message, 'error'); }
+        } }],
+      });
+    }));
+  }
+
+  function deployKeyDialog(k) {
+    modal({
+      title: k ? 'Edit deploy key' : 'New deploy key',
+      body: `<label>Name<input class="input" id="dkName" maxlength="60" value="${esc(k?.name || '')}" placeholder="e.g. certbot on web-01"></label>
+        <label>Allowed from <small class="muted">(optional)</small><input class="input" id="dkIps" value="${esc((k?.allowIps || []).join(', '))}" placeholder="10.0.0.5, 10.0.0.0/24" spellcheck="false"></label>
+        <p style="font-size:12px">Addresses or ranges the key may be used from, comma-separated. Empty = anywhere. Behind a reverse proxy, set <code>TRUST_PROXY</code> so the server sees the real address.</p>`,
+      actions: [{ label: 'Cancel' }, { label: k ? 'Save' : 'Create key', cls: 'primary', onClick: async () => {
+        const body = { name: $('#dkName').value, allowIps: $('#dkIps').value };
+        try {
+          if (k) { await apiJson(`/api/admin/tls/deploy-keys/${k.id}`, json('PUT', body)); toast('Deploy key saved'); await loadTls(); return; }
+          const r = await apiJson('/api/admin/tls/deploy-keys', json('POST', body));
+          await loadTls();
+          setTimeout(() => showNewDeployKey(r.key), 0);
+        } catch (e) { toast(e.message, 'error'); return false; }
+      } }],
+    });
+  }
+
+  function showNewDeployKey(key) {
+    const origin = location.origin;
+    const curl = `cat fullchain.pem privkey.pem | curl -fsS -X PUT "${origin}/api/tls/certificate" \\\n  -H "X-Deploy-Key: ${key}" -H "Content-Type: application/x-pem-file" --data-binary @-`;
+    const certbot = `certbot renew --deploy-hook 'cat "$RENEWED_LINEAGE/fullchain.pem" "$RENEWED_LINEAGE/privkey.pem" | curl -fsS -X PUT "${origin}/api/tls/certificate" -H "X-Deploy-Key: ${key}" -H "Content-Type: application/x-pem-file" --data-binary @-'`;
+    const ps = `Invoke-RestMethod -Method Put "${origin}/api/tls/certificate" -Headers @{ "X-Deploy-Key" = "${key}"; "X-Pfx-Password" = "<pfx password>" } -ContentType "application/x-pkcs12" -InFile .\\cert.pfx`;
+    modal({
+      title: 'Deploy key created',
+      body: `<div class="warn-box" style="margin:0 0 10px">Copy it now: it isn't shown again (only a hash is kept).</div>
+        <div class="copy-row"><input class="input mono" id="dkKey" readonly value="${esc(key)}"><button class="btn" id="dkCopy">${ICON.copy}Copy</button></div>
+        <p style="font-size:12px;margin-top:12px"><b>Send a certificate</b> (PEM chain + key in one body; the server checks it and swaps it in live):</p>
+        <pre class="key-reveal" style="white-space:pre-wrap;font-size:11px">${esc(curl)}</pre>
+        <p style="font-size:12px"><b>certbot</b>, after each renewal:</p>
+        <pre class="key-reveal" style="white-space:pre-wrap;font-size:11px">${esc(certbot)}</pre>
+        <p style="font-size:12px"><b>PowerShell</b> with a .pfx (JSON <code>{"cert","key"}</code> or <code>{"pfx": base64, "passphrase"}</code> works too):</p>
+        <pre class="key-reveal" style="white-space:pre-wrap;font-size:11px">${esc(ps)}</pre>
+        <p style="font-size:12px">The new certificate must not expire before the current one and must share a name with it, unless you add <code>?force=1</code>. Every attempt shows in the certificate history.</p>`,
+      wide: true,
+      actions: [{ label: 'Done', cls: 'primary' }],
+    });
+    $('#dkCopy').addEventListener('click', () => copy(key));
   }
 
   function wireInstall() {

@@ -62,7 +62,8 @@ export function inspectMaterial(opts) {
   let selfSigned = false;
   try { selfSigned = x.subject === x.issuer && x.verify(x.publicKey); } catch { /* ignore */ }
   return {
-    subject: subjectCN,
+    // Some CAs (Pebble, Let's Encrypt short-lived certs) leave the subject empty: use the first name.
+    subject: subjectCN || names[0] || '(no name)',
     names,
     issuer: (/(?:^|\n)(?:CN|O)=([^\n]+)/.exec(x.issuer) || [])[1] || x.issuer,
     validFrom: new Date(x.validFrom).toISOString(),
@@ -110,7 +111,7 @@ export class TlsManager {
   /** Current certificate material from the volume, or null if none. */
   material() {
     const s = this.settings();
-    if (s.source === 'pfx' && this.#exists('pfx')) {
+    if ((s.source === 'pfx' || s.pfxSource) && this.#exists('pfx')) {
       return { pfx: fs.readFileSync(this.#file('pfx')), passphrase: decrypt(this.accounts.secret, s.pfxPass) || '' };
     }
     if (this.#exists('cert') && this.#exists('key')) {
@@ -129,9 +130,10 @@ export class TlsManager {
     const stamp = this.#fileStamp();
     if (stamp === this.mtimes) return;
     this.mtimes = stamp;
-    if (this.mode !== 'off') {
-      this.log.info?.('TLS files changed on disk, reloading certificate');
-      await this.apply().catch(() => {});
+    const st = await this.apply().catch(() => null);
+    if (st?.cert) {
+      this.logEvent({ action: 'file', ok: true, by: 'files in the data volume', subject: st.cert.subject, validTo: st.cert.validTo });
+      if (this.mode !== 'off') this.log.info?.('TLS files changed on disk, reloaded certificate');
     }
   }
 
@@ -206,7 +208,66 @@ export class TlsManager {
       uploadedAt: s.uploadedAt,
       uploadedBy: s.uploadedBy,
       cert: info,
+      events: this.events().slice(0, 20),
     };
+  }
+
+  // ---- certificate history (uploads, deploy keys, Let's Encrypt, files) ----
+  events() { return this.accounts.getSetting('tlsEvents', []); }
+  logEvent(e) {
+    const list = [{ at: new Date().toISOString(), ...e }, ...this.events()].slice(0, 50);
+    this.accounts.setSetting('tlsEvents', list);
+  }
+
+  /** The installed certificate's details (null when there is none or it can't be read). */
+  current() {
+    if (!this.info) {
+      const mat = this.material();
+      if (mat) { try { this.info = inspectMaterial(mat); } catch { this.info = null; } }
+    }
+    return this.info;
+  }
+
+  /** Install a PFX that arrived automatically (deploy key). Same checks as an upload. */
+  async installPfx({ pfx, passphrase, source, by }) {
+    if (!pfx?.length) throw new HttpError(400, 'Empty .pfx file');
+    if (pfx.length > MAX_PFX) throw new HttpError(400, 'PFX file is too large');
+    const info = inspectMaterial({ pfx, passphrase });
+    if (info.expired) throw new HttpError(400, `That certificate expired on ${info.validTo.slice(0, 10)}`);
+    fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    writeSecureFile(this.#file('pfx'), pfx);
+    for (const f of ['cert', 'key']) fs.rmSync(this.#file(f), { force: true });
+    this.#save({ source, pfxPass: passphrase ? encrypt(this.accounts.secret, passphrase) : '', uploadedAt: new Date().toISOString(), uploadedBy: by || null, pfxSource: true });
+    await this.apply();
+    const installed = { ...info };
+    delete installed.pem;
+    return { ...this.state(), installed };
+  }
+
+  /**
+   * Install a PEM certificate chain + key that arrived automatically (deploy key, Let's Encrypt).
+   * Same checks as an upload; the HTTPS mode is left as it is.
+   */
+  async installPem({ cert, key, source, by }) {
+    cert = String(cert || '');
+    if (!cert.includes('BEGIN CERTIFICATE')) throw new HttpError(400, 'Certificate must be PEM text containing BEGIN CERTIFICATE');
+    if (!/BEGIN [A-Z ]*PRIVATE KEY/.test(String(key || ''))) throw new HttpError(400, 'No private key found (PEM text containing BEGIN … PRIVATE KEY)');
+    if (cert.length > MAX_PEM || String(key).length > MAX_PEM) throw new HttpError(400, 'Certificate or key is too large');
+    let pkcs8;
+    try { pkcs8 = crypto.createPrivateKey({ key: String(key) }).export({ type: 'pkcs8', format: 'pem' }); } catch (e) {
+      throw new HttpError(400, /passphrase|bad decrypt/i.test(e.message) ? 'The private key is encrypted; send it unencrypted' : 'Could not read the private key: ' + e.message);
+    }
+    const info = inspectMaterial({ cert, key: pkcs8 });
+    if (info.expired) throw new HttpError(400, `That certificate expired on ${info.validTo.slice(0, 10)}`);
+    fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    writeSecureFile(this.#file('cert'), cert);
+    writeSecureFile(this.#file('key'), pkcs8);
+    fs.rmSync(this.#file('pfx'), { force: true });
+    this.#save({ source, pfxPass: '', uploadedAt: new Date().toISOString(), uploadedBy: by || null, pfxSource: false });
+    await this.apply();
+    const installed = { ...info };
+    delete installed.pem;
+    return { ...this.state(), installed };
   }
 
   async updateSettings({ mode, hsts, publicPort }) {
@@ -304,6 +365,7 @@ export class TlsManager {
     }
     this.#save({
       source: type,
+      pfxSource: type === 'pfx',
       pfxPass: pfxPass ? encrypt(this.accounts.secret, pfxPass) : '',
       uploadedAt: new Date().toISOString(),
       uploadedBy: by || null,
@@ -311,13 +373,14 @@ export class TlsManager {
     await this.apply();
     const installed = { ...info };
     delete installed.pem;
+    this.logEvent({ action: 'upload', ok: true, by: by || null, source: type, subject: info.subject, validTo: info.validTo });
     return { ...this.state(), installed };
   }
 
   async remove() {
     if (this.settings().mode !== 'off') throw new HttpError(400, 'Turn HTTPS off before removing the certificate');
     for (const f of Object.keys(FILES)) fs.rmSync(this.#file(f), { force: true });
-    this.#save({ source: null, pfxPass: '', uploadedAt: null, uploadedBy: null });
+    this.#save({ source: null, pfxPass: '', uploadedAt: null, uploadedBy: null, pfxSource: false });
     await this.apply();
     return this.state();
   }
@@ -336,6 +399,7 @@ export class TlsManager {
     if (req.protocol === 'https') return null; // already HTTPS (directly or via a trusted proxy)
     const url = req.url;
     if (url === '/health' || url.startsWith('/health?')) return null; // keep container health checks on HTTP
+    if (url.startsWith('/.well-known/acme-challenge/')) return null; // Let's Encrypt checks over plain HTTP
     const port = this.publicPort;
     const host = (req.hostname || 'localhost').replace(/:\d+$/, '');
     return `https://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}${port === 443 ? '' : ':' + port}${url}`;

@@ -64,6 +64,10 @@
   and create a scheduled task that runs it as SYSTEM every -Every minutes. Needs an elevated prompt.
 .PARAMETER Every
   Minutes between runs for -Install (1-1439). Default 5.
+.PARAMETER ReplaceSettings
+  With -Install: exclude, extra fields, port checks and -Insecure are exactly what this command
+  says, and anything left out is cleared (the one-line installer uses this). Without it, settings
+  not given keep their saved values. The saved API key, -Id and -Proxy are always kept unless given.
 .PARAMETER Uninstall
   Remove the scheduled task, the copied agent and its settings.
 .PARAMETER RemoveRecord
@@ -99,6 +103,7 @@ param(
   [switch]$List,
   [switch]$Install,
   [ValidateRange(1, 1439)][int]$Every,
+  [switch]$ReplaceSettings,
   [switch]$Uninstall,
   [switch]$RemoveRecord,
   [string]$Proxy,
@@ -184,15 +189,18 @@ $ApiKey = Get-Setting $ApiKey 'CHECKIN_API_KEY' 'ApiKey'
 $Id = Get-Setting $Id 'CHECKIN_ID' 'Id'
 # -Fields cpu,ram (a list) and -Fields "cpu,ram" (text) both work.
 $Fields = Get-Setting ($Fields -join ',') 'CHECKIN_FIELDS' 'Fields' $DefaultFields
-$Exclude = Get-Setting ($Exclude -join ',') 'CHECKIN_EXCLUDE' 'Exclude' $DefaultExclude
+# With -ReplaceSettings, the options the installer manages ignore the saved file.
+$managed = { param($name) if ($ReplaceSettings) { "__none_$name" } else { $name } }
+$Exclude = Get-Setting ($Exclude -join ',') 'CHECKIN_EXCLUDE' (& $managed 'Exclude') $DefaultExclude
 $Proxy = Get-Setting $Proxy 'CHECKIN_PROXY' 'Proxy'
-$Extra = Get-Setting $Extra 'CHECKIN_EXTRA' 'Extra' $DefaultExtra
+$Extra = Get-Setting $Extra 'CHECKIN_EXTRA' (& $managed 'Extra') $DefaultExtra
 # -CheckPorts 3389,443 (a list) and -CheckPorts "3389,443" (text) both work.
-$CheckPorts = (Get-Setting ($CheckPorts -join ',') 'CHECKIN_CHECK_PORTS' 'CheckPorts' $DefaultCheckPorts) -replace '\s', ''
-if ($CheckPorts -and $CheckPorts -notmatch '^\d{1,5}(,\d{1,5})*$') { Stop-Agent '-CheckPorts must be port numbers separated by commas, e.g. 3389 or 3389,443' }
-$PortCheck = ($PortCheck -join ',') -replace '\s', ''
-if ($PortCheck -and $PortCheck -notmatch '^\d{1,5}(,\d{1,5})*$') { Stop-Agent '-PortCheck must be port numbers separated by commas, e.g. 3389 or 3389,443' }
-if (-not $Insecure) { $Insecure = [bool](($env:CHECKIN_INSECURE -eq '1') -or ($cfg.ContainsKey('Insecure') -and $cfg['Insecure'])) }
+# (New names: the parameters are string arrays, and a plain string is what gets sent and saved.)
+$PortsEachRun = [string]((Get-Setting ($CheckPorts -join ',') 'CHECKIN_CHECK_PORTS' (& $managed 'CheckPorts') $DefaultCheckPorts) -replace '\s', '')
+if ($PortsEachRun -and $PortsEachRun -notmatch '^\d{1,5}(,\d{1,5})*$') { Stop-Agent '-CheckPorts must be port numbers separated by commas, e.g. 3389 or 3389,443' }
+$PortsOnce = [string](($PortCheck -join ',') -replace '\s', '')
+if ($PortsOnce -and $PortsOnce -notmatch '^\d{1,5}(,\d{1,5})*$') { Stop-Agent '-PortCheck must be port numbers separated by commas, e.g. 3389 or 3389,443' }
+if (-not $Insecure) { $Insecure = [bool](($env:CHECKIN_INSECURE -eq '1') -or (-not $ReplaceSettings -and $cfg.ContainsKey('Insecure') -and $cfg['Insecure'])) }
 
 # Resolve the group list.
 $selected = New-Object System.Collections.Generic.List[string]
@@ -255,7 +263,7 @@ if ($Install) {
     if ($Insecure -and $PSVersionTable.PSVersion.Major -ge 6) { $dl.SkipCertificateCheck = $true }
     Invoke-WebRequest @dl
   }
-  $settings = [ordered]@{ Url = $Url; ApiKey = $ApiKey; Id = $Id; Fields = $Fields; Exclude = $Exclude; Extra = $Extra; CheckPorts = $CheckPorts; Insecure = [bool]$Insecure; Proxy = $Proxy }
+  $settings = [ordered]@{ Url = $Url; ApiKey = $ApiKey; Id = $Id; Fields = $Fields; Exclude = $Exclude; Extra = $Extra; CheckPorts = $PortsEachRun; Insecure = [bool]$Insecure; Proxy = $Proxy }
   $settings | ConvertTo-Json | Out-File -FilePath $DefaultConfig -Encoding utf8 -Force
   # The task is defined in XML so it also runs on battery, can't pile up, and is stopped if a run hangs.
   $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -353,8 +361,8 @@ function Format-Ports($ports) {
 }
 
 # ---- -PortCheck: ask once, print, exit -----------------------------------------------------
-if ($PortCheck) {
-  try { $pc = Invoke-Api 'GET' "/api/portcheck?ports=$PortCheck" } catch { Stop-Agent "could not reach $Url/api/portcheck : $($_.Exception.Message)" }
+if ($PortsOnce) {
+  try { $pc = Invoke-Api 'GET' "/api/portcheck?ports=$PortsOnce" } catch { Stop-Agent "could not reach $Url/api/portcheck : $($_.Exception.Message)" }
   if ($pc.Status -ne 200) { Stop-Agent "port check failed (HTTP $($pc.Status)): $($pc.Body)" }
   $res = $pc.Body | ConvertFrom-Json
   Write-Log ((@("Ports on $($res.ip), as seen from ${Url}:") + (Format-Ports $res.ports)) -join [Environment]::NewLine)
@@ -641,7 +649,7 @@ foreach ($pair in ($Extra -split ',' | Where-Object { $_ -match '=' })) {
 if ($groupErrors.Count) { Add-Field 'agent_errors' ($groupErrors -join '; ') }
 Add-Field 'agent_version' $Version
 Add-Field 'agent_os' 'windows'
-Add-Field 'check_ports' $CheckPorts   # an instruction to the server, not stored as a field
+Add-Field 'check_ports' $PortsEachRun   # an instruction to the server, not stored as a field
 
 $body = $data | ConvertTo-Json -Compress -Depth 3
 
@@ -652,7 +660,7 @@ switch ($r.Status) {
   { $_ -eq 200 -or $_ -eq 201 } {
     $how = if ($r.Status -eq 201) { 'created' } else { 'updated' }
     $lines = @("Checked in as $($data['id']) ($how, $($data.Count) fields).")
-    if ($CheckPorts) {
+    if ($PortsEachRun) {
       try { $res = $r.Body | ConvertFrom-Json } catch { $res = $null }
       if ($res.portCheck -eq 'off') { $lines += '  port checks are turned off on the server (Admin → Port checks)' }
       elseif ($res.ports) { $lines += Format-Ports $res.ports }

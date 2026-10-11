@@ -287,6 +287,31 @@
     $('#pauseResume').hidden = !can('pause');
   }
 
+  // Admins: warn on the dashboard when the HTTPS certificate is close to expiring or Let's Encrypt is failing.
+  async function loadCertWarning() {
+    const el = $('#certBanner');
+    if (!can('tls')) { el.hidden = true; return; }
+    let tls, acme;
+    try { [tls, acme] = await Promise.all([apiJson('/api/admin/tls'), apiJson('/api/admin/tls/acme').catch(() => null)]); } catch { return; }
+    let msg = '', bad = false;
+    const c = tls.cert;
+    if (tls.listening && c?.validTo) {
+      const ms = new Date(c.validTo) - Date.now();
+      const days = Math.floor(ms / 86400000);
+      if (ms <= 0) { bad = true; msg = `<b>The HTTPS certificate has expired</b> (${esc(absTime(c.validTo))}). Browsers will refuse the connection.`; }
+      else if (days < 14) { bad = days < 3; msg = `<b>The HTTPS certificate expires ${days < 1 ? 'today' : `in ${days} day${days === 1 ? '' : 's'}`}</b> (${esc(absTime(c.validTo))}).`; }
+    }
+    if (acme?.enabled && acme.lastError) {
+      const why = String(acme.lastError).split(' Details:')[0];
+      msg += `${msg ? ' ' : ''}<b>Automatic certificate renewal is failing:</b> ${esc(why.length > 220 ? why.slice(0, 220).replace(/\s+\S*$/, '') + '…' : why)}`;
+    } else if (msg && acme?.enabled) {
+      msg += ' Automatic renewal is on; check it is working.';
+    }
+    el.hidden = !msg;
+    el.classList.toggle('bad', bad);
+    $('#certBannerText').innerHTML = msg;
+  }
+
   async function loadIngest() {
     try { S.ingest = await apiJson('/api/status'); updateLive(); } catch { /* ignore */ }
   }
@@ -1796,6 +1821,7 @@
     matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
     $('#liveToggle').addEventListener('click', togglePause);
     $('#pauseResume').addEventListener('click', () => setIngestPaused(false));
+    $('#certBannerOpen').addEventListener('click', () => window.CheckinAdmin?.open('tls'));
     $('#liveStatus').addEventListener('click', () => { if (can('pause')) $('#liveToggle').click(); });
 
     // account menu
@@ -2135,10 +2161,12 @@
     migrateLocalViews();
     loadBoxes();
     await loadIngest();
+    loadCertWarning();
+    setInterval(loadCertWarning, 30 * 60_000);
     connect();
     try { await loadAll(); } catch (e) { if (e.message !== 'API key required') toast('Could not load records: ' + e.message, 'error'); }
     if (S.view.layout === 'activity') loadActivity();
   }
-  window.CheckinUI = { api, apiJson, modal, closeModal, toast, esc, nf, relTime, absTime, initials, state: S, can };
+  window.CheckinUI = { api, apiJson, modal, closeModal, toast, esc, nf, relTime, absTime, initials, state: S, can, refreshCertWarning: loadCertWarning };
   init();
 })();
