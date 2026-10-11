@@ -11,6 +11,8 @@ Everything beyond the basics: configuration, Docker details, HTTPS, users and si
 - [Users, roles and sign-in](#users-roles-and-sign-in)
 - [API](#api)
 - [Dashboard](#dashboard)
+- [Issues](#issues)
+- [Load test page](#load-test-page)
 - [Performance](#performance)
 - [Agents (Windows and Linux)](#agents-windows-and-linux)
 - [Tests](#tests)
@@ -204,8 +206,11 @@ JSON works too: `{ "cert": "<PEM chain>", "key": "<PEM key>" }` or `{ "pfx": "<b
 | Import CSV, export CSV | | ✓ | ✓ | ✓ |
 | Delete records (single or multi-select) | | ✓ | ✓ | ✓ |
 | **Clear all**, pause/resume check-ins, change the active threshold, create/edit/delete team views, set up status boxes | | | ✓ | ✓ |
+| See issues (when an admin has turned them on) | ✓ | ✓ | ✓ | ✓ |
+| Assign, ignore and close issues; add notes; export issues | | ✓ | ✓ | ✓ |
+| Define issue rules and the reassign window; clear the issues list; delete anyone's notes | | | ✓ | ✓ |
 | See and regenerate the API key | | | ✓ | ✓ |
-| Manage users and single sign-on; use a custom API key or stop requiring one; turn port checks on or off | | | | ✓ |
+| Manage users and single sign-on; use a custom API key or stop requiring one; turn port checks and the issues list on or off; the load test page | | | | ✓ |
 
 The active threshold is now a shared, server-side setting. When a power user changes it, every open dashboard updates. Permissions are enforced by the server; the dashboard also hides what your role can't do.
 
@@ -385,6 +390,27 @@ Each port comes back as `open` (connected), `closed` (refused), `filtered` (no a
 
 The Status box presets include **RDP open / closed** (`port_3389`) and **SSH open / closed** (`port_22`).
 
+### Issues
+
+All need the issues list turned on (otherwise `409`), except `GET /api/issues/config`, `GET /api/issues/summary` and the admin switch. See [Issues](#issues) for how they behave.
+
+| Method & path | Role | Description |
+|---|---|---|
+| `PUT /api/admin/issues` | Admin | `{ "enabled": true }` turns the issues list on or off; `{ "autoClose": false }` stops issues closing themselves when every problem clears (default `true`) |
+| `GET /api/issues/config` | Reader | `{ enabled, reassignMinutes, rules, version }` (each rule also has readable `text` and `clearText`) |
+| `PUT /api/issues/rules` | Power user | `{ "rules": [...], "version": 3 }` replaces every rule (`409` if someone saved in between). A rule: `{ "name", "kind": "field" \| "skew" \| "stale", "severity": "critical" \| "warning" \| "info", "enabled", "field", "op", "value", "count": 5, "clear": { "mode": "auto" \| "custom", "field", "op", "value", "count": 2 } }`. `count` = failing check-ins in a row before it opens, `clear.count` = passing check-ins in a row before it clears (1-1000, defaults 5 and 2). For `stale`, `value` is the minutes without a check-in |
+| `PUT /api/issues/settings` | Power user | `{ "reassignMinutes": 60 }` (0 = off) |
+| `GET /api/issues` | Reader | `?status=active` (default: open and ignored) `\| open \| ignored \| allclear \| closed \| all`, `q` (device, problem, person or issue number), `assignee=me \| none \| <user id>`, `sort=opened \| opened_asc \| updated`, `limit` (≤1000), `offset`. Returns `{ issues, total, summary }` |
+| `GET /api/issues/summary` | Reader | Counts: `{ enabled, open, ignored, unassigned, mine, allClear, closed, total }` |
+| `GET /api/issues/:id` | Reader | One issue with its problems, `events` (log and notes), `snapshot` (the device's fields when it opened) and `current` (the device now) |
+| `GET /api/issues/assignees` | User | People issues can be assigned to (enabled users) |
+| `PUT /api/issues/:id/assign` | User | `{ "assignee": 12 }`, or `null` to unassign |
+| `POST /api/issues/:id/ignore` · `/unignore` | User | `{ "minutes": 240 }` (1 minute to 90 days) |
+| `POST /api/issues/:id/close` | User | `{ "reason": "optional" }` |
+| `POST /api/issues/:id/notes` · `DELETE /api/issues/:id/notes/:noteId` | User | `{ "text" }` (up to 4,000 characters). You can delete your own notes; power users and admins can delete any |
+| `GET /api/issues/export.csv` | User | One row per issue, with every problem, note and log line. `?kind=log` gives one row per log entry and note instead. Takes the same filters as `GET /api/issues` (default `status=all`) |
+| `DELETE /api/issues?confirm=true` | Power user | Deletes every issue (open, ignored and closed) with their problems, notes and logs |
+
 ### CSV
 
 | Method & path | Description |
@@ -438,6 +464,67 @@ The dashboard's export menu can also download the **current view**: only the fil
 - **Pause check-ins** (power users and admins): the server stops accepting check-ins and CSV imports until resumed. Every open dashboard shows a banner saying who paused it and when.
 - **Import:** use the button, or drag a `.csv` file onto the page.
 - Light and dark themes, plus compact and comfortable row density.
+
+## Issues
+
+An optional **Issues** page that tracks problems on devices: who is on them, notes, and what happened when. It's off until an admin turns it on in **Admin → Issues** (or on the Issues page itself). Then the dashboard shows an **Issues** button with the number of open issues, and so does the account menu on phones.
+
+### Rules: what counts as an issue
+
+Power users and admins set the rules with **Issue rules** on the Issues page. **Every check-in is one test of every rule.** A rule **fails after N failing check-ins in a row** (5 by default) and opens an issue, and its problem **clears after M passing check-ins in a row** (2 by default). A passing check-in resets the fail count, and a failing one resets the clear count, so a single odd reading never opens or closes anything. Each rule also has a name and a severity (critical, warning or info). There are three types:
+
+- **A field matches a condition**, for example `cpu_pct > 90` on 5 check-ins in a row. It uses the same conditions as status boxes (`>`, `≥`, `<`, `≤`, is, is not, contains, is empty…). It passes when the condition is no longer true, or when a separate condition holds, such as `cpu_pct < 80` on 2 check-ins in a row. With a separate condition, a reading in between (say 85) counts as neither: it doesn't fail and it resets the clear count, so a value hovering around the limit doesn't open and close issues over and over.
+- **Clock is off**: a date/time field (by default `system_time`, which the agents send) is more than N minutes away from the time the server received the check-in. It passes when it's back within that limit, or within a tighter one you choose.
+- **No check-in** for N minutes. There's nothing to count while a device is silent, so this one is time-based and checked every 30 seconds. It clears after the device checks in again the set number of times (1 in the preset). Time the server was down and time check-ins were paused don't count, so a restart or a pause doesn't open an issue for every device.
+
+Every check-in counts, even when no values changed (the device still reports the same reading). How long "5 in a row" takes depends on how often a device checks in: 25 minutes for agents on a 5-minute schedule. The presets: high CPU and high memory (fail after 5, clear after 2, with a lower clear threshold), low disk space (2/2), clock skew (3/2), offline (30 minutes, clears on the next check-in), failed services (3/2), and **RDP closed** / **SSH closed** (`port_3389` / `port_22` is `closed` on 2 check-ins in a row, clears on the first check-in where it's `open` again). The port rules use the fields the agents' port checks save (see [Port checks](#port-checks)), so they only apply to devices that check those ports, which includes the load test's simulated devices.
+
+Rule changes apply right away. Problems from a deleted or turned-off rule leave their issues, and an issue closes if nothing is left. A new or changed rule starts counting from each device's latest check-in, which counts as the first, so a rule that fails after 1 check-in opens issues as soon as it's saved. A check-in is never counted twice: saving the rules again or clearing the issues list doesn't add to the counts.
+
+### How issues behave
+
+- **One issue per device.** If a device already has an open or ignored issue, a new problem (high memory while high CPU is open) is added to it, not opened as a second issue.
+- **Problems clear one by one.** After its passing check-ins in a row, a problem leaves the issue and the log notes it with the reading, for example "High CPU cleared: cpu_pct = 42 (2 check-ins in a row)". When no problems are left, the issue **closes itself**.
+- **Automatic closing (admins, Admin → Issues):** on by default. Turn it off and issues no longer close themselves: when every problem has cleared, the issue stays open, marked **All clear** (with its own count, filter and a log entry), until someone closes it. A problem that starts again meanwhile joins that same issue. Turning automatic closing back on closes the issues that are already all clear.
+- **Closing by hand.** Anyone with the User role or above can close an issue, optionally with a reason. If a problem is still happening, it won't open a new issue until it has stopped and then happened again. Other problems can still open one.
+- **Ignore** for 15 minutes to a week, or a custom time (up to 90 days). An ignored issue leaves the Open list but keeps tracking. If everything clears, it closes. If the same problem comes and goes, it stays ignored. A **new kind of problem** on that device ends the ignore straight away, so ignoring one problem never hides another. When the time runs out, it goes back to Open.
+- **Assign** to anyone in the users list, with search. **Assign to me** is one click.
+- **Same person when it comes back:** if a device gets a new issue within the reassign window (60 minutes by default, set in Issue rules, 0 = off) of its last issue closing, the new issue goes to whoever had the last one. Disabled users are skipped.
+- **Notes:** anyone with the User role or above can add notes. You can delete your own notes, and power users and admins can delete anyone's.
+- **Log:** every issue keeps a log written by the server and by people. It records when the issue opened, each problem starting and clearing with the values that triggered it, assignments, ignores and closing. It also keeps a copy of the device's fields when the issue opened, shown next to the current values. The device name links to the device on the dashboard.
+- Deleting a device record, or clearing all records, closes its issues.
+
+### Exports and clearing
+
+**Export** gives a CSV of every issue: one row each with problems, notes and the log. You can also export the issue log (one row per entry) or just the issues matching the current filters. **Clear issues** (power users and admins) deletes every issue, open and closed, with their problems, notes and logs, after a confirmation. Rules and settings stay. Problems that are still happening open new issues straight away.
+
+Everything updates live: the list, the open issue and the dashboard button follow changes from other people and from check-ins without a refresh.
+
+## Load test page
+
+Admins can open **Load test** from the account menu (`/loadtest`). The Issues and Load test pages have the same account menu, top right, as the dashboard. It runs a simulated fleet inside the server, so you can watch the dashboard, status boxes and issues under load without installing anything.
+
+- **Devices and interval:** choose how many simulated devices there are (up to 20,000) and how often each one checks in. The target rate is shown (2,000 devices every 10 s = 200 check-ins a second). Check-ins are spread evenly over the interval. **Apply** changes the fleet while it runs, and **Burst** makes every device check in at once.
+- **They start healthy and active.** Each device has its own realistic, slightly noisy readings, using the same fields as the agents: `cpu_pct`, `ram_pct`, `disk_max_pct`, `disk_busy_pct`, `system_time`, `failed_services`, `failed_service_names`, `reboot_required`, `domain_joined`, hostname, OS, site and so on, plus `role`.
+- **A mixed fleet.** Every 5th device is a server with a role and that role's services. Windows servers can be web (`W3SVC`, `WAS`), SQL (`MSSQLSERVER`, `SQLSERVERAGENT`), domain controller (`NTDS`, `DNS`, `Netlogon`, `Kdc`), file (`LanmanServer`, `DFSR`) or app servers. Linux servers can be web (`nginx`), database (`postgresql`) or container hosts (`docker`, `containerd`). A simulated device's ID is always its hostname, which shows its role: `SIM-SRV-SQL-00030`, `SIM-LNX-WEB-00045`, `SIM-WS-00001`. The rest are workstations, laptops and kiosks, with the usual Windows or Linux services (`Spooler`, `wuauserv`, `W32Time`, `TermService`… or `sshd`, `cron`…).
+- **Remote access:** Windows devices report RDP as `port_3389 = open` and Linux devices report SSH as `port_22 = open`, the way the agents' port checks do. So the **RDP open / closed** and **SSH open / closed** status-box presets and issue rules such as `port_3389 is closed` work against them. Stopping the service behind the port (`TermService` or `sshd`) also closes the port.
+- **Problems:** trigger **high CPU, high memory, low disk space, high disk activity, clock skew, failed services, RDP closed, SSH closed, reboot required, not domain joined** or **offline** (stops checking in) on a percentage or a number of devices (RDP closed counts only Windows devices, and SSH closed only Linux ones). Affected devices report the problem from their next check-in. You can change the amount while it runs: the same devices stay affected, and more are added or some removed at the edge. **Remove** (or **Make every device healthy**) puts them back to normal from their next check-in, so issues clear on their own clear rules.
+- **Specific devices:** find a device by name, role, service or site (**All**, or **Changed** for the ones you've changed). Open it and choose exactly what's wrong: any of the problems above, whether its RDP or SSH port is open or closed, and which of its services are stopped. A stopped service shows in `failed_services` / `failed_service_names` the way the agents report it, so an issue rule such as `failed_service_names contains MSSQLSERVER` catches it. Changes reach the server straight away, not at the device's next turn. They add to the percentage problems, and **Make healthy** (one device) or **Make all of these healthy** undoes them.
+- **Live numbers:** check-ins per second against the target, latency (p50, p95, max), server CPU (% of one core), event-loop delay, memory, total sent, failures (and how many were turned away because check-ins were paused), simulated devices in the database and open issues. There are charts of the last 2 minutes with hover details.
+- **Real requests:** every check-in goes through the real API (routing, body parsing, auth, the write queue, history, status boxes, issues and live updates) using Fastify's in-process request injection. Only the network socket is skipped, so to measure the network and a reverse proxy too, use `scripts/loadtest.js` or `scripts/loadtest-fleet.ps1` from another machine. The simulator uses the server's own CPU, which the CPU number includes. It never has more than 1,000 requests waiting: if the server falls behind, the extra check-ins are counted as *skipped* rather than piling up.
+- **Simulated devices are ordinary records** whose ID is their hostname (`SIM-…`) with `simulated = true`, so they appear on the dashboard and can open issues like real devices. **Remove simulated devices** (after stopping) deletes them and their history and closes their issues, without touching real devices (only `SIM-` IDs that are also marked `simulated = true`, plus `sim-` ones from older versions). The simulation itself doesn't survive a restart, but the records do (they go stale) until you remove them.
+
+| Method & path | Role | Description |
+|---|---|---|
+| `GET /api/admin/loadtest` | Admin | Status, live numbers, the last 2 minutes and active problems |
+| `POST /api/admin/loadtest/start` · `/stop` · `/burst` | Admin | `start` takes `{ "devices": 2000, "interval": 10 }` |
+| `PUT /api/admin/loadtest` | Admin | `{ "devices", "interval" }`, applied live |
+| `POST /api/admin/loadtest/scenarios` | Admin | `{ "key": "high_cpu", "mode": "percent" \| "count", "amount": 10 }`. Keys: `high_cpu`, `high_memory`, `low_disk`, `disk_busy`, `clock_skew`, `failed_services`, `rdp_closed`, `ssh_closed`, `reboot_required`, `not_domain_joined`, `offline` |
+| `PUT` · `DELETE /api/admin/loadtest/scenarios/:id` | Admin | Change the amount, or remove it (`all` removes every problem) |
+| `GET /api/admin/loadtest/sims` | Admin | Find simulated devices: `?q=` (name, role, service, site), `filter=custom` for changed devices only, `limit` (≤200). Each has its `services`, `problems`, `stopped` services and the percentage problems it's in |
+| `PUT /api/admin/loadtest/sims/:id` | Admin | Set exactly what's wrong with one device: `{ "problems": ["high_cpu"], "stopped": ["MSSQLSERVER"], "closed": [3389] }`. Empty lists make it healthy |
+| `DELETE /api/admin/loadtest/sims` | Admin | Make every changed device healthy |
+| `DELETE /api/admin/loadtest/devices?confirm=true` | Admin | Delete every simulated record (the test must be stopped) |
 
 ## Performance
 
@@ -668,6 +755,8 @@ src/
   acme.js     automatic certificates (ACME HTTP-01): issue, renew, backoff, routes
   certdeploy.js deploy keys: certificate pushes from automation, safety checks
   views.js    saved views (personal and team)
+  issues.js   issues: rules, one open issue per device, clearing, ignore, assign, notes, CSV, routes
+  loadtest.js the admin load test: a simulated fleet checking in through the real API, problems on demand
   boxes.js    status boxes: rules, per-device "since" tracking, routes
   portcheck.js port checks: TCP probes back to the caller, limits, routes
   compress.js Brotli / gzip response compression
@@ -678,7 +767,7 @@ src/
     accounts.js  users, sessions, settings, roles, SSO user provisioning
     oidc.js      Microsoft Entra ID (OIDC, code flow + PKCE)
     security.js  scrypt hashing, encryption, rate limiting
-public/       dashboard and login page (index.html, login.html, app.js, admin.js, agents.js, chart.js, viewstate.js, login.js, styles.css; no build step)
+public/       dashboard, issues page and login page (index.html, issues.html, loadtest.html, login.html, app.js, issues.js, loadtest.js, admin.js, agents.js, chart.js, viewstate.js, login.js, styles.css; no build step)
 scripts/      seed.js, loadtest.js, loadtest.ps1, loadtest-fleet.ps1, checkin-agent.sh, checkin-agent.ps1 (agents served at /agent/...)
 test/         API tests (node:test)
 ```

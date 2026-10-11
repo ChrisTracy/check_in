@@ -9,8 +9,8 @@
 
   const ROLES = [
     ['admin', 'Admin', 'Everything, including users, single sign-on, port checks and whether the API key is required'],
-    ['power', 'Power user', 'User rights plus Clear all, pausing check-ins, the active threshold and the API key'],
-    ['user', 'User', 'View, import, export and delete records'],
+    ['power', 'Power user', 'User rights plus Clear all, pausing check-ins, the active threshold, the API key and the issue rules'],
+    ['user', 'User', 'View, import, export and delete records; assign, ignore, close and add notes to issues'],
     ['reader', 'Reader', 'View records and history only'],
   ];
   const roleLabel = (r) => ROLES.find((x) => x[0] === r)?.[1] || r;
@@ -56,7 +56,7 @@
     $$('.admin-nav [data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
     $('#aBody').innerHTML = '<div class="muted">Loading…</div>';
     foot('');
-    ({ users: loadUsers, sso: loadSso, apikey: loadApiKey, tls: loadTls, ports: loadPorts })[t]();
+    ({ users: loadUsers, sso: loadSso, apikey: loadApiKey, tls: loadTls, ports: loadPorts, issues: loadIssuesAdmin })[t]();
   }
 
   // ================================================================== Users
@@ -809,6 +809,48 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
   }
 
   // ================================================================== Port checks
+  // ---- issues list on/off ----
+  async function loadIssuesAdmin() {
+    let cfg;
+    try { cfg = await apiJson('/api/issues/config'); } catch (e) { $('#aBody').innerHTML = `<div class="warn-box">${esc(e.message)}</div>`; return; }
+    head('Issues', 'Track problems on devices: who is on them, notes and history', cfg.enabled ? '<span class="tag ok">On</span>' : '<span class="tag">Off</span>');
+    const rules = cfg.rules.filter((r) => r.enabled);
+    $('#aBody').innerHTML = `
+      <div class="admin-section">
+        <label class="switch"><input type="checkbox" id="isEnabled" ${cfg.enabled ? 'checked' : ''}><span class="track"></span><b>Turn on the issues list</b></label>
+        <p class="muted" style="margin:0;font-size:12px">Adds an <b>Issues</b> page (button at the top of the dashboard). The server opens an issue when a device breaks one of the issue rules and adds further problems to the same issue. Everyone can see issues; Users and up can assign, ignore, close and add notes; Power users and admins define the rules and can clear the list.</p>
+      </div>
+      <div class="admin-section">
+        <h4>When a problem clears on its own</h4>
+        <label class="switch"><input type="checkbox" id="isAutoClose" ${cfg.autoClose !== false ? 'checked' : ''}><span class="track"></span><b>Close issues automatically when every problem has cleared</b></label>
+        <p class="muted" style="margin:0;font-size:12px">${cfg.autoClose !== false
+          ? 'On: each problem leaves the issue when its clear rule is met, and the issue closes by itself once none are left.'
+          : 'Off: problems still clear and are noted in the log, but the issue stays open, marked <b>All clear</b>, until someone closes it. A problem that starts again joins the same issue.'}
+          Turning this back on closes the issues that are already all clear.</p>
+      </div>
+      <div class="admin-section">
+        <h4>Rules</h4>
+        ${rules.length ? `<table class="utable"><thead><tr><th>Name</th><th>Opens when</th><th>Clears when</th></tr></thead><tbody>${rules.map((r) => `<tr><td><b>${esc(r.name)}</b></td><td>${esc(r.text)}</td><td>${esc(r.clearText)}</td></tr>`).join('')}</tbody></table>`
+          : '<p class="muted" style="margin:0">No rules yet.</p>'}
+        <p class="muted" style="margin:0;font-size:12px">Rules and the reassign window (now ${cfg.reassignMinutes ? `${cfg.reassignMinutes} min` : 'off'}) are edited on the Issues page with <b>Issue rules</b>.</p>
+        <div><a class="btn" href="/issues">Open the Issues page</a></div>
+      </div>`;
+    $('#isAutoClose').addEventListener('change', async (e) => {
+      try {
+        await apiJson('/api/admin/issues', json('PUT', { autoClose: e.target.checked }));
+        toast(e.target.checked ? 'Issues close automatically when they clear' : 'Issues stay open until someone closes them');
+        loadIssuesAdmin();
+      } catch (err) { e.target.checked = !e.target.checked; toast(err.message, 'error'); }
+    });
+    $('#isEnabled').addEventListener('change', async (e) => {
+      try {
+        await apiJson('/api/admin/issues', json('PUT', { enabled: e.target.checked }));
+        toast(e.target.checked ? 'Issues turned on' : 'Issues turned off');
+        loadIssuesAdmin();
+      } catch (err) { e.target.checked = !e.target.checked; toast(err.message, 'error'); }
+    });
+  }
+
   async function loadPorts() {
     try { renderPorts(await apiJson('/api/admin/portcheck')); } catch (e) { $('#aBody').innerHTML = `<div class="warn-box">${esc(e.message)}</div>`; }
   }

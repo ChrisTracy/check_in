@@ -27,6 +27,8 @@ A self-hosted dashboard that keeps track of your devices. Each device checks in 
 - **History and graphs** for every record: what changed and when, plus CPU, RAM, disk space and disk activity over time.
 - **Windows and Linux agents** that report system details (OS, CPU, memory, disk, network, domain join, uptime and more). **Add Device** gives you a one-line install command.
 - **Port checks** (optional, turned on by an admin): devices can ask the server whether a port such as RDP (3389) or SSH (22) is reachable, with the answer saved on the record or sent straight back.
+- **Issues** (optional, turned on by an admin): you define what counts as a problem, such as CPU over 90% on 5 check-ins in a row, a clock more than 5 minutes off, or no check-in for 30 minutes, and how many passing check-ins clear it. The server opens one issue per device, adds further problems to it and closes it when they clear. People can assign, ignore, close and add notes, and everything exports to CSV.
+- **Load test page** for admins: run a simulated fleet of up to 20,000 devices that start healthy, then switch problems such as high CPU, clock skew or offline on and off while you watch the dashboard and issues react.
 - **CSV import and export**, multi-select delete, and a pause switch to stop accepting check-ins.
 - **Users and roles** (Admin, Power user, User, Reader), an API key for devices, and Microsoft Entra ID single sign-on.
 - **Built-in HTTPS** if you don't have a reverse proxy, with free automatic certificates from Let's Encrypt, or deploy keys so your own renewal tools can push certificates.

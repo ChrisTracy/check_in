@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#4f46e5">
+  <title>Check-In Load Test</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><path d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app lt-app">
+  <header class="topbar">
+    <div class="brand">
+      <a class="logo" href="/" title="Back to the dashboard"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></a>
+      <div>
+        <h1>Load test</h1>
+        <div class="live" id="runState"><span class="pulse"></span><span id="runText">Loading…</span></div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <a class="btn" href="/"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span>Dashboard</span></a>
+      <a class="btn" href="/issues" id="issuesLink"><svg class="i" viewBox="0 0 24 24"><path d="M12 3l9.5 16.5h-19z"/><path d="M12 10v4M12 17v.5"/></svg><span>Issues</span></a>
+      <button class="icon-btn" id="themeBtn" title="Toggle theme"><svg class="i" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+      <div id="userMenuSlot"></div>
+    </div>
+  </header>
+
+  <main class="lt-main">
+    <section class="lt-card lt-control">
+      <div class="lt-control-row">
+        <label class="field">Simulated devices<input class="input" type="number" id="devices" min="1" max="20000" step="1"></label>
+        <label class="field">Each checks in every<span class="lt-unit"><input class="input" type="number" id="interval" min="1" max="3600" step="1"><span>seconds</span></span></label>
+        <div class="field lt-target"><span>Target</span><b id="target">–</b></div>
+        <div class="lt-buttons">
+          <button class="btn primary" id="startBtn">Start</button>
+          <button class="btn" id="applyBtn" hidden title="Change the fleet without stopping">Apply</button>
+          <button class="btn" id="burstBtn" title="Every device checks in once, right now">Burst</button>
+        </div>
+      </div>
+      <p class="muted lt-note">Devices start <b>healthy and active</b> and check in through the real API (routing, auth, the write queue, status boxes and issues), spread evenly over the interval.
+        They're saved as ordinary records whose ID is their hostname, such as <code>SIM-WS-00001</code> or <code>SIM-SRV-SQL-00030</code>, with <code>simulated = true</code>, so they show on the dashboard and can open issues. Remove them when you're done.</p>
+    </section>
+
+    <section class="lt-tiles" id="tiles">
+      <div class="lt-tile"><span class="label">Check-ins / s</span><span class="value" id="tRate">0</span><span class="sub" id="tRateSub">target 0</span></div>
+      <div class="lt-tile"><span class="label">Latency p95</span><span class="value" id="tP95">–</span><span class="sub" id="tP50">p50 –</span></div>
+      <div class="lt-tile"><span class="label">Server CPU</span><span class="value" id="tCpu">–</span><span class="sub" id="tLag">event loop –</span></div>
+      <div class="lt-tile"><span class="label">Sent</span><span class="value" id="tSent">0</span><span class="sub" id="tErr">0 errors</span></div>
+      <div class="lt-tile"><span class="label">Simulated in database</span><span class="value" id="tSim">0</span><span class="sub" id="tRecords">of 0 records</span></div>
+      <div class="lt-tile"><span class="label">Open issues</span><span class="value" id="tIssues">–</span><span class="sub" id="tIssuesSub">issues off</span></div>
+    </section>
+    <div class="warn-box lt-err" id="lastError" hidden></div>
+
+    <section class="lt-charts">
+      <figure class="lt-card lt-chart" data-key="ok" data-unit="/s"><figcaption>Check-ins per second <span class="muted">· last 2 minutes</span></figcaption><div class="lt-plot"></div></figure>
+      <figure class="lt-card lt-chart" data-key="p95" data-unit=" ms"><figcaption>Latency p95 <span class="muted">· ms</span></figcaption><div class="lt-plot"></div></figure>
+      <figure class="lt-card lt-chart" data-key="cpu" data-unit="%"><figcaption>Server CPU <span class="muted">· % of one core</span></figcaption><div class="lt-plot"></div></figure>
+    </section>
+
+    <section class="lt-card">
+      <div class="lt-sec-head"><h3>Problems</h3><button class="btn sm" id="healAll" hidden>Make every device healthy</button></div>
+      <p class="muted lt-note">Trigger a problem on some of the devices; it shows from their next check-in. Remove it and they're healthy again from their next check-in.</p>
+      <div class="lt-active" id="active"></div>
+      <div class="lt-catalog" id="catalog"></div>
+    </section>
+
+    <section class="lt-card" id="devSection">
+      <div class="lt-sec-head"><h3>Specific devices <span class="badge" id="customCount" hidden></span></h3><button class="btn sm" id="healDevices" hidden>Make all of these healthy</button></div>
+      <p class="muted lt-note">Pick a server (or any device) and choose exactly what's wrong with it, down to which of its services are stopped. This is on top of the percentage problems above, and it reaches the server straight away.</p>
+      <div class="lt-dev-tools">
+        <label class="search"><svg class="i" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="devSearch" placeholder="Name, role, service or site, e.g. SIM-SRV-SQL-00030 or MSSQLSERVER" autocomplete="off"></label>
+        <div class="seg text" id="devKind"><button data-kind="">All</button><button data-kind="custom">Changed</button></div>
+        <span class="muted lt-dev-count" id="devCount"></span>
+      </div>
+      <div class="lt-dev-list" id="devList"></div>
+    </section>
+
+    <section class="lt-card lt-cleanup">
+      <div><h3>Clean up</h3><p class="muted lt-note">Stop the test first. Deletes every simulated (<code>SIM-*</code>) record and its history, and closes their issues.</p></div>
+      <button class="btn danger" id="removeBtn">Remove simulated devices</button>
+    </section>
+  </main>
+</div>
+
+<div class="modal-back" id="modalBack" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <h3 id="mTitle"></h3>
+    <div id="mBody"></div>
+    <div class="modal-actions" id="mActions"></div>
+  </div>
+</div>
+<div class="lt-tip" id="tip" hidden></div>
+<div class="toasts" id="toasts"></div>
+<script src="usermenu.js"></script>
+<script src="loadtest.js"></script>
+</body>
+</html>

@@ -17,6 +17,9 @@ import { registerAuth } from './auth/plugin.js';
 import { TlsManager } from './tls.js';
 import { CertDeployKeys } from './certdeploy.js';
 import { AcmeManager, registerAcme } from './acme.js';
+import { Issues, registerIssues } from './issues.js';
+import { LoadTest, registerLoadTest } from './loadtest.js';
+import { can } from './auth/accounts.js';
 
 const AUTH_QUERY_KEYS = new Set(['api_key', 'apikey']);
 const MAX_BULK_DELETE = 100_000;
@@ -173,6 +176,21 @@ export function buildApp({ config, store, accounts, oidc }) {
   registerBoxes(app, { boxes, broadcast });
   const portChecker = new PortChecker(accounts);
   registerPortCheck(app, { portChecker });
+
+  // ---- issues (turned on by an admin; rules set by power users) ---------
+  let issuesTimer = null;
+  const issues = new Issues({
+    db: store.db, store, accounts, tickMs: config.issuesTickMs ?? 30_000,
+    // Coalesce bursts (a fleet checking in) into at most two notifications per second.
+    onChange: () => { if (!issuesTimer) issuesTimer = setTimeout(() => { issuesTimer = null; broadcast('issues', {}); }, 500); },
+  });
+  app.decorate('issues', issues);
+  registerIssues(app, { issues, can });
+
+  // ---- load test (admins): a simulated fleet checking in through the real API ----
+  const loadTest = new LoadTest({ app, store, log: app.log });
+  app.decorate('loadTest', loadTest);
+  registerLoadTest(app, { loadTest, store, issues });
 
   // ---- admin: HTTPS / TLS --------------------------------------------------
   const tlsCap = { config: { cap: 'tls' } };
@@ -449,6 +467,9 @@ export function buildApp({ config, store, accounts, oidc }) {
     clients.clear();
   });
   app.addHook('onClose', async () => {
+    issues.close();
+    loadTest.close();
+    clearTimeout(issuesTimer);
     acme.close();
     await tlsManager.close();
   });

@@ -252,6 +252,7 @@
       if (d.reload) loadAll().catch(() => {});
     });
     es.addEventListener('ingest', (e) => { S.ingest = JSON.parse(e.data); updateLive(); });
+    es.addEventListener('issues', () => { clearTimeout(S.issuesTimer); S.issuesTimer = setTimeout(loadIssuesBadge, 1000); });
     es.addEventListener('reload', () => { S.checked.clear(); updateSelBar(); loadAll().catch(() => {}); });
     es.addEventListener('settings', (e) => {
       const st = JSON.parse(e.data);
@@ -310,6 +311,20 @@
     el.hidden = !msg;
     el.classList.toggle('bad', bad);
     $('#certBannerText').innerHTML = msg;
+  }
+
+  // The Issues button (when an admin has turned issues on): open-issue count.
+  async function loadIssuesBadge() {
+    const btn = $('#issuesBtn');
+    if (!can('issues')) { btn.hidden = true; $('#issuesItem').hidden = true; return; }
+    try {
+      const s = await apiJson('/api/issues/summary');
+      btn.hidden = !s.enabled;
+      $('#issuesItem').hidden = !s.enabled;
+      const n = s.open || 0;
+      for (const b of [$('#issuesBadge'), $('#issuesBadge2')]) { b.hidden = !n; b.textContent = n > 999 ? '999+' : String(n); }
+      btn.title = s.enabled ? `Issues: ${n} open, ${s.ignored || 0} ignored, ${s.mine || 0} assigned to you` : '';
+    } catch { /* ignore */ }
   }
 
   async function loadIngest() {
@@ -1430,6 +1445,7 @@
     $('#liveToggle').hidden = !can('pause');
     $('#dDelete').hidden = !can('delete');
     $('#adminItem').hidden = !can('users');
+    $('#loadtestItem').hidden = !can('loadTest');
     $('#agentsItem').hidden = !can('checkin');
     $('#boxesItem').hidden = !can('boxes');
     $('#pwItem').hidden = S.me.kind !== 'session';
@@ -1845,6 +1861,8 @@
       if (act === 'password') changePassword();
       if (act === 'admin') window.CheckinAdmin?.open('users');
       if (act === 'agents') window.CheckinAgents?.open();
+      if (act === 'issues') location.href = '/issues';
+      if (act === 'loadtest') location.href = '/loadtest';
       // Phone-only shortcuts for the header buttons hidden on small screens
       if (act === 'm-pause') togglePause();
       if (act === 'm-import') $('#importFile').click();
@@ -2162,9 +2180,19 @@
     loadBoxes();
     await loadIngest();
     loadCertWarning();
+    loadIssuesBadge();
     setInterval(loadCertWarning, 30 * 60_000);
     connect();
     try { await loadAll(); } catch (e) { if (e.message !== 'API key required') toast('Could not load records: ' + e.message, 'error'); }
+    // /?record=<id> (links from the issues page) opens that device.
+    const params = new URLSearchParams(location.search);
+    const want = params.get('record');
+    const open = params.get('open');
+    if (want || open) history.replaceState(null, '', '/');
+    if (want) openDrawer(want);
+    // /?open=admin or /?open=agents (from the account menu on the Issues and Load test pages).
+    if (open === 'admin') window.CheckinAdmin?.open('users');
+    if (open === 'agents') window.CheckinAgents?.open();
     if (S.view.layout === 'activity') loadActivity();
   }
   window.CheckinUI = { api, apiJson, modal, closeModal, toast, esc, nf, relTime, absTime, initials, state: S, can, refreshCertWarning: loadCertWarning };

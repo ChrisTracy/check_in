@@ -1,8 +1,10 @@
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { HttpError } from '../store.js';
 import { ROLES, CAPS, can, capsFor, roleLevel } from './accounts.js';
 import { RateLimiter, sha256, encrypt, decrypt, verifyPassword, safeReturnTo } from './security.js';
 import { ROOT } from '../config.js';
+import { LOADTEST_TOKEN } from '../loadtest.js';
 
 const SESSION_COOKIE = 'ci_session';
 const OIDC_COOKIE = 'ci_oidc';
@@ -61,6 +63,12 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
       basicCache.set(cacheKey, { userId: u.id, exp: Date.now() + 5 * 60_000 });
       return userAuth(u, 'basic');
     }
+    // The load test's own simulated check-ins (app.inject only: a random per-process token).
+    const lt = req.headers['x-loadtest-token'];
+    if (lt && typeof lt === 'string' && lt.length === LOADTEST_TOKEN.length && req.ip === '127.0.0.1'
+      && crypto.timingSafeEqual(Buffer.from(lt), Buffer.from(LOADTEST_TOKEN))) {
+      return { kind: 'apikey', role: 'user', name: 'Load test', userId: null };
+    }
     // 3. API key
     const key = req.headers['x-api-key']
       || (/^bearer /i.test(header) ? header.slice(7).trim() : '')
@@ -75,7 +83,7 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
   // Resolve identity for every API / auth request.
   app.addHook('onRequest', async (req, reply) => {
     const url = req.url;
-    if (!url.startsWith('/api/') && !url.startsWith('/auth/') && url !== '/' && !url.startsWith('/?')) return;
+    if (!url.startsWith('/api/') && !url.startsWith('/auth/') && url !== '/' && !url.startsWith('/?') && url !== '/issues' && !url.startsWith('/issues?') && url !== '/loadtest' && !url.startsWith('/loadtest?')) return;
     try {
       req.auth = await resolve(req);
     } catch (e) {
@@ -107,9 +115,18 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
     if (accounts.count() === 0 || req.auth?.kind !== 'session') return reply.redirect('/login');
     return reply.sendFile('index.html');
   });
+  app.get('/loadtest', (req, reply) => {
+    if (accounts.count() === 0 || req.auth?.kind !== 'session') return reply.redirect('/login?returnTo=' + encodeURIComponent(req.url));
+    if (!can(req.auth.role, 'loadTest')) return reply.redirect('/');
+    return reply.sendFile('loadtest.html');
+  });
+  app.get('/issues', (req, reply) => {
+    if (accounts.count() === 0 || req.auth?.kind !== 'session') return reply.redirect('/login?returnTo=' + encodeURIComponent(req.url));
+    return reply.sendFile('issues.html');
+  });
   app.get('/login', (req, reply) => {
     const t = req.cookies?.[SESSION_COOKIE];
-    if (t && accounts.getSession(t) && !req.query.error) return reply.redirect('/');
+    if (t && accounts.getSession(t) && !req.query.error) return reply.redirect(safeReturnTo(req.query.returnTo));
     return reply.sendFile('login.html', path.join(ROOT, 'public'));
   });
 

@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#4f46e5">
+  <title>Check-In Issues</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><path d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app iss-app">
+  <header class="topbar">
+    <div class="brand">
+      <a class="logo" href="/" title="Back to the dashboard"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></a>
+      <div>
+        <h1>Issues</h1>
+        <div class="live" id="liveStatus"><span class="pulse"></span><span id="liveText">Connecting…</span></div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <a class="btn" href="/" id="dashLink"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span>Dashboard</span></a>
+      <button class="btn" id="rulesBtn" hidden><svg class="i" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span>Issue rules</span></button>
+      <div class="dropdown" id="exportWrap" hidden>
+        <button class="btn" id="exportBtn"><svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg><span>Export</span><svg class="i chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+        <div class="menu right" id="exportMenu">
+          <button data-export="issues"><b>Issues</b><small>One row per issue, with problems, notes and log</small></button>
+          <button data-export="log"><b>Issue log</b><small>One row per log entry and note</small></button>
+          <button data-export="issues-view"><b>Current list only</b><small>The issues matching the filters, one row each</small></button>
+        </div>
+      </div>
+      <button class="btn danger" id="clearBtn" hidden><svg class="i" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg><span>Clear issues</span></button>
+      <button class="icon-btn" id="themeBtn" title="Toggle theme"><svg class="i" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+      <div id="userMenuSlot"></div>
+    </div>
+  </header>
+
+  <div class="iss-off callout" id="offBox" hidden></div>
+
+  <section class="stats iss-stats" id="stats" hidden>
+    <button class="stat" data-q="open"><span class="label"><i class="dot stale"></i>Open</span><span class="value" id="sOpen">0</span><span class="sub">needs attention</span></button>
+    <button class="stat" data-q="unassigned"><span class="label">Unassigned</span><span class="value" id="sUnassigned">0</span><span class="sub">open or ignored</span></button>
+    <button class="stat" data-q="mine"><span class="label">Assigned to me</span><span class="value" id="sMine">0</span><span class="sub">open or ignored</span></button>
+    <button class="stat" data-q="ignored"><span class="label"><i class="dot aging"></i>Ignored</span><span class="value" id="sIgnored">0</span><span class="sub">snoozed for now</span></button>
+    <button class="stat" data-q="allclear" hidden><span class="label"><i class="dot fresh"></i>All clear</span><span class="value" id="sAllClear">0</span><span class="sub">waiting to be closed</span></button>
+    <button class="stat" data-q="closed"><span class="label"><i class="dot fresh"></i>Closed</span><span class="value" id="sClosed">0</span><span class="sub">kept until cleared</span></button>
+  </section>
+
+  <div class="iss-toolbar" id="toolbar" hidden>
+    <div class="seg text" id="statusSeg">
+      <button data-status="active">Active</button><button data-status="open">Open</button><button data-status="ignored">Ignored</button><button data-status="allclear" hidden>All clear</button><button data-status="closed">Closed</button><button data-status="all">All</button>
+    </div>
+    <label class="search"><svg class="i" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="search" placeholder="Device, problem, person or #id" autocomplete="off"></label>
+    <select class="select" id="assigneeFilter" title="Assigned to"></select>
+    <span class="muted iss-count" id="countText"></span>
+  </div>
+
+  <main class="iss-main" id="main" hidden>
+    <div class="iss-list" id="list"></div>
+    <div class="iss-more" id="moreWrap" hidden><button class="btn" id="moreBtn">Show more</button></div>
+  </main>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer iss-drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <div style="min-width:0">
+      <div class="eyebrow" id="dEyebrow">Issue</div>
+      <h2 id="dTitle"></h2>
+      <div class="muted" id="dSub"></div>
+    </div>
+    <button class="icon-btn" id="dClose" title="Close (Esc)"><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  </div>
+  <div class="iss-actions" id="dActions"></div>
+  <div class="drawer-body" id="dBody"></div>
+</aside>
+
+<div class="modal-back" id="modalBack" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <h3 id="mTitle"></h3>
+    <div id="mBody"></div>
+    <div class="modal-actions" id="mActions"></div>
+  </div>
+</div>
+<div class="toasts" id="toasts"></div>
+<script src="usermenu.js"></script>
+<script src="issues.js"></script>
+</body>
+</html>
