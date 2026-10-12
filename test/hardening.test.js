@@ -312,3 +312,9 @@ test('dashboard: a failed first load retries by itself instead of leaving the ta
   assert.ok(!js.includes("toast('Could not load records: '"), 'no vanishing toast for this error');
   assert.match(js, /if \(S\.loaded \|\| loadingAll\) return;/);               // never a second parallel download
 });
+
+test('issues page: every visit opens on Open, whatever status filter was used last time', () => {
+  const js = fs.readFileSync(new URL('../public/issues.js', import.meta.url), 'utf8');
+  assert.match(js, /status: 'open', q: ''/);
+  assert.ok(!js.includes("local.get('issues.status'") && !js.includes("local.set('issues.status'"), 'the status filter is no longer saved');
+});

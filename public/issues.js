@@ -39,7 +39,7 @@
 
   const S = {
     me: null, cfg: null, users: null, fields: [],
-    status: local.get('issues.status', 'open'), q: '', assignee: local.get('issues.assignee', ''),
+    status: 'open', q: ''  /* every visit starts on Open; the status filter is not remembered */, assignee: local.get('issues.assignee', ''),
     issues: [], total: 0, summary: {}, want: 200, // how many rows of the list are loaded (Show more adds a page)
     openId: null, detail: null, connected: false,
   };
@@ -745,7 +745,7 @@
     $('#statusSeg').addEventListener('click', (e) => {
       const b = e.target.closest('[data-status]');
       if (!b) return;
-      S.status = b.dataset.status; local.set('issues.status', S.status);
+      S.status = b.dataset.status;
       syncControls(); loadList({ reset: true });
     });
     let t;
@@ -757,7 +757,7 @@
       if (q === 'unassigned') { S.status = 'active'; S.assignee = 'none'; }
       else if (q === 'mine') { S.status = 'active'; S.assignee = 'me'; }
       else { S.status = q; S.assignee = ''; }
-      local.set('issues.status', S.status); local.set('issues.assignee', S.assignee);
+      local.set('issues.assignee', S.assignee);
       syncControls(); loadList({ reset: true });
     });
     $('#moreBtn').addEventListener('click', loadMore);
