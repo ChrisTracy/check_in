@@ -2,7 +2,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { HttpError } from '../store.js';
 import { ROLES, CAPS, can, capsFor, roleLevel } from './accounts.js';
-import { RateLimiter, sha256, encrypt, decrypt, verifyPassword, safeReturnTo } from './security.js';
+import { RateLimiter, sha256, encrypt, decrypt, verifyPassword, safeReturnTo, safeProto } from './security.js';
 import { ROOT } from '../config.js';
 import { LOADTEST_TOKEN } from '../loadtest.js';
 
@@ -26,11 +26,11 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
   const loginLimiter = new RateLimiter({ max: 10, windowMs: 15 * 60_000 });
   const basicCache = new Map(); // sha256(header) -> { userId, exp }
 
-  const secureCookie = (req) => (config.cookieSecure === 'auto' ? req.protocol === 'https' : config.cookieSecure === 'true');
+  const secureCookie = (req) => (config.cookieSecure === 'auto' ? safeProto(req) === 'https' : config.cookieSecure === 'true');
   const setSessionCookie = (req, reply, token) => reply.setCookie(SESSION_COOKIE, token, {
     path: '/', httpOnly: true, sameSite: 'lax', secure: secureCookie(req), maxAge: Math.floor(accounts.ttlMs / 1000),
   });
-  const baseUrl = (req) => accounts.sso().publicUrl || `${req.protocol}://${req.headers.host}`;
+  const baseUrl = (req) => accounts.sso().publicUrl || `${safeProto(req)}://${req.headers.host}`;
   const redirectUri = (req) => `${baseUrl(req)}/auth/oidc/callback`;
 
   function userAuth(u, kind, extra = {}) {
@@ -48,17 +48,24 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
     // 2. HTTP Basic (local accounts)
     if (/^basic /i.test(header)) {
       const ip = req.ip;
-      const cacheKey = sha256(header);
-      const hit = basicCache.get(cacheKey);
-      if (hit && hit.exp > Date.now()) {
-        const u = accounts.get(hit.userId);
-        if (u && !u.disabled) return userAuth(u, 'basic');
-      }
-      if (loginLimiter.blocked('ip:' + ip)) throw new HttpError(429, 'Too many failed sign-in attempts. Try again later.');
       const raw = Buffer.from(header.slice(6).trim(), 'base64').toString('utf8');
       const i = raw.indexOf(':');
-      const u = i > 0 ? await accounts.verifyLogin(raw.slice(0, i), raw.slice(i + 1)) : null;
-      if (!u) { loginLimiter.fail('ip:' + ip); throw Object.assign(new HttpError(401, 'Invalid username or password'), { basic: true }); }
+      // Cache on the decoded credentials, not the header text, so "basic" vs "Basic", spacing
+      // or padding variations can't force a fresh (slow) password check every time.
+      const cacheKey = sha256(i > 0 ? raw.slice(0, i).toLowerCase() + '\0' + raw.slice(i + 1) : raw);
+      const hit = basicCache.get(cacheKey);
+      // "Password sign-in: admins only" applies to HTTP Basic too (it's a password sign-in).
+      const passwordAllowed = (u) => accounts.passwordLogin !== 'admins' || u.role === 'admin';
+      if (hit && hit.exp > Date.now()) {
+        const u = accounts.get(hit.userId);
+        if (u && !u.disabled && passwordAllowed(u)) return userAuth(u, 'basic');
+      }
+      // Checks in progress count against the limit, so parallel guesses can't all get in first.
+      const g = await loginLimiter.guard(['ip:' + ip], () => (i > 0 ? accounts.verifyLogin(raw.slice(0, i), raw.slice(i + 1)) : null));
+      if (g.blocked) throw new HttpError(429, 'Too many failed sign-in attempts. Try again later.');
+      const u = g.result;
+      if (!u) throw Object.assign(new HttpError(401, 'Invalid username or password'), { basic: true });
+      if (!passwordAllowed(u)) throw new HttpError(403, 'Password sign-in is limited to admins on this server. Use single sign-on.');
       if (basicCache.size > 1000) basicCache.clear();
       basicCache.set(cacheKey, { userId: u.id, exp: Date.now() + 5 * 60_000 });
       return userAuth(u, 'basic');
@@ -152,28 +159,45 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
     };
   });
 
+  // Sign-in and setup only take JSON: a form on another site can't send that, so it can't sign a
+  // visitor into someone else's account or claim a fresh install (login CSRF).
+  const requireJson = (req) => {
+    const ct = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    if (ct !== 'application/json') throw new HttpError(415, 'Send JSON (Content-Type: application/json)');
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) throw new HttpError(400, 'Body must be a JSON object');
+  };
+
+  // One setup at a time: password hashing is slow, so without this, parallel requests could all
+  // pass the "no users yet" check and each create an admin.
+  let setupBusy = false;
   app.post('/api/auth/setup', { config: { cap: 'public' } }, async (req, reply) => {
+    requireJson(req);
     if (accounts.count() > 0) throw new HttpError(409, 'Setup has already been completed');
-    const { username, password, name } = req.body || {};
+    if (setupBusy) throw new HttpError(409, 'Setup is already in progress');
+    const { username, password, name } = req.body;
     if (!password) throw new HttpError(400, 'Password is required');
-    const u = await accounts.create({ username, password, name, role: 'admin' });
+    setupBusy = true;
+    let u;
+    try {
+      if (accounts.count() > 0) throw new HttpError(409, 'Setup has already been completed');
+      u = await accounts.create({ username, password, name, role: 'admin' });
+    } finally {
+      setupBusy = false;
+    }
     const { token } = accounts.createSession(u.id, 'password');
     setSessionCookie(req, reply, token);
     return { ok: true };
   });
 
   app.post('/api/auth/login', { config: { cap: 'public' } }, async (req, reply) => {
-    const { username, password } = req.body || {};
+    requireJson(req);
+    const { username, password } = req.body;
     const key = 'login:' + req.ip + ':' + String(username || '').toLowerCase();
-    if (loginLimiter.blocked(key) || loginLimiter.blocked('ip:' + req.ip)) {
-      throw new HttpError(429, 'Too many failed sign-in attempts. Wait a few minutes and try again.');
-    }
-    const u = await accounts.verifyLogin(username, password);
-    if (!u) {
-      loginLimiter.fail(key);
-      loginLimiter.fail('ip:' + req.ip);
-      throw new HttpError(401, 'Incorrect username or password');
-    }
+    // Checks in progress count against the limit, so parallel guesses can't all get in first.
+    const g = await loginLimiter.guard([key, 'ip:' + req.ip], () => accounts.verifyLogin(username, password));
+    if (g.blocked) throw new HttpError(429, 'Too many failed sign-in attempts. Wait a few minutes and try again.');
+    const u = g.result;
+    if (!u) throw new HttpError(401, 'Incorrect username or password');
     if (accounts.passwordLogin === 'admins' && u.role !== 'admin') {
       throw new HttpError(403, 'Password sign-in is turned off. Use single sign-on.');
     }

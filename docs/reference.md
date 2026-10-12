@@ -45,7 +45,7 @@ To load some sample data, run `API_KEY=<key> npm run seed` (PowerShell: `$env:AP
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | *(empty)* | Creates the first admin automatically if no users exist |
 | `APP_SECRET` | *(generated)* | Encrypts the stored SSO client secret and sign-in cookies. If empty, a random one is saved to `data/.app-secret`. Back that file up with the database |
 | `SESSION_TTL_HOURS` | `12` | Browser sign-in lifetime, extended while in use |
-| `TRUST_PROXY` | *(empty)* | Set (`true`, a hop count, or proxy IPs) when behind a reverse proxy / load balancer, so HTTPS and client IPs are detected |
+| `TRUST_PROXY` | *(empty)* | Set when behind a reverse proxy / load balancer, so HTTPS and client IPs are detected: the number of proxies in front of the app (`1` for a single Caddy / nginx / Traefik), or the proxies' addresses (`10.0.0.0/8,172.16.0.0/12`). `true` means `1`. Only the address the last trusted proxy saw is believed, so a client can't fake its address with its own `X-Forwarded-For`. With a hop count, the proxy right in front of the app must connect from a private or loopback address (Docker networks, the host, a LAN); if yours connects from a public address, list its address instead |
 | `HTTPS_PORT` | `3443` | Port for the built-in HTTPS server (only used when HTTPS is turned on in Admin → HTTPS) |
 | `TLS_DIR` | `data/tls` | Where certificates are stored (next to the database by default, so inside the Docker volume) |
 | `TLS_DISABLE` | `false` | Break-glass: `true` forces HTTP only, ignoring saved HTTPS settings |
@@ -82,7 +82,8 @@ Things to know:
 - **Use a named volume, not a Windows folder bind mount.** SQLite's WAL file locking is unreliable on host folders bind-mounted through Docker Desktop. The compose file already uses the named volume `checkin-data`.
 - **Set `APP_SECRET`** in production. Otherwise a secret is generated in the volume (`/app/data/.app-secret`) and must be backed up with the database, or the stored SSO client secret can't be decrypted.
 - **No reverse proxy?** Use [built-in HTTPS](#built-in-https) and publish port 3443 too.
-- **Behind a reverse proxy or load balancer** (nginx, Traefik, Azure App Gateway and so on) that terminates HTTPS: set `TRUST_PROXY=true` (or the hop count), and set **Public URL** in Admin → Single sign-on, so cookies are marked Secure and the Entra redirect URI uses your public `https://` address. Server-Sent Events (live updates) need response buffering turned off for `/api/events`. The app sends `X-Accel-Buffering: no` for nginx.
+- **Proxies and client addresses:** with `TRUST_PROXY` set to a hop count, the server takes the client address the last proxy added and ignores anything further left in `X-Forwarded-For`, which a client could write itself. That address is what port checks probe and what deploy-key allow lists and sign-in rate limits use, so set the count to exactly the number of proxies. `X-Forwarded-Proto` is only accepted as `http` or `https`.
+- **Behind a reverse proxy or load balancer** (nginx, Traefik, Azure App Gateway and so on) that terminates HTTPS: set `TRUST_PROXY=1` (the number of proxies in front of the app), and set **Public URL** in Admin → Single sign-on, so cookies are marked Secure and the Entra redirect URI uses your public `https://` address. Server-Sent Events (live updates) need response buffering turned off for `/api/events`. The app sends `X-Accel-Buffering: no` for nginx.
 - **Backups:** stop the container (or accept a crash-consistent copy), then archive the volume:
   ```bash
   docker compose stop
@@ -229,6 +230,14 @@ Upgrading from a version where check-ins were open: if the database already has 
 
 Failed sign-ins are rate-limited (10 attempts per 15 minutes per IP and username). Passwords are hashed with scrypt, the API key is stored as a SHA-256 hash, and the SSO client secret is encrypted with AES-256-GCM.
 
+
+Sign-in protections:
+
+- Failed sign-ins are limited per address and username (and per address). Each attempt is counted before the password is checked, so sending many guesses at once doesn't get around the limit. HTTP Basic counts the same way.
+- `POST /api/auth/login` and `/api/auth/setup` only accept JSON, so a page on another site can't sign a visitor into a different account or complete setup on a fresh server.
+- First-run setup runs one request at a time, so only one first admin can be created.
+- With **password sign-in limited to admins**, HTTP Basic is limited too: other users get `403` and must use single sign-on.
+- After sign-in, `returnTo` only allows a path on this site (anything that would end up as `//host` or contain `\` goes to `/`).
 ### Managing users (Admin → Users)
 
 - **Add user**: give them a username, role and password. Or choose *Single sign-on only*: the account is linked on their first Microsoft sign-in when their Entra sign-in name (UPN) matches its username or email. From then on the account is tied to their Entra object ID.

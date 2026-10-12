@@ -10,7 +10,10 @@
     if (value.startsWith('//') || /[\\\x00-\x1f\x7f]/.test(value)) return '/';
     try {
       const u = new URL(value, location.origin);
-      return u.origin === location.origin ? u.pathname + u.search + u.hash : '/';
+      const out = u.pathname + u.search + u.hash;
+      // "/.//evil.com" normalises to "//evil.com" (another site): check the result too.
+      if (u.origin !== location.origin || !out.startsWith('/') || out.startsWith('//') || out.includes('\\')) return '/';
+      return out;
     } catch { return '/'; }
   }
 

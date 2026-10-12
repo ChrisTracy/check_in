@@ -3,6 +3,7 @@ import path from 'node:path';
 import https from 'node:https';
 import tls from 'node:tls';
 import crypto from 'node:crypto';
+import { safeProto } from './auth/security.js';
 import { HttpError } from './store.js';
 import { encrypt, decrypt } from './auth/security.js';
 
@@ -396,7 +397,7 @@ export class TlsManager {
   /** Should this plain-HTTP request be sent to HTTPS? */
   redirectTarget(req) {
     if (this.mode !== 'redirect' || !this.listening) return null;
-    if (req.protocol === 'https') return null; // already HTTPS (directly or via a trusted proxy)
+    if (safeProto(req) === 'https') return null; // already HTTPS (directly or via a trusted proxy)
     const url = req.url;
     if (url === '/health' || url.startsWith('/health?')) return null; // keep container health checks on HTTP
     if (url.startsWith('/.well-known/acme-challenge/')) return null; // Let's Encrypt checks over plain HTTP

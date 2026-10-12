@@ -14,6 +14,7 @@ import { HttpError, normalizeInput } from './store.js';
 import { csvRow, parseCsv, decodeCell } from './csv.js';
 import { ROOT } from './config.js';
 import { registerAuth } from './auth/plugin.js';
+import { trustProxyOption, safeProto } from './auth/security.js';
 import { TlsManager } from './tls.js';
 import { CertDeployKeys } from './certdeploy.js';
 import { AcmeManager, registerAcme } from './acme.js';
@@ -95,7 +96,7 @@ export function buildApp({ config, store, accounts, oidc }) {
   const app = Fastify({
     logger: config.logLevel === 'silent' ? false : { level: config.logLevel },
     bodyLimit: config.bodyLimitMb * 1024 * 1024,
-    trustProxy: config.trustProxy,
+    trustProxy: trustProxyOption(config.trustProxy),
     serverFactory: (h) => {
       handler = h;
       const server = http.createServer(h);
@@ -139,7 +140,7 @@ export function buildApp({ config, store, accounts, oidc }) {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'same-origin');
     reply.header('X-Frame-Options', 'DENY');
-    if (req.protocol === 'https' && tlsManager.settings().hsts && tlsManager.mode !== 'off') {
+    if (safeProto(req) === 'https' && tlsManager.settings().hsts && tlsManager.mode !== 'off') {
       reply.header('Strict-Transport-Security', 'max-age=31536000');
     }
     return payload;

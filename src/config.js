@@ -25,9 +25,14 @@ const int = (v, d) => {
   return Number.isFinite(n) ? n : d;
 };
 
-function parseTrustProxy(v) {
-  if (!v) return false;
-  if (v === 'true') return true;
+export function parseTrustProxy(v) {
+  if (!v || v === 'false') return false;
+  // "true" used to mean "trust every X-Forwarded-For entry", so a client could put any address
+  // first and be believed (port checks, deploy-key IP limits, rate limits). It now means one
+  // proxy hop, which is right for a single reverse proxy (Caddy, nginx, Traefik). For a chain,
+  // set the number of proxies or their addresses (e.g. 2, or 10.0.0.0/8,172.16.0.0/12).
+  // Hop counts become a trust function in trustProxyOption (src/auth/security.js).
+  if (v === 'true') return 1;
   if (/^\d+$/.test(v)) return Number(v);
   return v;
 }

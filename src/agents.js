@@ -56,7 +56,8 @@ export function siteUrl(req, override) {
   }
   const host = String(req.host || req.headers.host || '');
   if (!/^[A-Za-z0-9.\-[\]:]{1,255}$/.test(host)) throw new BadOption('Could not work out this server\'s address; add ?url=https://your-server');
-  return `${req.protocol}://${host}`;
+  // Never echo X-Forwarded-Proto as-is: it lands inside the generated installer scripts.
+  return `${String(req.protocol || '').trim().toLowerCase() === 'https' ? 'https' : 'http'}://${host}`;
 }
 
 /** Validate install options. Values end up inside generated scripts, so only safe characters are allowed. */
