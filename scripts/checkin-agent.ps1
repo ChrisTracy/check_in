@@ -47,7 +47,7 @@
   Use single quotes in PowerShell so the reference is stored, not today's value.
 .PARAMETER CheckPorts
   With each check-in, ask the server to test these TCP ports on this computer (e.g. 3389) and save
-  port_3389 = open / closed on its record. Needs port checks turned on (dashboard: Admin → Port checks).
+  port_3389 = open / closed on its record. Needs port checks turned on (dashboard: Admin > Port checks).
 .PARAMETER PortCheck
   Just ask the server whether these ports on this computer are reachable from it, print the answer
   and exit (exit code 0 = all open, 3 = some not open). Sends no check-in.
@@ -120,7 +120,7 @@ $DefaultFields = 'default'       # field groups to send: default, all, or e.g. c
 $DefaultExclude = ''             # field groups to skip
 $DefaultExtra = ''               # extra fields, e.g. 'site=Dallas,owner=%OWNER%' (see -Extra)
 $DefaultEvery = 5                # minutes between runs when installing (1-1439)
-$DefaultCheckPorts = ''          # ports the server tests on each check-in, e.g. '3389' (needs Admin → Port checks)
+$DefaultCheckPorts = ''          # ports the server tests on each check-in, e.g. '3389' (needs Admin > Port checks)
 # What "default" means (the groups sent when nothing else is chosen):
 $DefaultGroups = @('system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 'domain', 'users', 'health')
 # ----------------------------------------------------------------------------------------------
@@ -662,7 +662,7 @@ switch ($r.Status) {
     $lines = @("Checked in as $($data['id']) ($how, $($data.Count) fields).")
     if ($PortsEachRun) {
       try { $res = $r.Body | ConvertFrom-Json } catch { $res = $null }
-      if ($res.portCheck -eq 'off') { $lines += '  port checks are turned off on the server (Admin → Port checks)' }
+      if ($res.portCheck -eq 'off') { $lines += '  port checks are turned off on the server (Admin > Port checks)' }
       elseif ($res.ports) { $lines += Format-Ports $res.ports }
       elseif ($res.portCheckError) { $lines += "  port check: $($res.portCheckError)" }
     }

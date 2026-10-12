@@ -143,6 +143,6 @@ export function registerPortCheck(app, { portChecker }) {
   app.post('/api/portcheck', { config: { cap: 'checkin' } }, handler);
 
   const admin = { config: { cap: 'portCheckPolicy' } };
-  app.get('/api/admin/portcheck', admin, async (req) => ({ ...portChecker.settings, yourAddress: callerAddress(req), stats: portChecker.stats }));
+  app.get('/api/admin/portcheck', { config: { cap: 'settingsView' } }, async (req) => ({ ...portChecker.settings, yourAddress: callerAddress(req), stats: portChecker.stats }));
   app.put('/api/admin/portcheck', admin, async (req) => ({ ...portChecker.update(req.body || {}), yourAddress: callerAddress(req), stats: portChecker.stats }));
 }

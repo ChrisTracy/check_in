@@ -4,7 +4,7 @@ import https from 'node:https';
 import tls from 'node:tls';
 import crypto from 'node:crypto';
 import net from 'node:net';
-import { safeProto } from './auth/security.js';
+import { safeProto, HOST_RE } from './auth/security.js';
 import { HttpError } from './store.js';
 import { encrypt, decrypt } from './auth/security.js';
 
@@ -445,7 +445,11 @@ export class TlsManager {
     if (url === '/health' || url.startsWith('/health?')) return null; // keep container health checks on HTTP
     if (url.startsWith('/.well-known/acme-challenge/')) return null; // Let's Encrypt checks over plain HTTP
     const port = this.publicPort;
-    const host = (req.hostname || 'localhost').replace(/:\d+$/, '');
+    // The Host header is the caller's to choose: only redirect to something that is a plain host name,
+    // never to what could be a user name, path or another site (a@evil.com, evil.com/@x ...).
+    const rawHost = String(req.hostname || req.headers.host || '');
+    if (!HOST_RE.test(rawHost.replace(/_/g, 'x'))) return false; // underscores are harmless and common in intranet names
+    const host = rawHost.replace(/:\d+$/, '');
     return `https://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}${port === 443 ? '' : ':' + port}${url}`;
   }
 }

@@ -2,7 +2,7 @@
 // Usage: node scripts/loadtest.js [url] [connections] [seconds] [distinctIds]
 // Set API_KEY in the environment if the server requires one.
 // Set CHECK_PORTS=45389 (for example) to add check_ports to every check-in, so the server also tests
-// that port on this machine each time (port checks must be on in Admin → Port checks, and the
+// that port on this machine each time (port checks must be on in Admin > Port checks, and the
 // per-address limit raised there, since every request comes from this one address).
 import http from 'node:http';
 import https from 'node:https';

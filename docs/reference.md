@@ -41,12 +41,12 @@ To load some sample data, run `API_KEY=<key> npm run seed` (PowerShell: `$env:AP
 | `HOST` | `0.0.0.0` | Interface to bind |
 | `DB_PATH` | `data/checkin.db` | SQLite file (created automatically) |
 | `HISTORY_LIMIT` | `100` | History entries kept **per record**. `0` turns history off, `-1` keeps everything. If you lower it, existing history is trimmed at the next startup. |
-| `API_KEY` | *(empty)* | The API key to use on **first start** (otherwise one is generated). If a key saved by an older version matches it, that key becomes viewable. After that, manage it on the Add Device page or in **Admin → API key** |
+| `API_KEY` | *(empty)* | The API key to use on **first start** (otherwise one is generated). If a key saved by an older version matches it, that key becomes viewable. After that, manage it on the Add Device page or in **Settings → API key** |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | *(empty)* | Creates the first admin automatically if no users exist |
 | `APP_SECRET` | *(generated)* | Encrypts the stored SSO client secret and sign-in cookies. If empty, a random one is saved to `data/.app-secret`. Back that file up with the database |
 | `SESSION_TTL_HOURS` | `12` | Browser sign-in lifetime, extended while in use |
 | `TRUST_PROXY` | *(empty)* | Set when behind a reverse proxy / load balancer, so HTTPS and client IPs are detected: the number of proxies in front of the app (`1` for a single Caddy / nginx / Traefik), or the proxies' addresses (`10.0.0.0/8,172.16.0.0/12`). `true` means `1`. Only the address the last trusted proxy saw is believed, so a client can't fake its address with its own `X-Forwarded-For`. With a hop count, the proxy right in front of the app must connect from a private or loopback address (Docker networks, the host, a LAN); if yours connects from a public address, list its address instead |
-| `HTTPS_PORT` | `3443` | Port for the built-in HTTPS server (only used when HTTPS is turned on in Admin → HTTPS) |
+| `HTTPS_PORT` | `3443` | Port for the built-in HTTPS server (only used when HTTPS is turned on in Settings → HTTPS) |
 | `TLS_DIR` | `data/tls` | Where certificates are stored (next to the database by default, so inside the Docker volume) |
 | `TLS_DISABLE` | `false` | Break-glass: `true` forces HTTP only, ignoring saved HTTPS settings |
 | `COOKIE_SECURE` | `auto` | `auto` marks cookies Secure on HTTPS requests; or force `true` / `false` |
@@ -83,7 +83,7 @@ Things to know:
 - **Set `APP_SECRET`** in production. Otherwise a secret is generated in the volume (`/app/data/.app-secret`) and must be backed up with the database, or the stored SSO client secret can't be decrypted.
 - **No reverse proxy?** Use [built-in HTTPS](#built-in-https) and publish port 3443 too.
 - **Proxies and client addresses:** with `TRUST_PROXY` set to a hop count, the server takes the client address the last proxy added and ignores anything further left in `X-Forwarded-For`, which a client could write itself. That address is what port checks probe and what deploy-key allow lists and sign-in rate limits use, so set the count to exactly the number of proxies. `X-Forwarded-Proto` is only accepted as `http` or `https`.
-- **Behind a reverse proxy or load balancer** (nginx, Traefik, Azure App Gateway and so on) that terminates HTTPS: set `TRUST_PROXY=1` (the number of proxies in front of the app), and set **Public URL** in Admin → Single sign-on, so cookies are marked Secure and the Entra redirect URI uses your public `https://` address. Server-Sent Events (live updates) need response buffering turned off for `/api/events`. The app sends `X-Accel-Buffering: no` for nginx.
+- **Behind a reverse proxy or load balancer** (nginx, Traefik, Azure App Gateway and so on) that terminates HTTPS: set `TRUST_PROXY=1` (the number of proxies in front of the app), and set **Public URL** in Settings → Single sign-on, so cookies are marked Secure and the Entra redirect URI uses your public `https://` address. Server-Sent Events (live updates) need response buffering turned off for `/api/events`. The app sends `X-Accel-Buffering: no` for nginx.
 - **Backups:** stop the container (or accept a crash-consistent copy), then archive the volume:
   ```bash
   docker compose stop
@@ -120,7 +120,7 @@ To run a published image instead of building locally, replace `build: .` in `doc
 
 ## Built-in HTTPS
 
-If the app can't sit behind a reverse proxy or load balancer, it can serve HTTPS itself. Everything is configured in **Admin → HTTPS** (admins only), and certificates are saved in the data volume (`data/tls`), so they survive container rebuilds.
+If the app can't sit behind a reverse proxy or load balancer, it can serve HTTPS itself. Everything is configured in **Settings → HTTPS** (admins only), and certificates are saved in the data volume (`data/tls`), so they survive container rebuilds.
 
 1. **Install a certificate**, in one of three ways:
    - **PEM files:** the certificate (with intermediates after it, as a full chain) plus the private key. Encrypted keys are accepted with their password and stored decrypted, as nginx does.
@@ -131,7 +131,7 @@ If the app can't sit behind a reverse proxy or load balancer, it can serve HTTPS
 2. **Choose a mode:**
    - **Off:** HTTP only (the default).
    - **HTTPS and HTTP:** both work, which is handy while moving devices over.
-   - **HTTPS only:** HTTP gets a `307` redirect to HTTPS. A 307 keeps POST bodies, so check-ins that follow redirects still work. `/health` stays on HTTP for container health checks.
+   - **HTTPS only:** HTTP gets a `307` redirect to HTTPS. A 307 keeps POST bodies, so check-ins that follow redirects still work. `/health` stays on HTTP for container health checks. The redirect only goes to a plain host name taken from the `Host` header; anything else (for example `a@evil.com` or `evil.com/@x`) gets a `400` instead.
 3. Optionally turn on **HSTS**, and set **Public HTTPS port** if clients reach the server on a different port than it listens on (for example `443` mapped to `3443`).
 
 Notes:
@@ -143,11 +143,11 @@ Notes:
 - Minimum protocol is TLS 1.2.
 - **Locked out?** Start with `TLS_DISABLE=true` to force HTTP only, fix the settings, then remove the variable.
 - **Docker:** the container listens for HTTPS on `3443`. Publish it with `PUBLISH_HTTPS_PORT=443` in `.env` (compose maps `443:3443`). The container runs as a non-root user, so it can't bind port 443 itself. Set **Public HTTPS port** to `443` so redirects point at the right port.
-- Using Entra sign-in over HTTPS? Set **Public URL** in Admin → Single sign-on to your `https://` address, and register that redirect URI in Entra.
+- Using Entra sign-in over HTTPS? Set **Public URL** in Settings → Single sign-on to your `https://` address, and register that redirect URI in Entra.
 
 ### Automatic certificates (Let's Encrypt)
 
-**Admin → HTTPS → Automatic certificate** gets a free certificate from Let's Encrypt (or any ACME CA) and renews it by itself. It uses the **HTTP-01** check: the CA fetches `http://<domain>/.well-known/acme-challenge/<token>` on **port 80**, so:
+**Settings → HTTPS → Automatic certificate** gets a free certificate from Let's Encrypt (or any ACME CA) and renews it by itself. It uses the **HTTP-01** check: the CA fetches `http://<domain>/.well-known/acme-challenge/<token>` on **port 80**, so:
 
 - each domain must resolve to this server from the internet, and
 - port 80 must reach the app's HTTP port. With Docker Compose that means `PUBLISH_PORT=80` (maps `80:3000`). Behind a firewall or NAT, forward port 80.
@@ -169,7 +169,7 @@ How it behaves:
 
 If certificates come from somewhere else, such as certbot or acme.sh with DNS-01, a CI job, or a key vault, a **deploy key** lets that tool push the new certificate. A deploy key can **only replace the HTTPS certificate**. It can't read records or change any other setting, and it isn't the device API key.
 
-Create one in **Admin → HTTPS → Deploy keys**. It is shown once and stored as a SHA-256 hash. You can limit it to addresses or ranges (`10.0.0.5, 10.0.0.0/24, 2001:db8::/48`). Behind a reverse proxy, set `TRUST_PROXY` so the server sees the real client address. Keys can be renamed, re-scoped or revoked at any time, and each key shows when and from where it was last used.
+Create one in **Settings → HTTPS → Deploy keys**. It is shown once and stored as a SHA-256 hash. You can limit it to addresses or ranges (`10.0.0.5, 10.0.0.0/24, 2001:db8::/48`). Behind a reverse proxy, set `TRUST_PROXY` so the server sees the real client address. Keys can be renamed, re-scoped or revoked at any time, and each key shows when and from where it was last used.
 
 ```bash
 # PEM: certificate chain + key in one body
@@ -193,7 +193,7 @@ JSON works too: `{ "cert": "<PEM chain>", "key": "<PEM key>" }` or `{ "pfx": "<b
 
 ### Certificate history
 
-**Admin → HTTPS → Certificate history** lists the last 50 certificate changes and attempts: uploads, deploy-key pushes (with the key name and address), Let's Encrypt issues and failures, and files picked up from `data/tls`.
+**Settings → HTTPS → Certificate history** lists the last 50 certificate changes and attempts: uploads, deploy-key pushes (with the key name and address), Let's Encrypt issues and failures, and files picked up from `data/tls`.
 
 ## Users, roles and sign-in
 
@@ -206,7 +206,7 @@ JSON works too: `{ "cert": "<PEM chain>", "key": "<PEM key>" }` or `{ "pfx": "<b
 | Check in (API) | | ✓ | ✓ | ✓ |
 | Import CSV, export CSV | | ✓ | ✓ | ✓ |
 | Delete records (single or multi-select) | | ✓ | ✓ | ✓ |
-| **Clear all**, pause/resume check-ins, change the active threshold, create/edit/delete team views, set up status boxes | | | ✓ | ✓ |
+| **Reset** (clear dashboard, incidents or all), pause/resume check-ins, change the active threshold, create/edit/delete team views, set up status boxes | | | ✓ | ✓ |
 | See issues (when an admin has turned them on) | ✓ | ✓ | ✓ | ✓ |
 | Assign, ignore and close issues; add notes; export issues | | ✓ | ✓ | ✓ |
 | Define issue rules and the reassign window; clear the issues list; delete anyone's notes | | | ✓ | ✓ |
@@ -224,9 +224,11 @@ The active threshold is now a shared, server-side setting. When a power user cha
 | **HTTP Basic** | Scripts that should act as a specific user | `curl -u alice:password …`. The script gets that user's role |
 | **API key** | Devices and services | `X-API-Key: <key>`, `Authorization: Bearer <key>` or `?api_key=<key>`. The key acts as a **User** |
 
-Check-ins **require the API key** by default (or a user with at least the User role). A key is generated on first start and stored encrypted. **Power users and admins** can see and regenerate it on the **Add Device** page, which fills it into the install command, and in **Admin → API key**. Only **admins** can use their own key or turn the requirement off. A custom key must be 16 to 256 printable ASCII characters (letters, numbers, punctuation) with no spaces, so every device can send it in a header or URL. Reading data always requires sign-in, Basic auth or the key.
+Check-ins **require the API key** by default (or a user with at least the User role). A key is generated on first start and stored encrypted. **Power users and admins** can see and regenerate it on the **Add Device** page, which fills it into the install command, and in **Settings → API key**. Only **admins** can use their own key or turn the requirement off. A custom key must be 16 to 256 printable ASCII characters (letters, numbers, punctuation) with no spaces, so every device can send it in a header or URL. Reading data always requires sign-in, Basic auth or the key.
 
 Upgrading from a version where check-ins were open: if the database already has records and no key, check-ins stay open so your devices keep working, and a key is generated so an admin can turn the requirement on. A key saved by an older version can't be shown (only its hash was stored); start once with `API_KEY` set to it, or regenerate it.
+
+Usernames are limited to 128 characters and passwords to 256, and sign-in requests to 16 KB (longer ones are refused before anything is hashed or remembered). The server also sends a `Content-Security-Policy` that only allows scripts from the app itself (no inline scripts, no `eval`), no plugins, no framing, and form posts and connections only to the same site; styles and `data:` images are allowed for the pages' own styling and icons.
 
 Failed sign-ins are rate-limited: 10 failed attempts per 15 minutes per IP address and username, and 50 per IP address in total (so one person's typos don't lock out an office behind one address). A successful sign-in resets that username's count. Passwords are hashed with scrypt, the API key is stored as a SHA-256 hash, and the SSO client secret is encrypted with AES-256-GCM.
 
@@ -238,7 +240,17 @@ Sign-in protections:
 - First-run setup runs one request at a time, so only one first admin can be created.
 - With **password sign-in limited to admins**, HTTP Basic is limited too: other users get `403` and must use single sign-on.
 - After sign-in, `returnTo` only allows a path on this site (anything that would end up as `//host` or contain `\` goes to `/`).
-### Managing users (Admin → Users)
+### Settings
+
+Everything lives in one **Settings** panel, opened from the account menu (top right) or by clicking the **Live** indicator (which opens **Check-ins**).
+
+- **General** (everyone): **Preferences** (theme, compact rows, change or set your password) and **Check-ins** (pause and resume check-ins, the active threshold, the history limit).
+- **Administration** (power users and admins): Users, Single sign-on, API key, Port checks, Issues, HTTPS, **Load test** (admins) and **Reset**. Reset has **Clear dashboard** (all records and history), **Clear incidents** (all issues) and **Clear all** (both); each asks you to type CLEAR.
+- Anything your role can't change is shown **greyed out** with a *View only* note, so power users can see how the server is set up without being able to change admin settings. Users and readers see only the General section, where Pause and the threshold are greyed out.
+
+**Navigation and the account menu.** The header has page tabs in the centre (**Dashboard** and **Issues**, with the number of open issues on the Issues tab). The tabs appear once an admin turns Issues on, so there is never a single tab. The account menu (click your name, top right) is ordered by purpose: your data (**Import CSV**, **Export current view**, **Export all records**, **Export full history**), what to manage (Add Device, Status boxes), your account (Settings), and Sign out last and apart. On the Issues page the data group exports issues, the issue log or the current list instead. On a phone the tabs sit on their own row under the logo, and the menu also has the dark-mode toggle.
+
+### Managing users (Settings → Users)
 
 - **Add user**: give them a username, role and password. Or choose *Single sign-on only*: the account is linked on their first Microsoft sign-in when their Entra sign-in name (UPN) matches its username or email. From then on the account is tied to their Entra object ID.
 - **How accounts are linked:** only *single sign-on only* accounts (no password) that aren't already linked are ever linked automatically. Accounts with a password are never linked, guests from other tenants are never linked, and the user-editable `email` claim is never used for matching. A Microsoft sign-in that doesn't match gets its own new account (if auto-create is on) instead. To move an existing password user to Microsoft sign-in, remove their password in **Reset password**.
@@ -246,18 +258,18 @@ Sign-in protections:
 - You can't delete or disable yourself, or remove the last active admin. You also can't leave no admin who can actually sign in: removing the last such admin's password (or deleting, disabling or demoting them, or turning single sign-on off) is refused unless another admin has a password, or single sign-on is working and linked to an admin account. **Remove password** isn't offered then.
 - Resetting your own password here keeps you signed in on this browser; your other sessions are signed out. For anyone else, all their sessions end.
 - Disabling, deleting or signing a user out (or a password reset) also ends their open live-update streams straight away; streams are re-checked on every heartbeat too, so a dashboard stops receiving updates once its session, user, role or API key is no longer valid.
-- Anyone signed in can change their own password from the account menu (at least 10 characters; an empty new password is refused).
+- Anyone signed in can change their own password in **Settings → Preferences** (at least 10 characters; an empty new password is refused).
 
 ### Setting up Microsoft Entra ID SSO
 
 1. In the **Microsoft Entra admin center**, go to **App registrations → New registration** and choose *Single tenant*.
-2. Under **Authentication**, add a **Web** platform with the redirect URI shown in **Admin → Single sign-on**. It looks like `https://your-host/auth/oidc/callback`.
+2. Under **Authentication**, add a **Web** platform with the redirect URI shown in **Settings → Single sign-on**. It looks like `https://your-host/auth/oidc/callback`.
 3. Under **Certificates & secrets**, create a **client secret** and copy its *value*.
 4. *(Recommended)* Under **App roles**, create roles with these values, allowed member type *Users/Groups*:
    `CheckIn.Admin`, `CheckIn.PowerUser`, `CheckIn.User`, `CheckIn.Reader`.
    Then assign people or groups to them in **Enterprise applications → (your app) → Users and groups**.
    *Alternative:* add a groups claim (**Token configuration → Add groups claim**) and map group object IDs to roles.
-5. In the dashboard, open **Admin → Single sign-on**. Enter the **Directory (tenant) ID**, **Application (client) ID** and **client secret**, turn on **Allow sign-in with Microsoft Entra ID**, then select **Save**. **Test connection** checks the tenant.
+5. In the dashboard, open **Settings → Single sign-on**. Enter the **Directory (tenant) ID**, **Application (client) ID** and **client secret**, turn on **Allow sign-in with Microsoft Entra ID**, then select **Save**. **Test connection** checks the tenant.
 6. If the app runs behind a proxy or load balancer, set **Public URL**, for example `https://checkin.contoso.com`, so the redirect URI is correct. Also set `TRUST_PROXY`.
 
 SSO behaviour (configurable in the same screen):
@@ -310,6 +322,7 @@ How updates work:
 - Fields you send are added or overwritten. Fields you don't send stay as they are.
 - To **remove** a field, send it as JSON `null`, for example `{"id":"device-1","fred":null}`.
 - `created` and `modified` are ignored if a caller sends them.
+- `id` can be at most 64 characters. A field value can nest objects or arrays up to 32 levels deep; anything deeper is refused with a `400`.
 - A check-in that changes no values still updates `modified` and adds a history entry, with an empty change list.
 
 **Bulk:** POST a JSON array to check in many records in one request. Valid items are saved even if some items fail.
@@ -338,7 +351,7 @@ curl -X POST http://localhost:3000/api/checkin -H "Content-Type: application/jso
 |---|---|
 | `DELETE /api/records/:id` | Delete one record and its history (User role or higher) |
 | `POST /api/records/delete` | Delete many records: body `{ "ids": ["a", "b", ...] }` (User role or higher). The dashboard's multi-select **Delete** uses this |
-| `DELETE /api/records?confirm=true` | **Clear all records and all history** (Power user or higher). This is what the dashboard's *Clear all* button calls |
+| `DELETE /api/records?confirm=true` | **Clear all records and all history** (Power user or higher). This is what **Settings → Reset → Clear dashboard** calls |
 
 ### Auth and admin
 
@@ -390,7 +403,7 @@ curl -u admin:password -X PUT http://localhost:3000/api/status -H "Content-Type:
 
 ### Port checks
 
-Off until an admin turns them on in **Admin → Port checks**. A device asks the server to try a TCP connection back to it on a few ports. The server only ever checks **the address the request came from** (there's no way to name another host), so it can't be used to scan other machines. "Open" means reachable from the server: firewalls in between count, and a device behind NAT, a VPN gateway or a proxy is checked at that gateway's address. Behind a reverse proxy, set `TRUST_PROXY` so the server sees each device's real address.
+Off until an admin turns them on in **Settings → Port checks**. A device asks the server to try a TCP connection back to it on a few ports. The server only ever checks **the address the request came from** (there's no way to name another host), so it can't be used to scan other machines. "Open" means reachable from the server: firewalls in between count, and a device behind NAT, a VPN gateway or a proxy is checked at that gateway's address. Behind a reverse proxy, set `TRUST_PROXY` so the server sees each device's real address.
 
 | Method & path | Role | Description |
 |---|---|---|
@@ -446,7 +459,7 @@ Exports are spreadsheet-friendly and import back with their types:
 
 ## Dashboard
 
-- **Status cards:** Active, Aging and Stale are based on time since the last check-in. The threshold is set in Settings (default 15 minutes; Aging runs up to 2× the threshold). Click a card to filter by that status.
+- **Status cards:** Active, Aging and Stale are based on time since the last check-in. The threshold is set in Settings → Check-ins (default 15 minutes; Aging runs up to 2× the threshold). Click a card to filter by that status.
 - **Status boxes** (optional): extra cards under Active / Aging / Stale that count devices matching a rule, for example **High CPU**: `cpu_pct > 90` for at least 10 minutes. Power users and admins set them up from the account menu → **Status boxes** (or the sliders button at the end of the row); everyone sees them. There are presets for high CPU, high memory, high disk activity, low disk space, reboot required and not domain joined, or build one on any field with the same conditions as filters. Each box has:
   - **For at least N minutes:** every check-in for that long matched (0 = the latest one matches). The server records when each device started matching and keeps it across restarts. When you create or change a box it works this out from the stored history, so with a short `HISTORY_LIMIT` it can only look back that far.
   - **Don't count stale devices** (on by default): a device that stopped checking in keeps its last reading, which is out of date.
@@ -465,11 +478,13 @@ Exports are spreadsheet-friendly and import back with their types:
 - **Layouts:** Table, Cards, or an Activity feed of recent changes.
 - **Columns:** show or hide, drag to reorder (in the header or the Columns panel), and drag a column edge to resize it (double-click the edge to reset).
 - **Sort:** click a header to sort. Shift+click adds a secondary sort. Empty values always sort last, in either direction.
-- **Phones and tablets:** on a phone the header shrinks to the logo and your account menu, which also holds Pause, Import, Export, Clear all and dark mode. The status counts sit in one compact row, and the less-used toolbar controls scroll sideways under the search box. Menus, filters and dialogs open as bottom sheets, and Admin opens full screen with users shown as cards. The first visit on a phone starts in card view. Held sideways, the page scrolls so the list gets nearly the whole screen.
+- **Phones and tablets:** on a phone the header shrinks to the logo and your account menu, with the page tabs on a row of their own. The menu holds Import, Export and dark mode. The status counts sit in one compact row, and the less-used toolbar controls scroll sideways under the search box. Menus, filters and dialogs open as bottom sheets, and Settings opens full screen with users shown as cards. The first visit on a phone starts in card view. Held sideways, the page scrolls so the list gets nearly the whole screen.
 - **Graph tab:** in a record's details, **Graph** plots CPU %, RAM %, disk space used % and disk activity % over the record's stored history (the last `HISTORY_LIMIT` check-ins), with hover details, per-line toggles and a min / avg / max / latest table. It reads `cpu_pct`, `ram_pct`, `disk_pct` and `disk_busy_pct` (what the agents send) or common alternatives such as `cpu`, `mem_pct`, `disk` and `disk_util_pct`. The tab is greyed out for records without any of these.
 - **Saved views:** save the current filters, search, sort, grouping, columns and layout under a name. Views are stored on the server:
   - **My views** belong to your account. Only you can see them, and they follow you to any browser.
   - **Team views** are visible to everyone. Only power users and admins can create, overwrite or delete them, and changes show up on every open dashboard straight away.
+
+  **New fields stay hidden.** A view remembers the fields it has already seen (`known` in its saved state). A field that first appears later, for example when an agent starts sending something new, is hidden in that view until you tick it in **Columns**; once shown (and saved) it stays shown. **Default View** is the built-in layout: ID, Status, then `os`, `cpu_pct`, `ram_pct`, `disk_busy_pct`, `disk_pct` and `uptime` (only the ones your devices send, in that order), then Modified and Created. With none of those fields in use it is just ID, Status, Modified and Created. Every other field starts hidden; tick it in **Columns** to add it (the change is kept in your browser, and **Reset** in Columns returns to these columns). When one of the standard fields is sent for the first time it appears in its place. Views saved before this existed are given the fields present when the server first starts with this version, so nothing they showed disappears.
 
   A dot on the save button means you've changed the view since it was saved. Readers and users can open a team view, adjust it, and save their own copy under **My views**. Views saved in the browser by older versions are moved to your account the first time you sign in. Deleting a user also deletes their personal views.
 
@@ -480,13 +495,13 @@ Exports are spreadsheet-friendly and import back with their types:
 - **Record drawer:** click a row to see every field and a timeline of changes.
 - **Multi-select:** tick the checkboxes in the table (Shift+click selects a range) or on cards. The header checkbox selects every matching row. A bar appears where you can **Delete** or **Export** the selection; the Delete key works too (Backspace doesn't, so it can't delete by accident). Esc clears the selection.
 - **Live updates:** changes stream in as they happen.
-- **Pause check-ins** (power users and admins): the server stops accepting check-ins and CSV imports until resumed. Every open dashboard shows a banner saying who paused it and when.
-- **Import:** use the button, or drag a `.csv` file onto the page.
+- **Pause check-ins** (power users and admins, in **Settings → Check-ins**; clicking the Live indicator opens it): the server stops accepting check-ins and CSV imports until resumed. Every open dashboard shows a banner saying who paused it and when.
+- **Import:** use **Import CSV** in the account menu, or drag a `.csv` file onto the page.
 - Light and dark themes, plus compact and comfortable row density.
 
 ## Issues
 
-An optional **Issues** page that tracks problems on devices: who is on them, notes, and what happened when. It's off until an admin turns it on in **Admin → Issues** (or on the Issues page itself). Then the dashboard shows an **Issues** button with the number of open issues, and so does the account menu on phones.
+An optional **Issues** page that tracks problems on devices: who is on them, notes, and what happened when. It's off until an admin turns it on in **Settings → Issues** (or on the Issues page itself). Then the header shows an **Issues** tab with the number of open issues.
 
 ### Rules: what counts as an issue
 
@@ -504,7 +519,7 @@ Rule changes apply right away. Problems from a deleted or turned-off rule leave 
 
 - **One issue per device.** If a device already has an open or ignored issue, a new problem (high memory while high CPU is open) is added to it, not opened as a second issue.
 - **Problems clear one by one.** After its passing check-ins in a row, a problem leaves the issue and the log notes it with the reading, for example "High CPU cleared: cpu_pct = 42 (2 check-ins in a row)". When no problems are left, the issue **closes itself**.
-- **Automatic closing (admins, Admin → Issues):** on by default. Turn it off and issues no longer close themselves: when every problem has cleared, the issue stays open, marked **All clear** (with its own count, filter and a log entry), until someone closes it. A problem that starts again meanwhile joins that same issue. Turning automatic closing back on closes the issues that are already all clear.
+- **Automatic closing (admins, Settings → Issues):** on by default. Turn it off and issues no longer close themselves: when every problem has cleared, the issue stays open, marked **All clear** (with its own count, filter and a log entry), until someone closes it. A problem that starts again meanwhile joins that same issue. Turning automatic closing back on closes the issues that are already all clear.
 - **Closing by hand.** Anyone with the User role or above can close an issue, optionally with a reason. If a problem is still happening, it won't open a new issue until it has stopped and then happened again. Other problems can still open one.
 - **Ignore** for 15 minutes to a week, or a custom time (up to 90 days). An ignored issue leaves the Open list but keeps tracking. If everything clears, it closes. If the same problem comes and goes, it stays ignored. A **new kind of problem** on that device ends the ignore straight away, so ignoring one problem never hides another. When the time runs out, it goes back to Open.
 - **Assign** to anyone in the users list, with search. **Assign to me** is one click.
@@ -515,13 +530,13 @@ Rule changes apply right away. Problems from a deleted or turned-off rule leave 
 
 ### Exports and clearing
 
-**Export** gives a CSV of every issue: one row each with problems, notes and the log. You can also export the issue log (one row per entry) or just the issues matching the current filters. **Clear issues** (power users and admins) deletes every issue, open and closed, with their problems, notes and logs, after a confirmation. Rules and settings stay. Problems that are still happening open new issues straight away.
+**Export** gives a CSV of every issue: one row each with problems, notes and the log. You can also export the issue log (one row per entry) or just the issues matching the current filters. **Settings → Reset → Clear incidents** (power users and admins) deletes every issue, open and closed, with their problems, notes and logs, after a confirmation. Rules and settings stay. Problems that are still happening open new issues straight away.
 
 Everything updates live: the list, the open issue and the dashboard button follow changes from other people and from check-ins without a refresh; a note you're typing and the sections you've opened stay as they are. **Show more** loads the next 200 issues, as many times as you like.
 
 ## Load test page
 
-Admins can open **Load test** from the account menu (`/loadtest`). The Issues and Load test pages have the same account menu, top right, as the dashboard. It runs a simulated fleet inside the server, so you can watch the dashboard, status boxes and issues under load without installing anything.
+Admins can open **Load test** from **Settings → Load test** (`/loadtest`). The Issues and Load test pages have the same account menu, top right, as the dashboard. It runs a simulated fleet inside the server, so you can watch the dashboard, status boxes and issues under load without installing anything.
 
 - **Devices and interval:** choose how many simulated devices there are (up to 20,000) and how often each one checks in. The target rate is shown (2,000 devices every 10 s = 200 check-ins a second). Check-ins are spread evenly over the interval (slow fleets show e.g. `0.03/s (1 every 36 s)`). **Apply** changes the fleet while it runs without restarting the cycle (devices keep their turn; nothing happens if nothing changed). Shrinking the fleet deletes the simulated records of the devices dropped, which closes their issues. **Burst** makes every device that isn't offline check in once, as fast as the server takes them but never more than 1,000 at a time; a second burst is refused (409) until the first has been sent. Values must be plain numbers (devices a whole number); a count must be a whole number of at least 1. After a restart the device count starts from the number of simulated records in the database (up to 20,000).
 - **They start healthy and active.** Each device has its own realistic, slightly noisy readings, using the same fields as the agents: `cpu_pct`, `ram_pct`, `disk_max_pct`, `disk_busy_pct`, `system_time`, `failed_services`, `failed_service_names`, `reboot_required`, `domain_joined`, hostname, OS, site and so on, plus `role`.
@@ -587,7 +602,7 @@ From PowerShell (Windows PowerShell 5.1 or PowerShell 7), this fires 500 simulta
 - **Stale** devices check in once (only if they don't exist yet), then never again.
 - **Problems** (`-HighCpu`, `-HighMemory`, `-HighDiskActivity`, `-LowDiskSpace`, `-RebootRequired`, `-NotDomainJoined`, `-FailedServices`) go to that many active devices and hold on every check-in, with values that trip the Status box presets (for example `cpu_pct` 92-99).
 - The script reads the active threshold from the server. Status comes from the time of the last check-in, so aging settles after about twice the threshold and new stale devices turn stale after twice the threshold; for a quick demo, set the threshold to 1 or 2 minutes in Settings first.
-- **Ports** (`-RdpOpen`, `-RdpClosed`, `-SshOpen`, `-SshClosed`) write `port_3389` on that many active Windows devices and `port_22` on Linux ones, so the RDP / SSH status boxes fill in. Add `-ServerPortChecks` to also have the server really test a port with each of those check-ins. Every simulated device comes from the one machine running the script, so it listens on `-OpenPort` (default 45389) for the "open" devices and points the "closed" ones at `-ClosedPort` (45390). The server saves its real results as `port_45389` / `port_45390`, and the status line counts them (open, closed, filtered = no answer, refused = over the server's limit). Turn port checks on first, and raise **Checks per address per minute** in Admin → Port checks to more than the script says it needs; if "open" checks come back filtered, the machine's firewall is blocking that port.
+- **Ports** (`-RdpOpen`, `-RdpClosed`, `-SshOpen`, `-SshClosed`) write `port_3389` on that many active Windows devices and `port_22` on Linux ones, so the RDP / SSH status boxes fill in. Add `-ServerPortChecks` to also have the server really test a port with each of those check-ins. Every simulated device comes from the one machine running the script, so it listens on `-OpenPort` (default 45389) for the "open" devices and points the "closed" ones at `-ClosedPort` (45390). The server saves its real results as `port_45389` / `port_45390`, and the status line counts them (open, closed, filtered = no answer, refused = over the server's limit). Turn port checks on first, and raise **Checks per address per minute** in Settings → Port checks to more than the script says it needs; if "open" checks come back filtered, the machine's firewall is blocking that port.
 - Every few seconds it prints check-ins sent, failures by HTTP status, and latency (p50 / p95 / p99 / max); totals when it stops. Simulated ids start with `-Prefix` (default `LT-`) and carry `sim_group` (active, aging, stale), so they're easy to filter.
 
 ## Agents (Windows and Linux)

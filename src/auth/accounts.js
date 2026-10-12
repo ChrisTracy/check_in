@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { HttpError } from '../store.js';
-import { hashPassword, verifyPassword, passwordProblem, randomToken, sha256, encrypt, decrypt } from './security.js';
+import { hashPassword, verifyPassword, passwordProblem, randomToken, sha256, encrypt, decrypt, MAX_USERNAME_LEN, MAX_PASSWORD_LEN } from './security.js';
 
 export const ROLES = {
   reader: { level: 1, label: 'Reader' },
@@ -34,6 +34,7 @@ export const CAPS = {
   sso: 'admin',
   users: 'admin',
   tls: 'admin',
+  settingsView: 'power', // see the admin settings (read only); changing them still needs the capability above
 };
 export const can = (role, cap) => roleLevel(role) >= roleLevel(CAPS[cap]);
 export const capsFor = (role) => Object.fromEntries(Object.keys(CAPS).map((c) => [c, can(role, c)]));
@@ -360,6 +361,8 @@ export class Accounts extends EventEmitter {
   }
 
   async verifyLogin(username, password) {
+    // Nothing valid is this long: don't spend a hash on it (or look it up).
+    if (String(username || '').length > MAX_USERNAME_LEN || String(password ?? '').length > MAX_PASSWORD_LEN) return null;
     const u = this.s.byName.get(String(username || '').trim());
     const ok = await verifyPassword(password, u?.password_hash);
     if (!ok || !u || u.disabled) return null;

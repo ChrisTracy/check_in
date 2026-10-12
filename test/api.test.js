@@ -114,10 +114,12 @@ test('role permissions are enforced', async () => {
 
   assert.equal((await power({ method: 'PUT', url: '/api/settings', payload: { staleMinutes: 5 } })).json().staleMinutes, 5);
   assert.equal((await power({ method: 'DELETE', url: '/api/records?confirm=true' })).statusCode, 200);
-  assert.equal((await power({ url: '/api/admin/users' })).statusCode, 403);
+  assert.equal((await power({ url: '/api/admin/users' })).statusCode, 200, 'power users can look at the users (read only)');
+  assert.equal((await power({ method: 'POST', url: '/api/admin/users', payload: { username: 'zz-power', role: 'reader' } })).statusCode, 403);
   assert.equal((await user({ url: '/api/admin/apikey' })).statusCode, 403);
   assert.equal((await power({ url: '/api/admin/apikey' })).statusCode, 200);
-  assert.equal((await power({ url: '/api/admin/sso' })).statusCode, 403);
+  assert.equal((await power({ url: '/api/admin/sso' })).statusCode, 200, 'power users can look at the SSO settings (read only)');
+  assert.equal((await power({ method: 'PUT', url: '/api/admin/sso', payload: { enabled: false } })).statusCode, 403);
 
   assert.equal((await as('user', 'wrong-password')({ url: '/api/records' })).statusCode, 401);
 });
@@ -291,7 +293,8 @@ test('HTTPS: self-signed certificate, redirect mode, HSTS and hot reload', async
   // Once HTTP redirects, admin calls must arrive as HTTPS (here via a trusted proxy header).
   const admin = (o) => adminHttp({ ...o, headers: { 'x-forwarded-proto': 'https', ...(o.headers || {}) } });
   await accounts.create({ username: 'pp', password: 'password1234', role: 'power' });
-  assert.equal((await as('pp', 'password1234')({ url: '/api/admin/tls' })).statusCode, 403);
+  assert.equal((await as('pp', 'password1234')({ url: '/api/admin/tls' })).statusCode, 200, 'power users can look at the HTTPS settings');
+  assert.equal((await as('pp', 'password1234')({ method: 'PUT', url: '/api/admin/tls', payload: { mode: 'off' } })).statusCode, 403);
 
   let st = (await admin({ url: '/api/admin/tls' })).json();
   assert.deepEqual([st.mode, st.listening, st.cert], ['off', false, null]);

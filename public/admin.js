@@ -1,4 +1,5 @@
-/* Admin panel: users, single sign-on (Entra ID) and API key. Loaded after app.js. */
+/* Settings panel: preferences, check-ins, and the admin tabs (users, single sign-on, API key, port checks, issues, HTTPS).
+   Everything a role cannot change is shown greyed out. Loaded after app.js. */
 (() => {
   'use strict';
   const UI = window.CheckinUI;
@@ -25,7 +26,15 @@
     x: '<svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>',
     download: '<svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg>',
     edit: '<svg class="i" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16zM14 6l4 4"/></svg>',
+    pause: '<svg class="i" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg>',
+    play: '<svg class="i" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg>',
+    lock: '<svg class="i nav-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
   };
+
+  // The capability each tab needs to change anything on it. Controls inside can override with data-cap="...".
+  const TAB_CAP = { prefs: null, checkins: null, users: 'users', sso: 'sso', apikey: 'apiKey', ports: 'portCheckPolicy', issues: 'issuesEnable', tls: 'tls', reset: 'clearAll', loadtest: 'loadTest' };
+  const ADMIN_CAPS = new Set(['users', 'sso', 'tls', 'portCheckPolicy', 'apiKeyPolicy', 'issuesEnable', 'loadTest']);
+  const needRole = (cap) => (ADMIN_CAPS.has(cap) ? 'an Admin' : 'a Power user or Admin');
 
   let tab = 'users';
   let users = [];
@@ -45,19 +54,176 @@
     try { await navigator.clipboard.writeText(text); toast('Copied to clipboard'); } catch { toast('Clipboard unavailable', 'error'); }
   }
 
-  function open(t = 'users') {
-    if (!UI.can('users')) return;
+  // ---- read-only handling: anything the signed-in role cannot change is disabled, not hidden
+  const watched = () => ['#aBody', '#aHeadActions', '#aFoot'].map((q) => $(q));
+  let lockObs = null;
+  function lockPass() {
+    lockObs?.disconnect();
+    const base = TAB_CAP[tab];
+    for (const root of watched()) {
+      for (const el of $$('button, input, select, textarea, a.btn', root)) {
+        if (el.closest('[data-ro-ok]')) continue;
+        const need = el.closest('[data-cap]')?.dataset.cap || base;
+        if (!need || UI.can(need)) continue;
+        el.classList.add('locked');
+        if (el.tagName === 'A') { el.setAttribute('aria-disabled', 'true'); el.tabIndex = -1; } else el.disabled = true;
+        if (!el.title) el.title = `Requires ${needRole(need)}`;
+      }
+    }
+    const bodyEl = $('#aBody');
+    if (base && !UI.can(base) && !$('.ro-banner', bodyEl)) {
+      bodyEl.insertAdjacentHTML('afterbegin', `<div class="ro-banner" role="note">${ICON.lock}<span><b>View only.</b> Changing these settings requires ${needRole(base)}.</span></div>`);
+    }
+    watched().forEach((el) => lockObs?.observe(el, { childList: true, subtree: true }));
+  }
+  function startLocking() {
+    if (!lockObs) lockObs = new MutationObserver(lockPass);
+    lockPass();
+  }
+  function applyNav() {
+    $$('#adminBack [data-min]').forEach((el) => { el.hidden = !UI.can(el.dataset.min); });
+    $$('.admin-nav [data-tab]').forEach((b) => {
+      const need = TAB_CAP[b.dataset.tab];
+      const locked = need && !UI.can(need);
+      b.classList.toggle('is-locked', Boolean(locked));
+      if (locked && !$('.nav-lock', b)) b.insertAdjacentHTML('beforeend', ICON.lock);
+    });
+  }
+
+  function open(t = 'prefs') {
     $('#adminBack').hidden = false;
-    select(t);
+    applyNav();
+    const btn = $(`.admin-nav [data-tab="${t}"]`);
+    select(btn && !btn.hidden ? t : 'prefs');
   }
   function close() { $('#adminBack').hidden = true; UI.refreshCertWarning?.(); }
+
+  // ================================================================== Preferences
+  function loadPrefs() {
+    const S = UI.state;
+    const me = S.me;
+    head('Preferences', 'Personal settings, saved in this browser');
+    const hasPw = me.user.hasPassword;
+    $('#aBody').innerHTML = `
+      <div class="admin-section">
+        <h4>Appearance</h4>
+        <div class="row">
+          <label class="field">Theme<select class="select" id="pfTheme">${['auto', 'light', 'dark'].map((t) => `<option value="${t}" ${S.settings.theme === t ? 'selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}</select></label>
+        </div>
+        <label class="switch"><input type="checkbox" id="pfCompact" ${S.settings.compact ? 'checked' : ''}><span class="track"></span>Compact rows</label>
+      </div>
+      <div class="admin-section">
+        <h4>Account</h4>
+        <p class="muted" style="margin:0">Signed in as <b>${esc(me.user.name || me.user.username)}</b> (${esc(me.user.username)}) with the <span class="role-badge r-${esc(me.role)}">${esc(me.roleLabel)}</span> role.</p>
+        ${me.kind === 'session' ? `<div><button class="btn" id="pfPw">${ICON.key}<span>${hasPw ? 'Change password' : 'Set a password'}</span></button></div>` : ''}
+      </div>`;
+    $('#pfTheme').addEventListener('change', (e) => { UI.setTheme(e.target.value); toast('Theme saved'); });
+    $('#pfCompact').addEventListener('change', (e) => UI.setCompact(e.target.checked));
+    $('#pfPw')?.addEventListener('click', () => UI.changePassword());
+  }
+
+  // ================================================================== Load test
+  function loadLoadtest() {
+    head('Load test', 'Simulate a fleet of devices to see how the dashboard, status boxes and issues cope');
+    $('#aBody').innerHTML = `
+      <div class="admin-section">
+        <p class="muted" style="margin:0">Runs a simulated fleet inside the server, so you can watch the dashboard under load without installing anything. Simulated devices are removed when the test stops.</p>
+        <div><a class="btn primary" href="/loadtest">Open the load test</a></div>
+      </div>`;
+  }
+
+  // ================================================================== Reset
+  async function loadReset() {
+    head('Reset', 'Permanently delete data. None of these can be undone.');
+    let iss = { enabled: false, total: 0 };
+    try { if (UI.can('issues')) iss = await apiJson('/api/issues/summary'); } catch { /* ignore */ }
+    const nRec = UI.state.records.size;
+    const card = (id, title, text, cap, label, off) => `<div class="radio-card" style="cursor:default;flex-direction:column;align-items:stretch;gap:10px" data-cap="${cap}">
+        <b>${title}</b><span class="muted" style="font-size:13px" data-ro-ok>${text}</span>
+        <div><button class="btn danger" id="${id}" ${off ? 'disabled' : ''}>${ICON.trash}<span>${label}</span></button></div></div>`;
+    $('#aBody').innerHTML = `
+      <div class="admin-section"><div class="grid2" style="grid-template-columns:1fr">
+        ${card('rsDash', 'Clear dashboard', `Deletes all ${nf.format(nRec)} records and their history. Devices appear again the next time they check in. Issues, settings and views are kept.`, 'clearAll', 'Clear dashboard', false)}
+        ${card('rsIss', 'Clear incidents', iss.enabled ? `Deletes all ${nf.format(iss.total || 0)} issues with their notes, assignments and logs. Rules and settings are kept; problems that are still happening open new issues straight away.` : 'The issues list is turned off, so there is nothing to clear.', 'issueRules', 'Clear incidents', !iss.enabled)}
+        ${card('rsAll', 'Clear all', `Does both: deletes every record and its history${iss.enabled ? ', and every issue' : ''}.`, 'clearAll', 'Clear all', false)}
+      </div></div>`;
+    const run = (what) => async () => {
+      const done = [];
+      try {
+        if (what !== 'issues') { const r = await apiJson('/api/records?confirm=true', { method: 'DELETE' }); done.push(`${nf.format(r.deleted.records)} records`); }
+        if (what !== 'dashboard' && iss.enabled) { const r = await apiJson('/api/issues?confirm=true', { method: 'DELETE' }); done.push(`${nf.format(r.deleted)} issues`); }
+        toast(`Cleared ${done.join(' and ') || 'nothing'}`);
+        if (tab === 'reset') loadReset();
+      } catch (e) { toast(`${e.message}${done.length ? ` (already cleared: ${done.join(', ')})` : ''}`, 'error'); return false; }
+    };
+    const ask = (what, title, text, label) => () => {
+      modal({
+        title,
+        body: `<div class="warn-box">${text} It cannot be undone. Export first if you might need it.</div>
+          <p>Type <b>CLEAR</b> to confirm.</p><label>Confirmation<input class="input" id="rsConfirm" autocomplete="off" placeholder="CLEAR"></label>`,
+        actions: [{ label: 'Cancel' }, { label: 'Delete', cls: 'danger solid', id: 'rsGo', onClick: async () => { if ($('#rsConfirm').value.trim() !== 'CLEAR') return false; return run(what)(); } }],
+      });
+      const go = $('#rsGo'); go.disabled = true;
+      $('#rsConfirm').addEventListener('input', (e) => { go.disabled = e.target.value.trim() !== 'CLEAR'; });
+      $('#rsConfirm').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !go.disabled) go.click(); });
+    };
+    $('#rsDash').addEventListener('click', ask('dashboard', 'Clear the dashboard?', `This permanently deletes <b>all ${nf.format(nRec)} records and their entire history</b>.`));
+    $('#rsIss').addEventListener('click', ask('issues', 'Clear all incidents?', `This permanently deletes <b>every issue (${nf.format(iss.total || 0)})</b>, open, ignored and closed, with their notes and logs.`));
+    $('#rsAll').addEventListener('click', ask('all', 'Clear everything?', `This permanently deletes <b>all ${nf.format(nRec)} records and their history${iss.enabled ? `, and all ${nf.format(iss.total || 0)} issues` : ''}</b>.`));
+  }
+
+  // ================================================================== Check-ins
+  function pauseCard() {
+    const ing = UI.state.ingest;
+    const who = ing.by ? ` by ${esc(ing.by)}` : '';
+    return `<div class="radio-card" style="cursor:default;flex-direction:column;align-items:stretch;gap:12px" data-cap="pause">
+      <span class="status-line" data-ro-ok>${ing.paused
+        ? `<i class="dot stale"></i><b>Paused</b>${who} ${esc(relTime(ing.since))}. New check-ins and imports are rejected with HTTP 503.`
+        : '<i class="dot fresh"></i><b>Accepting check-ins</b>'}</span>
+      <div><button class="btn ${ing.paused ? 'primary' : ''}" id="ciPause">${ing.paused ? ICON.play : ICON.pause}<span>${ing.paused ? 'Resume check-ins' : 'Pause check-ins'}</span></button></div>
+      <small class="muted" data-ro-ok>While paused the server rejects new check-ins and CSV imports (HTTP 503, Retry-After 30) and devices retry later. Viewing, exporting and deleting still work.</small>
+    </div>`;
+  }
+  function loadCheckins() {
+    const S = UI.state;
+    head('Check-ins', 'How the server accepts check-ins and decides what is active');
+    $('#aBody').innerHTML = `
+      <div class="admin-section"><h4>Accepting check-ins</h4><div id="ciPauseBox">${pauseCard()}</div></div>
+      <div class="admin-section" data-cap="threshold">
+        <h4>Active threshold</h4>
+        <div class="copy-row"><input class="input" id="ciStale" type="number" min="1" step="1" value="${esc(S.settings.staleMinutes)}" style="width:120px;font-family:inherit;background:var(--surface)" aria-label="Active threshold in minutes"><span class="muted">minutes</span>
+          <button class="btn primary" id="ciSave">Save</button></div>
+        <p class="muted" style="margin:0;font-size:12px">A record is <b>active</b> within the threshold, <b>aging</b> up to twice that, and <b>stale</b> after that. This applies to everyone.</p>
+      </div>
+      <div class="admin-section">
+        <h4>History</h4>
+        <p class="muted" style="margin:0" data-ro-ok>The server keeps <b>${S.config.historyLimit < 0 ? 'unlimited' : esc(S.config.historyLimit)}</b> history entries per record (<code>HISTORY_LIMIT</code>).</p>
+      </div>`;
+    wirePause();
+    $('#ciSave').addEventListener('click', async () => {
+      const m = Math.floor(Number($('#ciStale').value));
+      if (!Number.isFinite(m) || m < 1) { toast('Enter a whole number of minutes (1 or more)', 'error'); return; }
+      try { $('#ciStale').value = await UI.saveThreshold(m); toast('Active threshold updated for everyone'); } catch (e) { toast(e.message, 'error'); }
+    });
+    $('#ciStale').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#ciSave').click(); });
+  }
+  function wirePause() { $('#ciPause')?.addEventListener('click', () => UI.togglePause()); }
+  // Called when the ingest state changes (pause/resume from here, another tab, or another user).
+  function refresh() {
+    if ($('#adminBack').hidden || tab !== 'checkins') return;
+    const box = $('#ciPauseBox');
+    if (!box) return;
+    box.innerHTML = pauseCard();
+    wirePause();
+  }
 
   function select(t) {
     tab = t;
     $$('.admin-nav [data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
     $('#aBody').innerHTML = '<div class="muted">Loading…</div>';
     foot('');
-    ({ users: loadUsers, sso: loadSso, apikey: loadApiKey, tls: loadTls, ports: loadPorts, issues: loadIssuesAdmin })[t]();
+    ({ prefs: loadPrefs, checkins: loadCheckins, users: loadUsers, sso: loadSso, apikey: loadApiKey, tls: loadTls, ports: loadPorts, issues: loadIssuesAdmin, reset: loadReset, loadtest: loadLoadtest })[t]();
+    startLocking();
   }
 
   // ================================================================== Users
@@ -73,7 +239,7 @@
   function renderUsers() {
     const me = UI.state.me.user.id;
     head('Users', `${nf.format(users.length)} user${users.length === 1 ? '' : 's'} · control who can sign in and what they can do`,
-      `<div class="copy-row"><input class="input" id="uSearch" placeholder="Search users…" value="${esc(userFilter)}" style="width:200px;font-family:inherit;background:var(--surface)">
+      `<div class="copy-row"><input class="input" data-ro-ok id="uSearch" placeholder="Search users…" value="${esc(userFilter)}" style="width:200px;font-family:inherit;background:var(--surface)">
        <button class="btn primary" id="uAdd">${ICON.plus}<span>Add user</span></button></div>`);
     const q = userFilter.toLowerCase();
     const list = users.filter((u) => !q || [u.username, u.name, u.email, u.roleLabel].some((x) => String(x || '').toLowerCase().includes(q)));
@@ -360,14 +526,13 @@
   function renderApiKey(info) {
     head('API key', 'For devices and scripts that check in or call the API');
     const origin = location.origin;
-    const isAdmin = UI.can('apiKeyPolicy');
     const masked = info.key ? info.key.slice(0, 6) + '•'.repeat(Math.max(8, info.key.length - 6)) : '';
     $('#aBody').innerHTML = `
       <div class="admin-section">
         <div class="radio-card" style="cursor:default;flex-direction:column;align-items:stretch;gap:12px">
           <span class="status-line">${info.required ? '<i class="dot fresh"></i><b>Required for check-ins</b>' : '<i class="dot aging"></i><b>Not required: anyone who can reach the server can check in</b>'}</span>
           ${info.key
-            ? `<div class="copy-row"><input class="input" id="kValue" readonly value="${esc(masked)}" data-shown="0" spellcheck="false">
+            ? `<div class="copy-row" data-ro-ok><input class="input" id="kValue" readonly value="${esc(masked)}" data-shown="0" spellcheck="false">
                  <button class="btn" id="kShow">Show</button><button class="btn" id="kCopy">Copy</button></div>`
             : info.set
               ? `<div class="warn-box" style="margin:0">This key (starts with <code>${esc(info.prefix)}…</code>) was saved by an older version, which stored it in a form that can't be shown again. Set <code>API_KEY</code> to the same key and restart to make it viewable, or regenerate it.</div>`
@@ -375,15 +540,15 @@
           <small class="muted">${info.set ? `Created ${esc(relTime(info.created))}${info.createdBy ? ' by ' + esc(info.createdBy) : ''}. ` : ''}Power users and admins can see it here and on the Add Device page, which puts it into the install command.</small>
           <span style="display:flex;gap:8px;flex-wrap:wrap">
             <button class="btn primary" id="kGen">${info.set ? 'Regenerate' : 'Generate key'}</button>
-            ${isAdmin ? '<button class="btn" id="kSet">Use my own</button>' : ''}
+            <button class="btn" id="kSet" data-cap="apiKeyPolicy">Use my own</button>
           </span>
         </div>
       </div>
-      ${isAdmin ? `<div class="admin-section">
+      <div class="admin-section" data-cap="apiKeyPolicy">
         <h4>Requirement</h4>
         <label class="switch"><input type="checkbox" id="kRequired" ${info.required ? 'checked' : ''}><span class="track"></span>Require the API key for check-ins</label>
         <p class="muted" style="margin:0;font-size:12px">On by default. When off, anyone who can reach the server can send check-ins; reading data still needs a sign-in. Only admins can change this.</p>
-      </div>` : ''}
+      </div>
       <div class="admin-section">
         <h4>What the key allows</h4>
         <div class="callout">
@@ -858,7 +1023,7 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
         ${rules.length ? `<table class="utable"><thead><tr><th>Name</th><th>Opens when</th><th>Clears when</th></tr></thead><tbody>${rules.map((r) => `<tr><td><b>${esc(r.name)}</b></td><td>${esc(r.text)}</td><td>${esc(r.clearText)}</td></tr>`).join('')}</tbody></table>`
           : '<p class="muted" style="margin:0">No rules yet.</p>'}
         <p class="muted" style="margin:0;font-size:12px">Rules and the reassign window (now ${cfg.reassignMinutes ? `${cfg.reassignMinutes} min` : 'off'}) are edited on the Issues page with <b>Issue rules</b>.</p>
-        <div><a class="btn" href="/issues">Open the Issues page</a></div>
+        <div><a class="btn" data-ro-ok href="/issues">Open the Issues page</a></div>
       </div>`;
     $('#isAutoClose').addEventListener('change', async (e) => {
       try {
@@ -945,5 +1110,5 @@ checkin-agent.ps1 -PortCheck 3389                (Windows: ask once)
   $('#adminClose').addEventListener('click', close);
   $('#adminBack').addEventListener('click', (e) => { if (e.target.id === 'adminBack') close(); });
 
-  window.CheckinAdmin = { open, close };
+  window.CheckinAdmin = { open, close, refresh };
 })();

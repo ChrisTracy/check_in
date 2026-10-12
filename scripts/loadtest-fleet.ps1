@@ -20,7 +20,7 @@
                devices, port_22) are written as fields on those active devices, so the RDP / SSH
                status boxes fill in.
                With -ServerPortChecks those devices also send check_ports, so the server really
-               tests ports on the machine running this script (port checks must be on in Admin →
+               tests ports on the machine running this script (port checks must be on in Admin >
                Port checks). Every simulated device comes from this one address, so the script
                opens a listener on -OpenPort for the "open" devices and points the "closed" ones at
                -ClosedPort, where nothing listens. The server saves its real results as
@@ -443,7 +443,7 @@ $listener = $null
 if ($ServerPortChecks -and $portTotal) {
   if ($OpenPort -eq $ClosedPort) { throw '-OpenPort and -ClosedPort must be different.' }
   $pc = (Invoke-Api GET '/api/config').portCheck
-  if (-not $pc -or -not $pc.enabled) { throw 'Port checks are turned off on the server. Turn them on in Admin → Port checks, or leave out -ServerPortChecks.' }
+  if (-not $pc -or -not $pc.enabled) { throw 'Port checks are turned off on the server. Turn them on in Admin > Port checks, or leave out -ServerPortChecks.' }
   # Something already answering on the "closed" port would make those devices report open.
   $probe = [System.Net.Sockets.TcpClient]::new()
   try { if ($probe.ConnectAsync('127.0.0.1', $ClosedPort).Wait(500)) { throw "Something is listening on port $ClosedPort; pick another with -ClosedPort." } } catch [System.AggregateException] { } finally { $probe.Dispose() }
@@ -453,7 +453,7 @@ if ($ServerPortChecks -and $portTotal) {
   $portPerMin = ($activeDevices | Where-Object { $_.Rdp -or $_.Ssh }).Count * 60 / $IntervalSeconds
   $limit = if ($pc.PSObject.Properties.Name -contains 'perIpPerMinute') { [int]$pc.perIpPerMinute } else { 300 }
   Write-Host ("  Server port checks: about {0:N0} a minute, all from this machine's address (server limit {1:N0} per address per minute)." -f $portPerMin, $limit)
-  if ($portPerMin -gt $limit) { Write-Warning "That's over the server's limit, so some checks will be refused. Raise 'Checks per address per minute' in Admin → Port checks for the test." }
+  if ($portPerMin -gt $limit) { Write-Warning "That's over the server's limit, so some checks will be refused. Raise 'Checks per address per minute' in Admin > Port checks for the test." }
   Write-Host "  If 'open' checks come back as filtered, this machine's firewall is blocking inbound port $OpenPort." -ForegroundColor DarkGray
   Write-Host ''
 }

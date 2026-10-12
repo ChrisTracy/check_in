@@ -22,7 +22,7 @@
 #                                         Quote it in single quotes so your shell doesn't expand it.
 #   --check-ports LIST CHECKIN_CHECK_PORTS With each check-in, ask the server to test these TCP ports
 #                                         on this machine (e.g. 22) and save port_22 = open / closed.
-#                                         Needs port checks turned on (dashboard: Admin → Port checks).
+#                                         Needs port checks turned on (dashboard: Admin > Port checks).
 #   --port-check LIST                     Just ask the server whether these ports on this machine are
 #                                         reachable from it, print the answer and exit
 #                                         (exit 0 = all open, 3 = some not open). Sends no check-in.
@@ -82,7 +82,7 @@ DEFAULT_FIELDS="default"        # field groups to send: default, all, or e.g. cp
 DEFAULT_EXCLUDE=""              # field groups to skip
 DEFAULT_EXTRA=""                # extra fields, e.g. 'site=Dallas,owner=${OWNER:-it}' (see --extra)
 DEFAULT_EVERY=5                 # minutes between runs when installing (1-59)
-DEFAULT_CHECK_PORTS=""          # ports the server tests on each check-in, e.g. "22" (needs Admin → Port checks)
+DEFAULT_CHECK_PORTS=""          # ports the server tests on each check-in, e.g. "22" (needs Admin > Port checks)
 # What "default" means (the groups sent when nothing else is chosen):
 DEFAULT_GROUPS="system cpu ram disk time uptime network domain users health"
 # ----------------------------------------------------------------------------------------------
@@ -608,7 +608,7 @@ case "$CODE" in
   200|201)
     log "Checked in as ${ID:-$HOST_SHORT} ($( [ "$CODE" = 201 ] && echo created || echo updated ), ${#FIELDS_JSON[@]} fields)."
     if [ -n "$CHECK_PORTS" ]; then
-      if printf '%s' "$BODY" | grep -q '"portCheck"[[:space:]]*:[[:space:]]*"off"'; then log "  port checks are turned off on the server (Admin → Port checks)"
+      if printf '%s' "$BODY" | grep -q '"portCheck"[[:space:]]*:[[:space:]]*"off"'; then log "  port checks are turned off on the server (Admin > Port checks)"
       elif ! print_ports "$BODY"; then log "  port check: $(printf '%s' "$BODY" | grep -o '"portCheckError"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*:[[:space:]]*"//; s/"$//')"; fi
     fi
     exit 0 ;;

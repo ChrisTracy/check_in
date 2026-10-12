@@ -257,10 +257,10 @@ test('admin 6: changing your password needs a real new password', async (t) => {
   const ok = await me.call({ method: 'POST', url: '/api/auth/password', payload: { current: 'admin-password-1', next: 'admin-password-2' } });
   assert.equal(ok.statusCode, 200);
   assert.equal((await login(app, 'admin', 'admin-password-2')).statusCode, 200);
-  // The account menu (Issues / Load test pages) checks before sending and shows server errors.
-  const js = fs.readFileSync(new URL('../public/usermenu.js', import.meta.url), 'utf8');
+  // The Change password dialog (Settings > Preferences) checks before sending; server errors are shown by apiJson.
+  const js = fs.readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
   assert.match(js, /if \(!next\) \{ toast\('Enter a new password', 'error'\); return false; \}/);
-  assert.match(js, /if \(!res\.ok\) \{ toast\(data\.error/);
+  assert.match(js, /next\.length < 10/);
 });
 
 test('admin 7: resetting your own password in Admin → Users keeps you signed in', async (t) => {
@@ -383,7 +383,7 @@ test('admin 13: an empty JSON body is "no fields", and the role check comes firs
   r = await app.inject({ method: 'POST', url: '/api/admin/apikey', headers: { ...json, authorization: basic('admin', 'admin-password-1') }, payload: '{bad json' });
   assert.equal(r.statusCode, 400);
   r = await app.inject({ method: 'POST', url: '/api/auth/login', headers: json, payload: '' });
-  assert.equal(r.statusCode, 401, 'empty sign-in is just a wrong password');
+  assert.equal(r.statusCode, 400, 'an empty sign-in asks for a username and password');
 });
 
 test('admin 2b: SSO role sync never demotes the last admin who can sign in', async (t) => {

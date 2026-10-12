@@ -64,10 +64,19 @@
     const y = (v) => m.t + ih - (Math.max(0, v) / vmax) * ih;
 
     // Gridlines and y labels every 25%.
+    // Normally a line every 25%; with a huge value, wider steps so there are never more than ~8 lines.
+    let step = 25;
+    if (vmax / step > 8) { // round 1-2-5 steps: 50, 100, 200, 500 ... 1e9
+      const raw = vmax / 4;
+      const pow = 10 ** Math.floor(Math.log10(raw));
+      step = [1, 2, 5, 10].map((m) => m * pow).find((c) => c >= raw);
+    }
+    vmax = Math.ceil(vmax / step) * step;
+    const tick = (v) => (v >= 1e9 ? +(v / 1e9).toFixed(1) + 'B' : v >= 1e6 ? +(v / 1e6).toFixed(1) + 'M' : v >= 1e4 ? +(v / 1e3).toFixed(1) + 'k' : v);
     let grid = '';
-    for (let v = 0; v <= vmax; v += 25) {
+    for (let v = 0; v <= vmax; v += step) {
       grid += `<line class="mc-grid${v === 0 ? ' base' : ''}" x1="${m.l}" x2="${m.l + iw}" y1="${y(v)}" y2="${y(v)}"/>`
-        + `<text class="mc-axis" x="${m.l - 8}" y="${y(v) + 4}" text-anchor="end">${v}%</text>`;
+        + `<text class="mc-axis" x="${m.l - 8}" y="${y(v) + 4}" text-anchor="end">${tick(v)}%</text>`;
     }
     // X ticks: up to 5, evenly spaced in time.
     const tf = new Intl.DateTimeFormat(undefined, timeFmt(span));

@@ -2,7 +2,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { HttpError } from '../store.js';
 import { ROLES, CAPS, can, capsFor, roleLevel } from './accounts.js';
-import { RateLimiter, sha256, encrypt, decrypt, verifyPassword, passwordProblem, safeReturnTo, safeProto } from './security.js';
+import { RateLimiter, sha256, encrypt, decrypt, verifyPassword, passwordProblem, safeReturnTo, safeProto, MAX_USERNAME_LEN, MAX_PASSWORD_LEN, HOST_RE } from './security.js';
 import { ROOT } from '../config.js';
 import { LOADTEST_TOKEN } from '../loadtest.js';
 
@@ -11,7 +11,7 @@ const OIDC_COOKIE = 'ci_oidc';
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 // A Host header we are willing to build absolute URLs from: a DNS name, IPv4 or [IPv6], optional port.
-const HOST_RE = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]{2,45}\])(?::\d{1,5})?$/;
+// (HOST_RE lives in security.js)
 /** Failed sign-ins allowed per address + username, and per address in total (an office behind one NAT). */
 export const LOGIN_LIMITS = { perUser: 10, perIp: 50 };
 
@@ -28,7 +28,8 @@ export const LOGIN_LIMITS = { perUser: 10, perIp: 50 };
  */
 export function registerAuth(app, { accounts, oidc, config, broadcast, views }) {
   const loginLimiter = new RateLimiter({ max: LOGIN_LIMITS.perUser, limits: { 'ip:': LOGIN_LIMITS.perIp }, windowMs: 15 * 60_000 });
-  const loginKeys = (ip, username) => ['login:' + ip + ':' + String(username || '').trim().toLowerCase(), 'ip:' + ip];
+  // Keys are kept in memory for the whole window, so never build one from an unbounded username.
+  const loginKeys = (ip, username) => ['login:' + ip + ':' + String(username || '').trim().toLowerCase().slice(0, MAX_USERNAME_LEN), 'ip:' + ip];
 
   // An empty body sent as application/json (e.g. a bodyless DELETE from fetch with a JSON header)
   // means "no fields", not a 400 that would come before the sign-in / role check.
@@ -193,7 +194,7 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
   // One setup at a time: password hashing is slow, so without this, parallel requests could all
   // pass the "no users yet" check and each create an admin.
   let setupBusy = false;
-  app.post('/api/auth/setup', { config: { cap: 'public' } }, async (req, reply) => {
+  app.post('/api/auth/setup', { bodyLimit: 16 * 1024, config: { cap: 'public' } }, async (req, reply) => {
     requireJson(req);
     if (accounts.count() > 0) throw new HttpError(409, 'Setup has already been completed');
     if (setupBusy) throw new HttpError(409, 'Setup is already in progress');
@@ -212,9 +213,15 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
     return { ok: true };
   });
 
-  app.post('/api/auth/login', { config: { cap: 'public' } }, async (req, reply) => {
+  app.post('/api/auth/login', { bodyLimit: 16 * 1024, config: { cap: 'public' } }, async (req, reply) => {
     requireJson(req);
-    const { username, password } = req.body;
+    const { username, password } = req.body || {};
+    if (typeof username !== 'string' || typeof password !== 'string' || !username.trim() || !password) {
+      throw new HttpError(400, 'Enter a username and password');
+    }
+    if (username.length > MAX_USERNAME_LEN || password.length > MAX_PASSWORD_LEN) {
+      throw new HttpError(400, `Usernames are at most ${MAX_USERNAME_LEN} characters and passwords at most ${MAX_PASSWORD_LEN}`);
+    }
     const [key, ipKey] = loginKeys(req.ip, username);
     // Checks in progress count against the limit, so parallel guesses can't all get in first.
     const g = await loginLimiter.guard([key, ipKey], () => accounts.verifyLogin(username, password));
@@ -341,7 +348,7 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
   });
 
   // ---------------------------------------------------------------- admin: users
-  app.get('/api/admin/users', { config: { cap: 'users' } }, async () => ({ users: accounts.list(), roles: ROLES, ssoReady: accounts.ssoReady() }));
+  app.get('/api/admin/users', { config: { cap: 'settingsView' } }, async () => ({ users: accounts.list(), roles: ROLES, ssoReady: accounts.ssoReady() }));
   app.post('/api/admin/users', { config: { cap: 'users' } }, async (req, reply) => {
     const u = await accounts.create(req.body || {});
     return reply.code(201).send({ ok: true, user: u });
@@ -368,7 +375,7 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
     try { uri = redirectUri(req); } catch { /* shown as empty: set the Public URL */ }
     return { ...accounts.publicSso(), redirectUri: uri, ready: accounts.ssoReady() };
   };
-  app.get('/api/admin/sso', { config: { cap: 'sso' } }, async (req) => ssoBody(req));
+  app.get('/api/admin/sso', { config: { cap: 'settingsView' } }, async (req) => ssoBody(req));
   app.put('/api/admin/sso', { config: { cap: 'sso' } }, async (req) => {
     const body = req.body || {};
     if (body.tenantId && !GUID_RE.test(String(body.tenantId).trim()) && !config.oidcIssuerOverride) {

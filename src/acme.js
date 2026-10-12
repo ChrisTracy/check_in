@@ -270,7 +270,7 @@ export function registerAcme(app, { acme }) {
     return reply.type('text/plain').header('cache-control', 'no-store').send(v);
   });
   const cap = { config: { cap: 'tls' } };
-  app.get('/api/admin/tls/acme', cap, async () => acme.state());
+  app.get('/api/admin/tls/acme', { config: { cap: 'settingsView' } }, async () => acme.state());
   app.put('/api/admin/tls/acme', cap, async (req) => acme.update(req.body || {}));
   // Starts the order and waits for it (usually 5-30 seconds).
   app.post('/api/admin/tls/acme/obtain', cap, async (req) => {

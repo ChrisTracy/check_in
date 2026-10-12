@@ -19,43 +19,38 @@
         <div class="live" id="liveStatus"><span class="pulse"></span><span id="liveText">Connecting…</span></div>
       </div>
     </div>
+    <!-- Page switcher; shown once the Issues page is turned on, so there is never a lone tab. -->
+    <nav class="top-tabs" id="topTabs" aria-label="Pages" hidden>
+      <a href="/" class="on" aria-current="page">Dashboard</a>
+      <a href="/issues" id="tabIssues">Issues<b class="iss-badge" id="issuesBadge" hidden></b></a>
+    </nav>
     <div class="top-actions">
-      <button class="btn ghost" id="liveToggle" title="Pause / resume accepting check-ins"></button>
       <input type="file" id="importFile" accept=".csv,text/csv" hidden>
-      <button class="btn" id="importBtn" title="Upload a CSV file"><svg class="i" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></svg><span>Import</span></button>
-      <div class="dropdown">
-        <button class="btn" id="exportBtn"><svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg><span>Export</span><svg class="i chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
-        <div class="menu" id="exportMenu">
-          <button data-export="view"><b>Current view</b><small id="exportViewHint">Filtered rows, visible columns</small></button>
-          <button data-export="all"><b>All records</b><small>Every record and field</small></button>
-          <button data-export="history"><b>Full history</b><small>Every stored change</small></button>
-        </div>
-      </div>
-      <button class="btn danger" id="clearBtn"><svg class="i" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg><span>Clear all</span></button>
-      <a class="btn" id="issuesBtn" href="/issues" hidden title="Issues: problems found on devices"><svg class="i" viewBox="0 0 24 24"><path d="M12 3l9.5 16.5h-19z"/><path d="M12 10v4M12 17v.5"/></svg><span>Issues</span><b class="iss-badge" id="issuesBadge" hidden></b></a>
       <button class="icon-btn" id="themeBtn" title="Toggle theme"><svg class="i" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
       <div class="dropdown">
         <button class="user-btn" id="userBtn" title="Account"><span class="avatar" id="userAvatar">?</span><span class="who"><b id="userName"></b><small id="userRole"></small></span></button>
         <div class="menu right" id="userMenu">
           <div class="menu-head"><span class="avatar sm" id="userAvatar2">?</span><div><b id="userName2"></b><small id="userSub"></small></div></div>
-          <div class="m-only" id="mActionsMenu">
-            <button class="row-item" data-act="m-pause" id="mPause"><svg class="i" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg><span>Pause check-ins</span></button>
+          <!-- Data you can move in and out; then what to manage; then you; Sign out last and apart. -->
+          <div class="menu-group" id="mgData">
             <button class="row-item" data-act="m-import" id="mImport"><svg class="i" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></svg>Import CSV</button>
-            <button class="row-item" data-act="m-export-view" id="mExportView"><svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg>Export current view</button>
+            <button class="row-item" data-act="m-export-view" id="mExportView"><svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg><span class="ri-text">Export current view<small id="exportViewHint"></small></span></button>
             <button class="row-item" data-act="m-export-all" id="mExportAll"><svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg>Export all records</button>
-            <button class="row-item" data-act="m-theme"><svg class="i" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Toggle dark mode</button>
-            <button class="row-item danger" data-act="m-clear" id="mClear"><svg class="i" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>Clear all records</button>
-            <hr>
+            <button class="row-item" data-act="m-export-history" id="mExportHistory"><svg class="i" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5M12 8v4l3 2"/></svg>Export full history</button>
           </div>
-          <button class="row-item" data-act="issues" id="issuesItem" hidden><svg class="i" viewBox="0 0 24 24"><path d="M12 3l9.5 16.5h-19z"/><path d="M12 10v4M12 17v.5"/></svg>Issues<b class="iss-badge" id="issuesBadge2" hidden></b></button>
-          <button class="row-item" data-act="agents" id="agentsItem"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/><path d="M12 7v5M9.5 9.5L12 12l2.5-2.5"/></svg>Add Device</button>
-          <button class="row-item" data-act="loadtest" id="loadtestItem" hidden><svg class="i" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Load test</button>
-          <button class="row-item" data-act="admin" id="adminItem"><svg class="i" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>Admin</button>
-          <button class="row-item" data-act="boxes" id="boxesItem"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="7" rx="1.5"/><rect x="13" y="4" width="8" height="7" rx="1.5"/><rect x="3" y="13" width="8" height="7" rx="1.5"/><path d="M17 14v6M14 17h6"/></svg>Status boxes</button>
-          <button class="row-item" data-act="settings"><svg class="i" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Settings</button>
-          <button class="row-item" data-act="password" id="pwItem"><svg class="i" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>Change password</button>
-          <hr>
-          <button class="row-item danger" data-act="logout"><svg class="i" viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l-5-5 5-5M5 12h11"/></svg>Sign out</button>
+          <div class="menu-group" id="mgManage">
+            <button class="row-item" data-act="agents" id="agentsItem"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/><path d="M12 7v5M9.5 9.5L12 12l2.5-2.5"/></svg>Add Device</button>
+            <button class="row-item" data-act="boxes" id="boxesItem"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="7" rx="1.5"/><rect x="13" y="4" width="8" height="7" rx="1.5"/><rect x="3" y="13" width="8" height="7" rx="1.5"/><path d="M17 14v6M14 17h6"/></svg>Status boxes</button>
+          </div>
+          <div class="menu-group" id="mgAccount">
+            <button class="row-item" data-act="settings"><svg class="i" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Settings</button>
+          </div>
+          <div class="menu-group m-only">
+            <button class="row-item" data-act="m-theme"><svg class="i" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Toggle dark mode</button>
+          </div>
+          <div class="menu-group last">
+            <button class="row-item danger" data-act="logout"><svg class="i" viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l-5-5 5-5M5 12h11"/></svg>Sign out</button>
+          </div>
         </div>
       </div>
     </div>
@@ -65,6 +60,11 @@
     <svg class="i" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg>
     <span id="pauseText"></span>
     <button class="btn sm" id="pauseResume">Resume check-ins</button>
+  </div>
+  <div class="pause-banner load-banner" id="loadBanner" hidden role="alert">
+    <svg class="i" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5"/></svg>
+    <span id="loadMsg"></span>
+    <button class="btn sm" id="loadRetry">Try now</button>
   </div>
   <div class="pause-banner cert-banner" id="certBanner" hidden role="alert">
     <svg class="i" viewBox="0 0 24 24"><path d="M12 3l9 4v5c0 5-3.8 8.5-9 9-5.2-.5-9-4-9-9V7z"/><path d="M12 8v5M12 16.5v.5"/></svg>
@@ -200,17 +200,23 @@
   <button class="btn sm" id="selClear" title="Clear selection (Esc)"><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
 </div>
 
-<!-- ===== Admin panel ===== -->
+<!-- ===== Settings (yours, check-ins and administration in one place) ===== -->
 <div class="admin-back" id="adminBack" hidden>
-  <div class="admin" role="dialog" aria-modal="true" aria-label="Administration">
+  <div class="admin" role="dialog" aria-modal="true" aria-label="Settings">
     <nav class="admin-nav">
-      <h2><svg class="i" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>Admin</h2>
-      <button data-tab="users"><svg class="i" viewBox="0 0 24 24"><circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M17 11a3 3 0 1 0 0-6M22 21a6 6 0 0 0-4-5.6"/></svg>Users</button>
-      <button data-tab="sso"><svg class="i" viewBox="0 0 24 24"><path d="M4 21V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v16M16 9h3a1 1 0 0 1 1 1v11M2 21h20M8 7h4M8 11h4M8 15h4"/></svg>Single sign-on</button>
-      <button data-tab="apikey"><svg class="i" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M16 7l3 3M14 9l2 2"/></svg>API key</button>
-      <button data-tab="ports"><svg class="i" viewBox="0 0 24 24"><path d="M4 12h5M15 12h5"/><rect x="9" y="8" width="6" height="8" rx="1.5"/><path d="M11 8V5M13 8V5M12 16v3"/></svg>Port checks</button>
-      <button data-tab="issues"><svg class="i" viewBox="0 0 24 24"><path d="M12 3l9.5 16.5h-19z"/><path d="M12 10v4M12 17v.5"/></svg>Issues</button>
-      <button data-tab="tls"><svg class="i" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>HTTPS</button>
+      <h2><svg class="i" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Settings</h2>
+      <div class="nav-group">General</div>
+      <button data-tab="prefs"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>Preferences</button>
+      <button data-tab="checkins"><svg class="i" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Check-ins</button>
+      <div class="nav-group" data-min="settingsView">Administration</div>
+      <button data-tab="users" data-min="settingsView"><svg class="i" viewBox="0 0 24 24"><circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M17 11a3 3 0 1 0 0-6M22 21a6 6 0 0 0-4-5.6"/></svg>Users</button>
+      <button data-tab="sso" data-min="settingsView"><svg class="i" viewBox="0 0 24 24"><path d="M4 21V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v16M16 9h3a1 1 0 0 1 1 1v11M2 21h20M8 7h4M8 11h4M8 15h4"/></svg>Single sign-on</button>
+      <button data-tab="apikey" data-min="settingsView"><svg class="i" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M16 7l3 3M14 9l2 2"/></svg>API key</button>
+      <button data-tab="ports" data-min="settingsView"><svg class="i" viewBox="0 0 24 24"><path d="M4 12h5M15 12h5"/><rect x="9" y="8" width="6" height="8" rx="1.5"/><path d="M11 8V5M13 8V5M12 16v3"/></svg>Port checks</button>
+      <button data-tab="issues" data-min="settingsView"><svg class="i" viewBox="0 0 24 24"><path d="M12 3l9.5 16.5h-19z"/><path d="M12 10v4M12 17v.5"/></svg>Issues</button>
+      <button data-tab="tls" data-min="settingsView"><svg class="i" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>HTTPS</button>
+      <button data-tab="loadtest" data-min="settingsView"><svg class="i" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Load test</button>
+      <button data-tab="reset" data-min="settingsView"><svg class="i" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5"/></svg>Reset</button>
       <div class="spacer"></div>
       <button id="adminClose"><svg class="i" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>Close</button>
     </nav>

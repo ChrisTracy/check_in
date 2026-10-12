@@ -14,22 +14,16 @@
     <div class="brand">
       <a class="logo" href="/" title="Back to the dashboard"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></a>
       <div>
-        <h1>Issues</h1>
+        <h1>Check-In</h1>
         <div class="live" id="liveStatus"><span class="pulse"></span><span id="liveText">Connecting…</span></div>
       </div>
     </div>
+    <nav class="top-tabs" id="topTabs" aria-label="Pages">
+      <a href="/">Dashboard</a>
+      <a href="/issues" id="tabIssues" class="on" aria-current="page">Issues<b class="iss-badge" id="issuesBadge" hidden></b></a>
+    </nav>
     <div class="top-actions">
-      <a class="btn" href="/" id="dashLink"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span>Dashboard</span></a>
       <button class="btn" id="rulesBtn" hidden><svg class="i" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span>Issue rules</span></button>
-      <div class="dropdown" id="exportWrap" hidden>
-        <button class="btn" id="exportBtn"><svg class="i" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg><span>Export</span><svg class="i chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
-        <div class="menu right" id="exportMenu">
-          <button data-export="issues"><b>Issues</b><small>One row per issue, with problems, notes and log</small></button>
-          <button data-export="log"><b>Issue log</b><small>One row per log entry and note</small></button>
-          <button data-export="issues-view"><b>Current list only</b><small>The issues matching the filters, one row each</small></button>
-        </div>
-      </div>
-      <button class="btn danger" id="clearBtn" hidden><svg class="i" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg><span>Clear issues</span></button>
       <button class="icon-btn" id="themeBtn" title="Toggle theme"><svg class="i" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
       <div id="userMenuSlot"></div>
     </div>

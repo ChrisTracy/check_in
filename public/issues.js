@@ -39,7 +39,7 @@
 
   const S = {
     me: null, cfg: null, users: null, fields: [],
-    status: local.get('issues.status', 'active'), q: '', assignee: local.get('issues.assignee', ''),
+    status: local.get('issues.status', 'open'), q: '', assignee: local.get('issues.assignee', ''),
     issues: [], total: 0, summary: {}, want: 200, // how many rows of the list are loaded (Show more adds a page)
     openId: null, detail: null, connected: false,
   };
@@ -146,7 +146,7 @@
   async function init() {
     applyTheme();
     try { S.me = await api('/api/auth/me'); } catch { return; }
-    window.CheckinUserMenu?.mount($('#userMenuSlot'), { me: S.me, modal, toast, page: 'issues', onTheme: () => $('#themeBtn').click() });
+    window.CheckinUserMenu?.mount($('#userMenuSlot'), { me: S.me, page: 'issues', onExport: (k) => exportCsv(k), onTheme: () => $('#themeBtn').click() });
     if (!can('issues')) return showOff('Your role can\'t see issues.');
     try { S.cfg = await api('/api/issues/config'); } catch (e) { return showOff(esc(e.message)); }
     bind();
@@ -158,9 +158,7 @@
   async function start() {
     $('#offBox').hidden = true;
     for (const id of ['#stats', '#toolbar', '#main']) $(id).hidden = false;
-    $('#rulesBtn').hidden = !can('issueRules');
-    $('#clearBtn').hidden = !can('issueRules');
-    $('#exportWrap').hidden = !can('export');
+    $('#rulesBtn').hidden = !can('issueRules'); exportItems(true);
     if (can('issueWork')) { try { S.users = (await api('/api/issues/assignees')).users; } catch { S.users = []; } }
     renderAssigneeFilter();
     syncControls();
@@ -172,7 +170,7 @@
 
   function showOff(msg) {
     for (const id of ['#stats', '#toolbar', '#main']) $(id).hidden = true;
-    $('#rulesBtn').hidden = true; $('#clearBtn').hidden = true; $('#exportWrap').hidden = true;
+    $('#rulesBtn').hidden = true; exportItems(false);
     const box = $('#offBox');
     box.hidden = false;
     box.innerHTML = msg || `<b>The issues list is turned off.</b> ${can('issuesEnable')
@@ -283,7 +281,14 @@
   }
 
   // ------------------------------------------------------------ list
+  function setBadge(n) {
+    const b = $('#issuesBadge');
+    if (!b) return;
+    b.hidden = !n; b.textContent = n > 999 ? '999+' : String(n);
+  }
+  function exportItems(show) { document.querySelectorAll('[data-um^="x-"]').forEach((b) => { b.hidden = !show; }); }
   function renderStats() {
+    setBadge((S.summary && S.summary.open) || 0);
     const s = S.summary;
     $('#sOpen').textContent = nf.format(s.open || 0);
     $('#sUnassigned').textContent = nf.format(s.unassigned || 0);
@@ -297,7 +302,7 @@
     $('#sAllClear').closest('.stat').hidden = !showAll;
     $('#sAllClear').textContent = nf.format(s.allClear || 0);
     $('#statusSeg [data-status="allclear"]').hidden = !showAll;
-    if (!showAll && S.status === 'allclear') { S.status = 'active'; syncControls(); }
+    if (!showAll && S.status === 'allclear') { S.status = 'open'; syncControls(); }
     $$('#stats .stat').forEach((b) => b.classList.toggle('active', b.dataset.q === which));
     $('#sMine').closest('.stat').hidden = !S.me.user?.id;
   }
@@ -331,7 +336,7 @@
     $('#countText').textContent = S.total ? `${nf.format(S.issues.length)}${S.total > S.issues.length ? ` of ${nf.format(S.total)}` : ''} issue${S.total === 1 ? '' : 's'}` : '';
     $('#moreWrap').hidden = S.issues.length >= S.total;
     if (!S.issues.length) {
-      const filtered = S.q || S.assignee || S.status !== 'active';
+      const filtered = S.q || S.assignee || S.status !== 'open';
       list.innerHTML = `<div class="iss-empty">${filtered
         ? '<div class="big">No issues match</div>Try another filter or search.'
         : S.cfg.rules.some((r) => r.enabled)
@@ -725,26 +730,6 @@
     });
   }
 
-  function clearDialog() {
-    const n = (S.summary.total || 0);
-    modal({
-      title: 'Clear the issues list?',
-      body: `<div class="warn-box" style="margin:0 0 12px">This permanently deletes <b>every issue: ${nf.format(n)} in total</b>, open, ignored and closed, together with everything in them:
-          their problems, notes, assignments and logs. It can't be undone. Export a CSV first if you might need them.</div>
-        <p>Rules and settings are kept. Problems that are still happening open fresh issues right away (without their old assignments).</p>
-        <label class="checkline"><input type="checkbox" id="clearOk"> I understand that all ${nf.format(n)} issues and their notes and logs will be deleted</label>`,
-      actions: [{ label: 'Cancel' }, { label: 'Delete all issues', cls: 'danger solid', id: 'clearGo', disabled: true, onClick: async () => {
-        try {
-          const r = await api('/api/issues?confirm=true', { method: 'DELETE' });
-          toast(`Deleted ${nf.format(r.deleted)} issue${r.deleted === 1 ? '' : 's'}`);
-          closeDrawer();
-          scheduleReload();
-        } catch (e) { toast(e.message, 'error'); return false; }
-      } }],
-    });
-    $('#clearOk').addEventListener('change', (e) => { $('#clearGo').disabled = !e.target.checked; });
-  }
-
   function exportCsv(kind) {
     const p = kind === 'issues-view' ? query() : 'status=all';
     const a = document.createElement('a');
@@ -794,10 +779,6 @@
       } }] });
     });
     $('#rulesBtn').addEventListener('click', rulesDialog);
-    $('#clearBtn').addEventListener('click', clearDialog);
-    $('#exportBtn').addEventListener('click', (e) => { e.stopPropagation(); $('#exportMenu').classList.toggle('open'); });
-    $('#exportMenu').addEventListener('click', (e) => { const k = e.target.closest('[data-export]')?.dataset.export; if (k) { $('#exportMenu').classList.remove('open'); exportCsv(k); } });
-    document.addEventListener('click', (e) => { if (!e.target.closest('#exportWrap')) $('#exportMenu').classList.remove('open'); });
     $('#themeBtn').addEventListener('click', () => {
       const s = local.get('settings', {});
       s.theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
@@ -807,10 +788,10 @@
     // The account menu closes itself on Esc (usermenu.js); note before it does whether it was open,
     // so that Esc only closes the menu and not the drawer or dialog behind it too.
     let menuWasOpen = false;
-    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') menuWasOpen = Boolean($('#umMenu.open') || $('#exportMenu.open')); }, true);
+    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') menuWasOpen = Boolean($('#umMenu.open')); }, true);
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
-      if (menuWasOpen) { menuWasOpen = false; $('#exportMenu').classList.remove('open'); return; }
+      if (menuWasOpen) { menuWasOpen = false; return; }
       if (!$('#modalBack').hidden) requestCloseModal();
       else if (S.openId) leaveDrawer(closeDrawer);
     });

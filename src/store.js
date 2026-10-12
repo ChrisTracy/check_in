@@ -10,7 +10,20 @@ export class HttpError extends Error {
 
 // Set by the server; a device can't send these (they'd override the real values in the API output).
 const RESERVED = new Set(['id', 'created', 'modified', '_version', '_rev', '_boxes']);
-const MAX_ID_LEN = 512;
+const MAX_ID_LEN = 64;
+const MAX_VALUE_DEPTH = 32; // how deeply a field value may nest (objects / arrays inside each other)
+
+/** Does this value nest deeper than `max`? Iterative, so a hostile payload can't overflow the stack here. */
+function tooDeep(value, max = MAX_VALUE_DEPTH) {
+  if (!value || typeof value !== 'object') return false;
+  const stack = [[value, 1]];
+  while (stack.length) {
+    const [v, d] = stack.pop();
+    if (d > max) return true;
+    for (const c of Array.isArray(v) ? v : Object.values(v)) if (c && typeof c === 'object') stack.push([c, d + 1]);
+  }
+  return false;
+}
 const MAX_FIELD_NAME_LEN = 200;
 
 /**
@@ -36,6 +49,7 @@ export function normalizeInput(input, { maxFields = 500, skipEmpty = false } = {
     if (skipEmpty && (value === '' || value === undefined)) continue;
     if (key.length > MAX_FIELD_NAME_LEN) throw new HttpError(400, `Field name too long: "${key.slice(0, 40)}…"`);
     if (++count > maxFields) throw new HttpError(400, `Too many fields (max ${maxFields})`);
+    if (tooDeep(value)) throw new HttpError(400, `Field "${key.slice(0, 40)}" is nested too deeply (max ${MAX_VALUE_DEPTH} levels)`);
     fields[key] = value === undefined ? null : value;
   }
   if (id === undefined || id === null || (typeof id === 'object')) throw new HttpError(400, '"id" is required');
@@ -111,7 +125,7 @@ export class Store extends EventEmitter {
   #rebuildFields() {
     this.fieldCounts.clear();
     const rows = this.db.prepare(
-      'SELECT j.key AS k, COUNT(*) AS n FROM records r, json_each(r.data) j GROUP BY j.key'
+      'SELECT j.key AS k, COUNT(*) AS n FROM records r, json_each(r.data) j WHERE json_valid(r.data) GROUP BY j.key'
     ).all();
     for (const { k, n } of rows) this.fieldCounts.set(k, n);
   }

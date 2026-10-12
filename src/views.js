@@ -125,6 +125,20 @@ export class SavedViews {
     if (ownerId !== undefined && ownerId !== auth.userId) throw new HttpError(404, 'View not found');
   }
 
+  /**
+   * Views saved before views remembered which fields they know have no `known` list. Give each the fields that
+   * exist now (they showed all of them), so only fields that appear from here on start hidden in them.
+   */
+  stampKnown(fields) {
+    const list = [...fields].slice(0, 5000);
+    for (const r of this.db.prepare('SELECT id, state FROM views').all()) {
+      const st = safeParse(r.state);
+      if (Array.isArray(st.known)) continue;
+      st.known = list;
+      this.db.prepare('UPDATE views SET state = ? WHERE id = ?').run(JSON.stringify(cleanViewState(st)), r.id);
+    }
+  }
+
   /** Create, or overwrite the view with the same name in the same scope. */
   save(auth, { scope = 'personal', name, state }) {
     if (!SCOPES.has(scope)) throw new HttpError(400, 'scope must be personal or team');

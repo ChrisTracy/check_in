@@ -93,7 +93,7 @@ test('splitPem and allow lists', () => {
 test('deploy keys: only admins manage them; shown once; stored hashed', async (t) => {
   const { app, admin, power, accounts } = await setup();
   t.after(() => app.close());
-  assert.equal((await power({ url: '/api/admin/tls/deploy-keys' })).statusCode, 403);
+  assert.equal((await power({ url: '/api/admin/tls/deploy-keys' })).statusCode, 200, 'power users can list deploy keys (no secrets)');
   assert.equal((await power({ method: 'POST', url: '/api/admin/tls/deploy-keys', payload: { name: 'x' } })).statusCode, 403);
   assert.equal((await admin({ method: 'POST', url: '/api/admin/tls/deploy-keys', payload: { name: '' } })).statusCode, 400);
   assert.equal((await admin({ method: 'POST', url: '/api/admin/tls/deploy-keys', payload: { name: 'x', allowIps: 'nope' } })).statusCode, 400);
@@ -235,7 +235,8 @@ test('certificates copied into the data volume are picked up and logged', async 
 test('ACME settings validation and the challenge route', async (t) => {
   const { app, admin, power } = await setup();
   t.after(() => app.close());
-  assert.equal((await power({ url: '/api/admin/tls/acme' })).statusCode, 403);
+  assert.equal((await power({ url: '/api/admin/tls/acme' })).statusCode, 200, 'power users can look at the ACME settings');
+  assert.equal((await power({ method: 'PUT', url: '/api/admin/tls/acme', payload: { enabled: false } })).statusCode, 403);
   const put = (payload) => admin({ method: 'PUT', url: '/api/admin/tls/acme', payload });
   assert.equal((await put({ domains: 'localhost' })).statusCode, 400);
   assert.equal((await put({ domains: '10.0.0.5' })).statusCode, 400);

@@ -35,9 +35,14 @@ export async function verifyPassword(password, stored) {
   return crypto.timingSafeEqual(key, expected);
 }
 
+/** A plain host name, IPv4 address or [IPv6] with an optional port: what a Host header may look like. */
+export const HOST_RE = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]{2,45}\])(?::\d{1,5})?$/;
+export const MAX_USERNAME_LEN = 128;
+export const MAX_PASSWORD_LEN = 256;
+
 export function passwordProblem(pw) {
   if (typeof pw !== 'string' || pw.length < 10) return 'Password must be at least 10 characters';
-  if (pw.length > 256) return 'Password is too long';
+  if (pw.length > MAX_PASSWORD_LEN) return 'Password is too long';
   return null;
 }
 

@@ -6,14 +6,7 @@
   <title>Sign in · Check-In</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%234f46e5'/><path d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
   <link rel="stylesheet" href="styles.css">
-  <script>
-    (function () {
-      var t = 'auto';
-      try { t = (JSON.parse(localStorage.getItem('checkin.settings') || '{}').theme) || 'auto'; } catch (e) {}
-      var dark = t === 'dark' || (t === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
-      document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-    })();
-  </script>
+  <script src="theme-init.js"></script>
 </head>
 <body class="auth-body">
   <div class="auth">

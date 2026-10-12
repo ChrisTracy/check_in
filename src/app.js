@@ -90,6 +90,9 @@ export function timeRanges(q, staleMinutes, now = Date.now()) {
   return ranges;
 }
 
+const CSP = ["default-src 'self'", "script-src 'self'", "style-src 'self' 'unsafe-inline'", "img-src 'self' data:", "font-src 'self' data:",
+  "connect-src 'self'", "object-src 'none'", "base-uri 'self'", "form-action 'self'", "frame-ancestors 'none'"].join('; ');
+
 export function buildApp({ config, store, accounts, oidc }) {
   // Keep a reference to Fastify's request handler so the optional HTTPS server can share it.
   let handler;
@@ -119,6 +122,7 @@ export function buildApp({ config, store, accounts, oidc }) {
   app.decorate('tls', tlsManager);
   app.addHook('onRequest', async (req, reply) => {
     const target = tlsManager.redirectTarget(req);
+    if (target === false) return reply.code(400).type('text/plain').send('Bad Host header');
     if (target) return reply.code(307).header('Location', target).send();
   });
 
@@ -140,6 +144,9 @@ export function buildApp({ config, store, accounts, oidc }) {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'same-origin');
     reply.header('X-Frame-Options', 'DENY');
+    // Scripts only from this site (no inline scripts, no eval): a stray bit of unescaped text can't run code.
+    // Styles allow inline because the pages set a few style attributes; images allow data: for built-in icons.
+    reply.header('Content-Security-Policy', CSP);
     if (safeProto(req) === 'https' && tlsManager.settings().hsts && tlsManager.mode !== 'off') {
       reply.header('Strict-Transport-Security', 'max-age=31536000');
     }
@@ -171,6 +178,7 @@ export function buildApp({ config, store, accounts, oidc }) {
 
   // ---- auth --------------------------------------------------------------
   const views = new SavedViews(accounts.db);
+  views.stampKnown(store.fieldCounts.keys());
   registerAuth(app, { accounts, oidc, config, broadcast, views });
   registerViews(app, { views, broadcast });
   const boxes = new StatBoxes({ db: store.db, store, accounts });
@@ -195,7 +203,8 @@ export function buildApp({ config, store, accounts, oidc }) {
 
   // ---- admin: HTTPS / TLS --------------------------------------------------
   const tlsCap = { config: { cap: 'tls' } };
-  app.get('/api/admin/tls', tlsCap, async () => tlsManager.state());
+  const tlsView = { config: { cap: 'settingsView' } }; // power users can look (no keys or secrets are returned)
+  app.get('/api/admin/tls', tlsView, async () => tlsManager.state());
   app.put('/api/admin/tls', tlsCap, async (req) => tlsManager.updateSettings(req.body || {}));
   app.post('/api/admin/tls/certificate', { ...tlsCap, bodyLimit: 2 * 1024 * 1024 }, async (req) =>
     tlsManager.install(req.body, req.auth.user?.username || req.auth.name));
@@ -203,7 +212,7 @@ export function buildApp({ config, store, accounts, oidc }) {
 
   // Certificate deploy keys: automation can replace the certificate and nothing else.
   const deployKeys = new CertDeployKeys({ accounts, tls: tlsManager });
-  app.get('/api/admin/tls/deploy-keys', tlsCap, async () => ({ keys: deployKeys.list() }));
+  app.get('/api/admin/tls/deploy-keys', tlsView, async () => ({ keys: deployKeys.list() }));
   app.post('/api/admin/tls/deploy-keys', tlsCap, async (req, reply) =>
     reply.code(201).header('cache-control', 'no-store').send(deployKeys.create(req.body || {}, req.auth.user?.username || req.auth.name)));
   app.put('/api/admin/tls/deploy-keys/:id', tlsCap, async (req) => ({ deployKey: deployKeys.update(req.params.id, req.body || {}) }));

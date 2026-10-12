@@ -52,6 +52,9 @@ export function siteUrl(req, override) {
     let u;
     try { u = new URL(String(override)); } catch { throw new BadOption('url must be a full address like https://checkin.example.com'); }
     if (!/^https?:$/.test(u.protocol)) throw new BadOption('url must start with http:// or https://');
+    // The address ends up inside the generated shell script, so hold it to the same plain
+    // characters as a Host header ($ ` ; & ' " ( ) { } are all legal in a URL host name).
+    if (u.username || u.password || !/^[A-Za-z0-9.\-[\]:]{1,255}$/.test(u.host)) throw new BadOption('url must be a plain address like https://checkin.example.com');
     return u.origin;
   }
   const host = String(req.host || req.headers.host || '');
@@ -115,7 +118,7 @@ FIELDS="\${CHECKIN_FIELDS:-${o.fields}}"             # field groups: default, al
 EXCLUDE="\${CHECKIN_EXCLUDE:-${o.exclude}}"          # field groups to leave out
 EXTRA="\${CHECKIN_EXTRA:-}"                         # extra fields, e.g. 'site=Dallas,owner=\${OWNER:-it}'
 [ -n "$EXTRA" ] || EXTRA='${o.extra}'   # single quotes: \${NAME} and %NAME% are read on each run, not now
-CHECK_PORTS="\${CHECKIN_CHECK_PORTS:-${o.ports}}"    # ports the server tests on each check-in, e.g. 22 (Admin → Port checks)
+CHECK_PORTS="\${CHECKIN_CHECK_PORTS:-${o.ports}}"    # ports the server tests on each check-in, e.g. 22 (Admin > Port checks)
 INSECURE="\${CHECKIN_INSECURE:-${o.insecure ? 1 : ''}}"           # 1 = accept a self-signed certificate
 # --------------------------------------------------------------------------------------------------
 set -eu
@@ -158,7 +161,7 @@ function windowsInstaller(site, o) {
   $Fields   = if ($env:CHECKIN_FIELDS)  { $env:CHECKIN_FIELDS }  else { '${q(o.fields)}' }   # default, all, or e.g. cpu,ram,disk
   $Exclude  = if ($env:CHECKIN_EXCLUDE) { $env:CHECKIN_EXCLUDE } else { '${q(o.exclude)}' }  # groups to leave out
   $Extra    = if ($env:CHECKIN_EXTRA)   { $env:CHECKIN_EXTRA }   else { '${q(o.extra)}' }    # e.g. site=%SITE%,owner=it (%NAME% / \${NAME} are read on each run)
-  $CheckPorts = if ($env:CHECKIN_CHECK_PORTS) { $env:CHECKIN_CHECK_PORTS } else { '${q(o.ports)}' }  # ports the server tests on each check-in, e.g. 3389 (Admin → Port checks)
+  $CheckPorts = if ($env:CHECKIN_CHECK_PORTS) { $env:CHECKIN_CHECK_PORTS } else { '${q(o.ports)}' }  # ports the server tests on each check-in, e.g. 3389 (Admin > Port checks)
   $Insecure = ${o.insecure ? '$true' : '$false'}                                             # $true = accept a self-signed certificate
   # -----------------------------------------------------------------------------------------------
   $ErrorActionPreference = 'Stop'

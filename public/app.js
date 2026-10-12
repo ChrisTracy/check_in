@@ -83,14 +83,20 @@
   });
   // Defaults + a saved/stored state, with every value type-checked (see viewstate.js).
   const normView = (st) => Object.assign(DEFAULT_VIEW(), window.CheckinViewState.cleanViewState(st));
+  // The built-in Default View: ID, Status, then these when devices send them, then Modified and Created.
+  // Every other field starts hidden (turn them on in Columns).
+  const DEFAULT_COLS = ['os', 'cpu_pct', 'ram_pct', 'disk_busy_pct', 'disk_pct', 'uptime'];
   const S = {
     records: new Map(), // id -> record
+    loaded: false, // the first full download of the records has succeeded
+    loadError: '', // why it has not, while the page keeps retrying
     searchText: new Map(), // id -> lowercase haystack
     rev: 0,
     fieldCounts: new Map(),
     fields: [],
     // First visit on a phone: cards read better than a wide table.
     view: normView(store.get('view', null) || (matchMedia('(max-width: 720px)').matches ? { layout: 'cards' } : {})),
+    pendingDefault: false, // the Default View's columns are applied as soon as there are fields to apply them to
     viewRef: store.get('viewRef', ''), // '' = Default, 'p:<id>' = personal view, 't:<id>' = team view
     views: { personal: [], team: [] }, // saved views from the server
     viewDefaults: { mine: null, team: null }, // which view opens first (see effectiveDefault)
@@ -109,6 +115,8 @@
     boxesVersion: null, // server's version of that list (bumps on every save)
     connected: false,
   };
+  // First visit, or a browser still holding the old unchanged layout: open with the Default View's columns.
+  { const st = store.get('view', null); S.pendingDefault = !S.viewRef && (!st || (!Array.isArray(st.known) && !(st.hidden || []).length && !(st.order || []).length)); }
 
   // Ids of the records matching the current filters (built on demand, reset by computeView).
   Object.defineProperty(S, 'matching', {
@@ -157,6 +165,48 @@
   }
   function refreshFieldList() {
     S.fields = [...S.fieldCounts.entries()].sort((a, b) => b[1] - a[1] || collator.compare(a[0], b[0])).map((e) => e[0]);
+    hideNewFields();
+  }
+  // The Default View's columns: ID, Status, whichever of DEFAULT_COLS exist (in that order), Modified, Created.
+  function applyDefaultColumns() {
+    const v = S.view;
+    v.order = [STATUS_KEY, ...DEFAULT_COLS.filter((f) => S.fieldCounts.has(f)), 'modified', 'created'];
+    v.hidden = S.fields.filter((f) => !DEFAULT_COLS.includes(f));
+    v.known = [...S.fields];
+    v.widths = {};
+  }
+  // A view remembers the fields it has seen (`known`). A field that shows up later, such as a new agent field,
+  // starts hidden in the current view; turn it on in Columns. A view without the list (an older one, or the
+  // first visit) counts every field that exists right now as seen, so nothing it showed goes away.
+  // The Default View is the exception for its own columns: when one of those is sent for the first time
+  // it appears, in its place.
+  function hideNewFields() {
+    const v = S.view;
+    if (!S.fields.length) return; // nothing loaded yet: don't count that as "seen nothing"
+    if (S.pendingDefault) { S.pendingDefault = false; applyDefaultColumns(); saveState(); return; }
+    if (!Array.isArray(v.known)) { v.known = [...S.fields]; saveState(); return; }
+    const seen = new Set(v.known);
+    const fresh = S.fields.filter((f) => !seen.has(f));
+    if (!fresh.length) return;
+    const hidden = new Set(v.hidden);
+    for (const f of fresh) {
+      if (!S.viewRef && DEFAULT_COLS.includes(f)) { insertDefaultColumn(v, f); continue; }
+      hidden.add(f);
+    }
+    v.hidden = [...hidden];
+    v.known = [...v.known, ...fresh];
+    saveState();
+    updateViewDirty();
+  }
+  // Put a standard column where the Default View has it: after the nearest standard column before it that
+  // is already in the order (or after Status), unless the order already places it.
+  function insertDefaultColumn(v, f) {
+    if (v.order.includes(f)) return;
+    const order = v.order.length ? v.order.slice() : [STATUS_KEY, ...S.fields.filter((c) => c !== f && !v.hidden.includes(c)), 'modified', 'created'];
+    let at = order.indexOf(STATUS_KEY) + 1;
+    for (const c of DEFAULT_COLS.slice(0, DEFAULT_COLS.indexOf(f))) { const i = order.indexOf(c); if (i >= 0) at = Math.max(at, i + 1); }
+    order.splice(at, 0, f);
+    v.order = order;
   }
 
   // Full download of every record: used on page load (and when the server's data was replaced).
@@ -177,11 +227,39 @@
         refreshFieldList();
         updateSelBar();
         if (S.selected && !S.records.has(S.selected)) closeDrawer();
+        markLoaded();
         scheduleRender(true);
       } while (loadAgain);
     })().finally(() => { loadingAll = null; loadAgain = false; });
     return loadingAll;
   }
+  // The first download can fail (the server is restarting, a proxy hiccups). The page then says so, keeps
+  // trying with a growing delay, and also tries again the moment the live connection is up, the browser
+  // comes back online or the tab is shown. Without this the table stayed empty until the next check-in.
+  let retryTimer = null;
+  let retryDelay = 1000;
+  function markLoaded() {
+    S.loaded = true; S.loadError = ''; retryDelay = 1000;
+    clearTimeout(retryTimer);
+    $('#loadBanner').hidden = true;
+  }
+  async function ensureLoaded() {
+    if (S.loaded || loadingAll) return; // done, or a download is already under way (it retries itself if it fails)
+    clearTimeout(retryTimer);
+    try {
+      await loadAll();
+    } catch (e) {
+      if (e.message === 'API key required') return;
+      if (S.loaded) return; // a live update filled the table meanwhile
+      S.loadError = e.message || 'network error';
+      $('#loadMsg').innerHTML = `<b>Can't load the records yet</b> (${esc(S.loadError)}). Trying again…`;
+      $('#loadBanner').hidden = false;
+      scheduleRender(true);
+      retryTimer = setTimeout(ensureLoaded, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 15000);
+    }
+  }
+
   // Records this tab knows are gone (a delete event, or our own delete request succeeded).
   function dropRecords(ids) {
     // A full download already under way may predate this delete: fetch again when it ends.
@@ -219,6 +297,7 @@
         const now = Date.now();
         for (const r of data.records) { indexRecord(r); S.flash.set(r.id, now); }
         S.rev = Math.max(S.rev, data.rev);
+        if (!S.loaded) { markLoaded(); scheduleRender(true); } // the first load had failed; this update (from revision 0) brought everything
         if (data.records.length) {
           refreshFieldList();
           scheduleLiveRender();
@@ -253,6 +332,7 @@
     es.addEventListener('hello', () => {
       S.connected = true;
       updateLive();
+      if (!S.loaded) ensureLoaded(); // the first load failed: the server is reachable now
       if (everConnected) { // catch up after a reconnect
         resync(); loadIngest(); if (S.view.layout === 'activity') loadActivity();
         loadBoxes().then((changed) => { if (changed) loadAll().catch(() => {}); });
@@ -306,11 +386,10 @@
     $('#liveText').textContent = !S.connected ? 'Reconnecting…' : paused ? 'Check-ins paused' : 'Live';
     const who = S.ingest.by ? ` by ${S.ingest.by}` : '';
     el.title = paused ? `Paused${who} ${relTime(S.ingest.since)}. New check-ins are rejected with HTTP 503.` : 'Accepting check-ins';
-    $('#liveToggle').innerHTML = paused ? icon(ICON.play) + '<span>Resume check-ins</span>' : icon(ICON.pause) + '<span>Pause check-ins</span>';
-    $('#liveToggle').title = paused ? 'Start accepting check-ins again' : 'Stop accepting check-ins (devices get HTTP 503)';
     $('#pauseBanner').hidden = !paused;
     $('#pauseText').innerHTML = `<b>Check-ins are paused</b>${esc(who)} ${esc(relTime(S.ingest.since))}. New check-ins and imports are rejected with HTTP 503 until resumed.`;
     $('#pauseResume').hidden = !can('pause');
+    window.CheckinAdmin?.refresh?.();
   }
 
   // Admins: warn on the dashboard when the HTTPS certificate is close to expiring or Let's Encrypt is failing.
@@ -338,17 +417,17 @@
     $('#certBannerText').innerHTML = msg;
   }
 
-  // The Issues button (when an admin has turned issues on): open-issue count.
+  // The Issues tab (when an admin has turned issues on): open-issue count. The tab row stays hidden otherwise.
   async function loadIssuesBadge() {
-    const btn = $('#issuesBtn');
-    if (!can('issues')) { btn.hidden = true; $('#issuesItem').hidden = true; return; }
+    const tabs = $('#topTabs');
+    if (!can('issues')) { tabs.hidden = true; return; }
     try {
       const s = await apiJson('/api/issues/summary');
-      btn.hidden = !s.enabled;
-      $('#issuesItem').hidden = !s.enabled;
+      tabs.hidden = !s.enabled;
       const n = s.open || 0;
-      for (const b of [$('#issuesBadge'), $('#issuesBadge2')]) { b.hidden = !n; b.textContent = n > 999 ? '999+' : String(n); }
-      btn.title = s.enabled ? `Issues: ${n} open, ${s.ignored || 0} ignored, ${s.mine || 0} assigned to you` : '';
+      const b = $('#issuesBadge');
+      b.hidden = !n; b.textContent = n > 999 ? '999+' : String(n);
+      $('#tabIssues').title = s.enabled ? `Issues: ${n} open, ${s.ignored || 0} ignored, ${s.mine || 0} assigned to you` : '';
     } catch { /* ignore */ }
   }
 
@@ -658,7 +737,10 @@
     renderHeader();
     const empty = $('#empty');
     if (S.view.layout === 'activity') empty.hidden = true;
-    else if (!c.all) {
+    else if (!S.loaded) {
+      empty.hidden = false;
+      empty.innerHTML = `<div><div class="big">${S.loadError ? 'Waiting for the server…' : 'Loading…'}</div>${S.loadError ? '<div>The records will appear as soon as it answers.</div>' : ''}</div>`;
+    } else if (!c.all) {
       empty.hidden = false;
       const origin = location.origin;
       empty.innerHTML = `<div><div class="big">No check-ins yet</div>
@@ -1286,7 +1368,17 @@
   }
   const canWriteView = (v) => Boolean(v) && (v.scope === 'personal' || can('teamViews'));
   // Comparable form of a view state (fills in defaults so old and new states line up).
-  const viewKey = (st) => JSON.stringify(normView(st));
+  // Fields the view hasn't seen count as hidden, so a saved view and the live one compare equal while a new field is hidden.
+  const viewKey = (st) => {
+    const v = normView(st);
+    if (Array.isArray(v.known)) {
+      const seen = new Set(v.known);
+      v.hidden = [...v.hidden, ...S.fields.filter((f) => !seen.has(f))];
+    }
+    v.hidden = [...new Set(v.hidden)].sort();
+    delete v.known;
+    return JSON.stringify(v);
+  };
   function updateViewDirty() {
     const saved = findView(S.viewRef);
     const dirty = saved ? viewKey(saved.state) !== viewKey(S.view) : false;
@@ -1376,6 +1468,8 @@
     S.viewRef = ref;
     const saved = findView(ref);
     S.view = normView(saved ? saved.state : {});
+    S.pendingDefault = !saved; // the standard layout: the Default View's columns
+    hideNewFields();
     S.collapsed.clear();
     syncControls();
     saveState();
@@ -1513,29 +1607,21 @@
 
   function applyCaps() {
     const u = S.me.user;
-    $('#importBtn').hidden = !can('import');
-    $('#exportBtn').parentElement.hidden = !can('export');
-    $('#clearBtn').hidden = !can('clearAll');
-    $('#liveToggle').hidden = !can('pause');
     $('#dDelete').hidden = !can('delete');
-    $('#adminItem').hidden = !can('users');
-    $('#loadtestItem').hidden = !can('loadTest');
     $('#agentsItem').hidden = !can('checkin');
     $('#boxesItem').hidden = !can('boxes');
-    $('#pwItem').hidden = S.me.kind !== 'session';
     $('#selDelete').hidden = !can('delete');
     $('#selExport').hidden = !can('export');
-    $('#mPause').hidden = !can('pause');
     $('#mImport').hidden = !can('import');
     $('#mExportView').hidden = !can('export');
     $('#mExportAll').hidden = !can('export');
-    $('#mClear').hidden = !can('clearAll');
+    $('#mExportHistory').hidden = !can('export');
     for (const el of [$('#userAvatar'), $('#userAvatar2')]) el.textContent = initials(u);
     $('#userName').textContent = u.name || u.username;
     $('#userName2').textContent = u.name || u.username;
     $('#userRole').textContent = S.me.roleLabel;
     $('#userSub').innerHTML = `<span>${esc(u.email || u.username)}</span><span class="role-badge r-${esc(S.me.role)}">${esc(S.me.roleLabel)}</span>`;
-    $('#liveStatus').style.cursor = can('pause') ? 'pointer' : 'default';
+    $('#liveStatus').style.cursor = 'pointer';
     scheduleRender(true);
   }
 
@@ -1555,6 +1641,8 @@
         <p style="font-size:12px">At least 10 characters. Your other sessions will be signed out.</p>`,
       actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
         const next = $('#pwNew').value;
+        if (!next) { toast('Enter a new password', 'error'); return false; }
+        if (next.length < 10) { toast('Password must be at least 10 characters', 'error'); return false; }
         if (next !== $('#pwNew2').value) { toast('Passwords do not match', 'error'); return false; }
         try {
           await apiJson('/api/auth/password', { method: 'POST', headers: { 'content-type': 'application/json' },
@@ -1693,57 +1781,23 @@
     } catch (e) { toast('Import failed: ' + e.message, 'error'); }
   }
 
-  function confirmClearAll() {
-    const total = S.records.size;
-    modal({
-      title: 'Clear all records?',
-      body: `<div class="warn-box">This permanently deletes <b>all ${nf.format(total)} records and their entire history</b>. It cannot be undone.</div>
-        <p>Consider exporting first. Type <b>CLEAR</b> to confirm.</p>
-        <label>Confirmation<input class="input" id="clearConfirm" autocomplete="off" placeholder="CLEAR"></label>`,
-      actions: [
-        { label: 'Cancel' },
-        { label: 'Delete everything', cls: 'danger solid', id: 'clearGo', onClick: async () => {
-          if ($('#clearConfirm').value.trim() !== 'CLEAR') return false;
-          try {
-            const r = await apiJson('/api/records?confirm=true', { method: 'DELETE' });
-            toast(`Cleared ${nf.format(r.deleted.records)} records and ${nf.format(r.deleted.history)} history entries`);
-          } catch (e) { toast('Clear failed: ' + e.message, 'error'); }
-        } },
-      ],
-    });
-    const go = $('#clearGo');
-    go.disabled = true;
-    $('#clearConfirm').addEventListener('input', (e) => { go.disabled = e.target.value.trim() !== 'CLEAR'; });
-    $('#clearConfirm').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !go.disabled) go.click(); });
+  // Used by the Settings panel (admin.js).
+  function setTheme(t) {
+    S.settings.theme = t;
+    store.set('settings', { theme: S.settings.theme, compact: S.settings.compact });
+    applyTheme();
   }
-
-  function openSettings() {
-    const canThreshold = can('threshold');
-    modal({
-      title: 'Settings',
-      body: `<div class="row">
-          <label>Active threshold (minutes)<input class="input" id="setStale" type="number" min="1" value="${S.settings.staleMinutes}" ${canThreshold ? '' : 'disabled title="Requires the Power user role"'}></label>
-          <label>Theme<select class="select" id="setTheme">
-            ${['auto', 'light', 'dark'].map((t) => `<option ${S.settings.theme === t ? 'selected' : ''} value="${t}">${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}</select></label>
-        </div>
-        <p style="font-size:12px">Records are <b>active</b> within the threshold, <b>aging</b> up to 2×, and <b>stale</b> after that.
-        ${canThreshold ? 'The threshold applies to everyone.' : 'Only power users and admins can change the threshold.'}</p>
-        <p style="font-size:12px">Server keeps <b>${S.config.historyLimit < 0 ? 'unlimited' : S.config.historyLimit}</b> history entries per record (HISTORY_LIMIT).</p>`,
-      actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
-        S.settings.theme = $('#setTheme').value;
-        store.set('settings', { theme: S.settings.theme, compact: S.settings.compact });
-        applyTheme();
-        const m = Math.max(1, Number($('#setStale').value) || 15);
-        if (canThreshold && m !== S.settings.staleMinutes) {
-          try {
-            const r = await apiJson('/api/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ staleMinutes: m }) });
-            S.settings.staleMinutes = r.staleMinutes;
-            toast('Active threshold updated for everyone');
-          } catch (e) { toast(e.message, 'error'); return false; }
-        }
-        scheduleRender(true);
-      } }],
-    });
+  function setCompact(on) {
+    S.settings.compact = !!on;
+    store.set('settings', { theme: S.settings.theme, compact: S.settings.compact });
+    applyTheme();
+    scheduleRender();
+  }
+  async function saveThreshold(m) {
+    const r = await apiJson('/api/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ staleMinutes: m }) });
+    S.settings.staleMinutes = r.staleMinutes;
+    scheduleRender(true);
+    return r.staleMinutes;
   }
 
   function applyTheme() {
@@ -1917,10 +1971,12 @@
       applyTheme();
     });
     matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
-    $('#liveToggle').addEventListener('click', togglePause);
     $('#pauseResume').addEventListener('click', () => setIngestPaused(false));
+    $('#loadRetry').addEventListener('click', () => { retryDelay = 1000; ensureLoaded(); });
+    window.addEventListener('online', () => ensureLoaded());
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) ensureLoaded(); });
     $('#certBannerOpen').addEventListener('click', () => window.CheckinAdmin?.open('tls'));
-    $('#liveStatus').addEventListener('click', () => { if (can('pause')) $('#liveToggle').click(); });
+    $('#liveStatus').addEventListener('click', () => window.CheckinAdmin?.open('checkins'));
 
     // account menu
     $('#userBtn').addEventListener('click', (e) => {
@@ -1928,7 +1984,6 @@
       const open = $('#userMenu').classList.contains('open');
       closeMenus();
       if (!open) {
-        $('#mPause span').textContent = S.ingest.paused ? 'Resume check-ins' : 'Pause check-ins';
         $('#userMenu').classList.add('open');
       }
     });
@@ -1938,20 +1993,15 @@
       if (!act) return;
       closeMenus();
       if (act === 'logout') logout();
-      if (act === 'settings') openSettings();
+      if (act === 'settings') window.CheckinAdmin?.open('prefs');
       if (act === 'boxes') openBoxEditor();
-      if (act === 'password') changePassword();
-      if (act === 'admin') window.CheckinAdmin?.open('users');
       if (act === 'agents') window.CheckinAgents?.open();
-      if (act === 'issues') location.href = '/issues';
-      if (act === 'loadtest') location.href = '/loadtest';
-      // Phone-only shortcuts for the header buttons hidden on small screens
-      if (act === 'm-pause') togglePause();
+      // Data in and out (and, on phones, the theme toggle that the header hides)
       if (act === 'm-import') $('#importFile').click();
       if (act === 'm-export-view') exportView();
       if (act === 'm-export-all') exportServer('/api/export.csv', 'checkins');
+      if (act === 'm-export-history') exportServer('/api/history/export.csv', 'checkin-history');
       if (act === 'm-theme') $('#themeBtn').click();
-      if (act === 'm-clear') $('#clearBtn').click();
     });
 
     // selection bar
@@ -1990,14 +2040,21 @@
       else setView({ filters: S.view.filters.filter((_, i) => 'f' + i !== rm) });
     });
 
+    // A menu opens under its button, right-aligned or left-aligned by its class. When the button sits near
+    // a screen edge (a toolbar that wrapped, a narrow window) it would be cut off, so slide it back into view.
+    const fitMenu = (el) => {
+      el.style.translate = '';
+      const r = el.getBoundingClientRect();
+      const shift = r.left < 8 ? 8 - r.left : r.right > window.innerWidth - 8 ? window.innerWidth - 8 - r.right : 0;
+      if (shift) el.style.translate = shift + 'px 0';
+    };
     // menus
     const toggle = (btn, menu, onOpen) => $(btn).addEventListener('click', (e) => {
       e.stopPropagation();
       const open = $(menu).classList.contains('open');
       closeMenus();
-      if (!open) { $(menu).classList.add('open'); onOpen && onOpen(); }
+      if (!open) { $(menu).classList.add('open'); onOpen && onOpen(); fitMenu($(menu)); }
     });
-    toggle('#exportBtn', '#exportMenu');
     toggle('#columnsBtn', '#columnsPop', () => { $('#colSearch').value = ''; renderColumnList(); });
     $('#filterBtn').addEventListener('click', (e) => {
       e.stopPropagation();
@@ -2005,15 +2062,6 @@
     });
     document.addEventListener('click', (e) => { if (!e.target.closest('.menu')) closeMenus(); });
 
-    $('#exportMenu').addEventListener('click', (e) => {
-      const k = e.target.closest('[data-export]')?.dataset.export;
-      if (!k) return;
-      closeMenus();
-      if (k === 'view') exportView();
-      if (k === 'all') exportServer('/api/export.csv', 'checkins');
-      if (k === 'history') exportServer('/api/history/export.csv', 'checkin-history');
-    });
-    $('#importBtn').addEventListener('click', () => $('#importFile').click());
     $('#importFile').addEventListener('change', (e) => {
       const f = e.target.files[0];
       if (f) importCsv(f);
@@ -2034,7 +2082,6 @@
       if (!can('import')) { toast('Your role can’t import CSV files', 'error'); return; }
       if (/\.csv$/i.test(f.name) || f.type.includes('csv')) importCsv(f); else toast('Drop a .csv file to import', 'error');
     });
-    $('#clearBtn').addEventListener('click', confirmClearAll);
 
     // filter popover
     $('#fField').addEventListener('change', () => { renderOps(); renderValue(); });
@@ -2061,7 +2108,11 @@
     });
     $('#colAll').addEventListener('click', () => { setView({ hidden: [] }); renderColumnList(); });
     $('#colNone').addEventListener('click', () => { setView({ hidden: orderedColumns().filter((c) => c !== 'id') }); renderColumnList(); });
-    $('#colReset').addEventListener('click', () => { setView({ hidden: [], order: [], widths: {} }); renderColumnList(); });
+    $('#colReset').addEventListener('click', () => {
+      if (S.viewRef) setView({ hidden: [], order: [], widths: {} });
+      else { applyDefaultColumns(); setView({}); } // the Default View's own columns
+      renderColumnList();
+    });
     let dragCol = null;
     $('#colList').addEventListener('dragstart', (e) => { dragCol = e.target.closest('.col-item')?.dataset.col; e.dataTransfer.effectAllowed = 'move'; });
     $('#colList').addEventListener('dragover', (e) => {
@@ -2273,18 +2324,18 @@
     loadIssuesBadge();
     setInterval(loadCertWarning, 30 * 60_000);
     connect();
-    try { await loadAll(); } catch (e) { if (e.message !== 'API key required') toast('Could not load records: ' + e.message, 'error'); }
+    await ensureLoaded();
     // /?record=<id> (links from the issues page) opens that device.
     const params = new URLSearchParams(location.search);
     const want = params.get('record');
     const open = params.get('open');
     if (want || open) history.replaceState(null, '', '/');
     if (want) openDrawer(want);
-    // /?open=admin or /?open=agents (from the account menu on the Issues and Load test pages).
-    if (open === 'admin') window.CheckinAdmin?.open('users');
+    // /?open=settings or /?open=agents (from the account menu on the Issues and Load test pages). 'admin' is the old name.
+    if (open === 'settings' || open === 'admin') window.CheckinAdmin?.open(open === 'admin' ? 'users' : 'prefs');
     if (open === 'agents') window.CheckinAgents?.open();
     if (S.view.layout === 'activity') loadActivity();
   }
-  window.CheckinUI = { api, apiJson, modal, closeModal, toast, esc, nf, relTime, absTime, initials, state: S, can, refreshCertWarning: loadCertWarning };
+  window.CheckinUI = { api, apiJson, modal, closeModal, toast, esc, nf, relTime, absTime, initials, state: S, can, refreshCertWarning: loadCertWarning, togglePause, changePassword, setTheme, setCompact, saveThreshold };
   init();
 })();

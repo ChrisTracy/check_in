@@ -33,7 +33,9 @@
       out.sort = (Array.isArray(state.sort) ? state.sort : []).slice(0, 10).filter(isObj)
         .map((s) => ({ key: str(s.key), dir: s.dir === 'asc' ? 'asc' : 'desc' })).filter((s) => s.key);
     }
-    if (has('hidden')) out.hidden = strList(state.hidden, 1000);
+    // `known`: the fields this view has already seen. A field that appears later isn't in it, so it starts hidden.
+    if (has('known')) out.known = strList(state.known, 5000);
+    if (has('hidden')) out.hidden = strList(state.hidden, 5000);
     if (has('order')) out.order = strList(state.order, 1000);
     if (has('widths')) {
       const w = {};
