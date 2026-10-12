@@ -29,6 +29,7 @@
 
   let tab = 'users';
   let users = [];
+  let ssoReady = false; // from /api/admin/users: can SSO-linked accounts sign in right now?
   let userFilter = '';
 
   function head(title, sub, actions = '') {
@@ -62,7 +63,9 @@
   // ================================================================== Users
   async function loadUsers() {
     try {
-      users = (await apiJson('/api/admin/users')).users;
+      const r = await apiJson('/api/admin/users');
+      users = r.users;
+      ssoReady = Boolean(r.ssoReady);
       renderUsers();
     } catch (e) { $('#aBody').innerHTML = `<div class="warn-box">${esc(e.message)}</div>`; }
   }
@@ -155,18 +158,31 @@
     });
   }
 
+  // Can this account sign in at all (the server applies the same rule)?
+  const canSignIn = (x) => !x.disabled && (x.hasPassword || (ssoReady && x.sso));
+  /** Would removing this user's password leave no admin who can sign in? */
+  function removeLocksOut(u) {
+    if (u.role !== 'admin' || !canSignIn(u)) return false;
+    if (ssoReady && u.sso) return false; // still signs in with Microsoft
+    return !users.some((x) => x.id !== u.id && x.role === 'admin' && canSignIn(x));
+  }
+
   function setPassword(u) {
+    const self = u.id === UI.state.me.user.id;
+    const locked = u.hasPassword && removeLocksOut(u);
     modal({
       title: u.hasPassword ? `Reset password for ${u.username}` : `Set a password for ${u.username}`,
       body: `<label>New password<input class="input" id="rpPw" type="password" autocomplete="new-password" placeholder="At least 10 characters"></label>
-        <p style="font-size:12px">The user's existing sessions will be signed out.</p>
-        ${u.hasPassword ? `<label class="switch" style="font-weight:500"><input type="checkbox" id="rpRemove"><span class="track"></span>Remove password (single sign-on only)</label>
+        <p style="font-size:12px">${self ? 'Your other sessions will be signed out; you stay signed in here.' : 'The user\'s existing sessions will be signed out.'}</p>
+        ${u.hasPassword && locked ? `<p style="font-size:12px" id="rpNoRemove">${self ? 'You are' : 'This is'} the last admin who can sign in, so the password can't be removed. Set up single sign-on and link an admin account first.</p>` : ''}
+        ${u.hasPassword && !locked ? `<label class="switch" style="font-weight:500"><input type="checkbox" id="rpRemove"><span class="track"></span>Remove password (single sign-on only)</label>
           ${u.sso ? '' : '<p style="font-size:12px">Accounts with a password are never linked to Microsoft sign-in automatically. Removing the password lets this account be linked on the user\'s next Microsoft sign-in.</p>'}` : ''}`,
       actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
         if ($('#rpRemove')?.checked) return patchUser(u.id, { removePassword: true }, 'Password removed');
         const pw = $('#rpPw').value;
         if (!pw) { toast('Enter a password', 'error'); return false; }
-        await patchUser(u.id, { password: pw }, 'Password updated');
+        if (pw.length < 10) { toast('Password must be at least 10 characters', 'error'); return false; }
+        await patchUser(u.id, { password: pw }, self ? 'Password updated. Your other sessions were signed out.' : 'Password updated');
       } }],
     });
   }
@@ -276,8 +292,11 @@
         <h4>Password sign-in</h4>
         <div class="grid2">
           <label class="radio-card"><input type="radio" name="pwl" value="all" ${passwordLogin === true ? 'checked' : ''}><span><b>Everyone</b><small>The login page shows both Microsoft sign-in and the username/password form.</small></span></label>
-          <label class="radio-card"><input type="radio" name="pwl" value="admins" ${passwordLogin === 'admins' ? 'checked' : ''}><span><b>Admins only</b><small>Only Microsoft sign-in is shown. Local admins can still sign in with a password (break-glass) via "Administrator sign-in".</small></span></label>
+          <label class="radio-card"><input type="radio" name="pwl" value="admins" ${passwordLogin === 'admins' ? 'checked' : ''} ${!sso.ready && passwordLogin !== 'admins' ? 'disabled' : ''}><span><b>Admins only</b><small>Only Microsoft sign-in is shown. Local admins can still sign in with a password (break-glass) via "Administrator sign-in".</small></span></label>
         </div>
+        ${!sso.ready ? `<p class="muted" style="margin:0;font-size:12px" id="pwlNote">${passwordLogin === 'admins'
+          ? 'Single sign-on isn\'t working, so only admins can sign in right now. Choose Everyone, or finish setting up single sign-on.'
+          : '"Admins only" becomes available once single sign-on is set up, turned on and saved; until then nobody else could sign in.'}</p>` : ''}
       </div>`;
     foot(`<button class="btn" id="sTest">Test connection</button><button class="btn primary" id="sSave">Save changes</button>`);
 
@@ -306,6 +325,9 @@
     const pwl = $('input[name=pwl]:checked')?.value === 'admins' ? 'admins' : true;
     $('#sSave').disabled = true;
     try {
+      // Opening password sign-in up goes first (so SSO can then be turned off in the same save);
+      // limiting it to admins goes last (it needs single sign-on to be saved and working).
+      if (pwl === true && pwl !== passwordLogin) passwordLogin = (await apiJson('/api/settings', json('PUT', { passwordLogin: pwl }))).passwordLogin;
       sso = await apiJson('/api/admin/sso', json('PUT', body));
       if (pwl !== passwordLogin) passwordLogin = (await apiJson('/api/settings', json('PUT', { passwordLogin: pwl }))).passwordLogin;
       toast('Single sign-on settings saved');
@@ -402,7 +424,7 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
     });
     $('#kSet')?.addEventListener('click', () => modal({
       title: 'Use your own API key',
-      body: '<label>API key<input class="input" id="kCustom" type="password" autocomplete="off" placeholder="At least 16 characters"></label><p style="font-size:12px">Use this to keep an existing key that devices already have.</p>',
+      body: '<label>API key<input class="input" id="kCustom" type="password" autocomplete="off" placeholder="16–256 characters, no spaces"></label><p style="font-size:12px">Use this to keep an existing key that devices already have. Letters, numbers and punctuation (printable ASCII) only, no spaces.</p>',
       actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
         try {
           renderApiKey(await apiJson('/api/admin/apikey', json('POST', { action: 'set', key: $('#kCustom').value })));
@@ -755,7 +777,10 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
         if (!f) { toast('Choose a .pfx or .p12 file', 'error'); return; }
         body = { type: 'pfx', pfx: await readB64(f), passphrase: $('#tPfxPass').value };
       } else {
-        body = { type: 'self-signed', hostnames: $('#tHosts').value, days: Number($('#tDays').value) || 365 };
+        const d = $('#tDays').value.trim();
+        const days = d === '' ? 365 : Number(d);
+        if (!Number.isInteger(days) || days < 1 || days > 3650) { toast('Valid for (days) must be a whole number from 1 to 3650', 'error'); return; }
+        body = { type: 'self-signed', hostnames: $('#tHosts').value, days };
       }
     } catch { toast('Could not read the file', 'error'); return; }
     $('#tInstall').disabled = true;

@@ -40,10 +40,13 @@
   const S = {
     me: null, cfg: null, users: null, fields: [],
     status: local.get('issues.status', 'active'), q: '', assignee: local.get('issues.assignee', ''),
-    issues: [], total: 0, summary: {}, limit: 200,
+    issues: [], total: 0, summary: {}, want: 200, // how many rows of the list are loaded (Show more adds a page)
     openId: null, detail: null, connected: false,
   };
   const can = (cap) => Boolean(S.me?.caps?.[cap]);
+  const PAGE = 200;
+  const MAX_PAGE = 1000; // the server's largest page
+  const hasOwn = (o, k) => typeof k === 'string' && Object.hasOwn(o, k);
 
   // ------------------------------------------------------------ basics
   async function api(path, opts = {}) {
@@ -64,7 +67,11 @@
     $('#toasts').appendChild(el);
     setTimeout(() => el.remove(), type === 'error' ? 6000 : 3500);
   }
-  function modal({ title, body, actions, wide = false }) {
+  // A dialog with unsaved work passes `guard`: () => true when it may close without asking.
+  let modalGuard = null;
+  function modal({ title, body, actions, wide = false, guard = null }) {
+    modalGuard = guard;
+    $('#mDiscard')?.remove();
     $('#modalBack .modal').classList.toggle('wide', wide);
     $('#mTitle').textContent = title;
     $('#mBody').innerHTML = body;
@@ -77,8 +84,8 @@
       if (a.id) b.id = a.id;
       if (a.disabled) b.disabled = true;
       b.onclick = async () => {
-        if (a.onClick) { b.disabled = true; const keep = await a.onClick(); b.disabled = false; if (keep === false) return; }
-        closeModal();
+        if (a.onClick) { b.disabled = true; const keep = await a.onClick(); b.disabled = false; if (keep === false) return; closeModal(); return; }
+        requestCloseModal();
       };
       box.appendChild(b);
     }
@@ -86,7 +93,25 @@
     const first = $('#mBody input:not([type=checkbox]), #mBody textarea');
     if (first) setTimeout(() => first.focus(), 30);
   }
-  const closeModal = () => { $('#modalBack').hidden = true; };
+  const closeModal = () => { $('#modalBack').hidden = true; modalGuard = null; $('#mDiscard')?.remove(); };
+  /** Cancel, Esc or a click outside: ask first if the dialog has unsaved changes. */
+  function requestCloseModal() {
+    if ($('#modalBack').hidden) return;
+    if (!modalGuard || modalGuard()) { closeModal(); return; }
+    if ($('#mDiscard')) { $('#mDiscard').remove(); return; } // asked already: Esc again keeps editing
+    const bar = document.createElement('div');
+    bar.id = 'mDiscard';
+    bar.className = 'iss-discard';
+    bar.setAttribute('role', 'alertdialog');
+    bar.innerHTML = '<span>You have unsaved changes. Discard them?</span><button class="btn sm" data-d="keep">Keep editing</button><button class="btn sm danger solid" data-d="go">Discard changes</button>';
+    bar.addEventListener('click', (e) => {
+      const d = e.target.closest('[data-d]')?.dataset.d;
+      if (d === 'go') closeModal();
+      else if (d === 'keep') bar.remove();
+    });
+    $('#mActions').before(bar);
+    bar.querySelector('[data-d="keep"]').focus();
+  }
   function relTime(iso, now = Date.now()) {
     const t = Date.parse(iso);
     if (!t) return '';
@@ -167,19 +192,60 @@
     return p.toString();
   }
 
+  /** The list was turned off while the page was open: show that, without an error. */
+  function wentOff() {
+    clearTimeout(reloadTimer);
+    loading = null;
+    if (S.cfg) S.cfg.enabled = false;
+    showOff();
+    closeDrawer();
+  }
+  const dedupe = (list) => { const seen = new Set(); return list.filter((i) => !seen.has(i.id) && seen.add(i.id)); };
   let loading = null;
-  async function loadList() {
+  /**
+   * Load (or refresh) the list: the first S.want rows, a page of up to 1000 at a time.
+   * `reset` (filters changed) goes back to the first page.
+   */
+  async function loadList({ reset = false } = {}) {
+    if (reset) { S.want = PAGE; $('#main').scrollTop = 0; }
+    if (!S.cfg?.enabled) return;
     const mine = (loading = Symbol('load'));
     try {
-      const r = await api('/api/issues?' + query({ limit: S.limit }));
-      if (mine !== loading) return;
-      S.issues = r.issues; S.total = r.total; S.summary = r.summary;
+      let rows = [];
+      let r;
+      do {
+        r = await api('/api/issues?' + query({ limit: Math.min(MAX_PAGE, S.want - rows.length), offset: rows.length, quiet: 1 }));
+        if (mine !== loading) return;
+        if (r.enabled === false) { wentOff(); return; }
+        rows = rows.concat(r.issues);
+      } while (r.issues.length && rows.length < S.want && rows.length < r.total);
+      S.issues = dedupe(rows); S.total = r.total; S.summary = r.summary;
       renderList();
       renderStats();
     } catch (e) {
-      if (e.status === 409) { S.cfg.enabled = false; showOff(); return; }
+      if (mine !== loading) return;
+      if (e.status === 409) { wentOff(); return; }
       toast('Could not load issues: ' + e.message, 'error');
     }
+  }
+  /** Show more: fetch the next page after the rows already shown and add it. */
+  async function loadMore() {
+    const mine = (loading = Symbol('more'));
+    const btn = $('#moreBtn');
+    btn.disabled = true;
+    try {
+      const r = await api('/api/issues?' + query({ limit: PAGE, offset: S.issues.length, quiet: 1 }));
+      if (mine !== loading) return;
+      if (r.enabled === false) { wentOff(); return; }
+      S.issues = dedupe(S.issues.concat(r.issues)); S.total = r.total; S.summary = r.summary;
+      S.want = Math.max(PAGE, S.issues.length);
+      renderList();
+      renderStats();
+    } catch (e) {
+      if (mine !== loading) return;
+      if (e.status === 409) { wentOff(); return; }
+      toast('Could not load more issues: ' + e.message, 'error');
+    } finally { btn.disabled = false; }
   }
 
   let reloadTimer = null;
@@ -203,9 +269,11 @@
     es.addEventListener('issues', async () => {
       try {
         const was = S.cfg.enabled;
+        // The rules editor keeps the version and settings it opened with, so replacing these is safe.
         S.cfg = await api('/api/issues/config');
         if (!was && S.cfg.enabled) { start(); return; }
-        if (was && !S.cfg.enabled) { showOff(); closeDrawer(); return; }
+        if (was && !S.cfg.enabled) { wentOff(); return; }
+        if (!S.cfg.enabled) return;
       } catch { /* ignore */ }
       scheduleReload();
     });
@@ -247,15 +315,15 @@
 
   function problemChips(i, max = 4) {
     const active = i.problems.filter((p) => !p.clearedAt);
-    const cleared = i.problems.filter((p) => p.clearedAt);
     const done = i.status === 'closed' || i.allClear;
-    const show = (done ? i.problems : active).slice(0, max);
-    const names = new Set();
-    const chips = show.filter((p) => !names.has(p.name) && names.add(p.name))
-      .map((p) => `<span class="iss-chip ${esc(p.severity)}${p.clearedAt ? ' done' : ''}">${esc(p.name)}</span>`).join('');
-    const more = (done ? i.problems.length : active.length) - show.length;
-    const gone = !done && cleared.length ? `<span class="muted iss-cleared">+${cleared.length} cleared</span>` : '';
-    return chips + (more > 0 ? `<span class="muted">+${more}</span>` : '') + gone;
+    // One chip per problem name: a problem that started and cleared several times counts once.
+    const byName = (list) => { const seen = new Set(); return list.filter((p) => !seen.has(p.name) && seen.add(p.name)); };
+    const uniq = byName(done ? i.problems : active);
+    const chips = uniq.slice(0, max).map((p) => `<span class="iss-chip ${esc(p.severity)}${p.clearedAt ? ' done' : ''}">${esc(p.name)}</span>`).join('');
+    const more = uniq.length - Math.min(max, uniq.length);
+    const activeNames = new Set(active.map((p) => p.name));
+    const cleared = done ? 0 : new Set(i.problems.filter((p) => p.clearedAt && !activeNames.has(p.name)).map((p) => p.name)).size;
+    return chips + (more > 0 ? `<span class="muted">+${more}</span>` : '') + (cleared ? `<span class="muted iss-cleared">+${cleared} cleared</span>` : '');
   }
 
   function renderList() {
@@ -296,20 +364,35 @@
     $('#dSub').textContent = '';
     $('#dActions').innerHTML = '';
     $('#dBody').innerHTML = '<div class="muted">Loading…</div>';
+    $('#dBody').scrollTop = 0;
     await refreshDetail();
   }
   async function refreshDetail() {
     const id = S.openId;
     try {
-      const d = await api('/api/issues/' + id);
+      // quiet=1: turned off meanwhile gives { enabled: false } rather than a 409.
+      const d = await api('/api/issues/' + id + '?quiet=1');
       if (S.openId !== id) return;
+      if (d.enabled === false) { wentOff(); return; }
+      const switched = S.detail?.id !== d.id;
       S.detail = d;
-      renderDetail();
+      renderDetail({ keep: !switched });
     } catch (e) {
       if (S.openId !== id) return;
       $('#dBody').innerHTML = `<div class="warn-box">${e.status === 404 ? 'This issue no longer exists: the issues list was cleared.' : esc(e.message)}</div>`;
       $('#dActions').innerHTML = '';
     }
+  }
+  /** Leave the open issue (close the drawer or open another), asking first if a note is half written. */
+  function leaveDrawer(then) {
+    const draft = $('#noteText')?.value.trim();
+    if (!draft || !S.openId) { then(); return; }
+    modal({
+      title: 'Discard your note?',
+      body: '<p>The note you started on this issue hasn\'t been added yet. Leaving now throws it away.</p>',
+      actions: [{ label: 'Keep writing', onClick: () => { setTimeout(() => $('#noteText')?.focus(), 0); } },
+        { label: 'Discard note', cls: 'danger', onClick: () => { const ta = $('#noteText'); if (ta) ta.value = ''; then(); } }],
+    });
   }
   function closeDrawer() {
     S.openId = null; S.detail = null;
@@ -320,17 +403,57 @@
     $$('#list .iss-row.sel').forEach((r) => r.classList.remove('sel'));
   }
 
-  function renderDetail() {
+  /** What the person is in the middle of in the drawer body (note draft, focus, open sections, scroll). */
+  function drawerState() {
+    const ta = $('#noteText');
+    const focused = Boolean(ta && document.activeElement === ta);
+    // Where focus is inside the drawer, so a refresh can put it back (and never moves it from elsewhere).
+    const a = document.activeElement;
+    let focusSel = null;
+    if (a && a !== ta && $('#drawer').contains(a)) {
+      focusSel = a.id ? '#' + CSS.escape(a.id)
+        : a.dataset.delNote ? `[data-del-note="${CSS.escape(a.dataset.delNote)}"]`
+          : a.dataset.act ? `#dActions [data-act="${CSS.escape(a.dataset.act)}"]`
+            : a.matches('details > summary') && a.parentElement.className ? `details.${CSS.escape(a.parentElement.className.split(' ')[0])} > summary` : null;
+    }
+    return {
+      focusSel,
+      draft: ta ? ta.value : null,
+      height: ta?.style.height || '',
+      focused,
+      sel: focused ? [ta.selectionStart, ta.selectionEnd, ta.selectionDirection] : null,
+      taScroll: ta ? ta.scrollTop : 0,
+      open: new Set($$('#dBody details').filter((x) => x.open).map((x) => x.className)),
+      scroll: $('#dBody').scrollTop,
+    };
+  }
+  function restoreDrawer(st) {
+    const ta = $('#noteText');
+    if (ta && st.draft !== null) {
+      ta.value = st.draft;
+      if (st.height) ta.style.height = st.height;
+      ta.scrollTop = st.taScroll;
+      if (st.focused) { ta.focus({ preventScroll: true }); if (st.sel) ta.setSelectionRange(...st.sel); }
+    }
+    for (const x of $$('#dBody details')) if (st.open.has(x.className)) x.open = true;
+    $('#dBody').scrollTop = st.scroll;
+    if (st.focusSel && (!document.activeElement || document.activeElement === document.body)) $(st.focusSel)?.focus({ preventScroll: true });
+  }
+  /** Replace an element's HTML only when it changed (keeps focus and hover on unchanged buttons). */
+  const setHtml = (el, html) => { if (el.innerHTML !== html) el.innerHTML = html; };
+
+  function renderDetail({ keep = true } = {}) {
+    const st = keep ? drawerState() : null;
     const d = S.detail;
     const work = can('issueWork');
     const open = d.status !== 'closed';
-    $('#dEyebrow').innerHTML = `Issue #${d.id} · <span class="iss-sevtxt ${esc(d.severity)}">${esc(SEV[d.severity])}</span>`;
+    setHtml($('#dEyebrow'), `Issue #${d.id} · <span class="iss-sevtxt ${esc(d.severity)}">${esc(SEV[d.severity])}</span>`);
     $('#dTitle').textContent = d.title;
-    $('#dSub').innerHTML = `${statusTag(d)} <a href="/?record=${encodeURIComponent(d.recordId)}" class="iss-devlink" title="Open this device on the dashboard">${esc(d.recordId)} ${ICON.ext}</a>`;
-    $('#dActions').innerHTML = work ? `
+    setHtml($('#dSub'), `${statusTag(d)} <a href="/?record=${encodeURIComponent(d.recordId)}" class="iss-devlink" title="Open this device on the dashboard"><span>${esc(d.recordId)}</span>${ICON.ext}</a>`);
+    setHtml($('#dActions'), work ? `
       <button class="btn sm" data-act="assign">${ICON.user}${d.assignedName ? 'Reassign' : 'Assign'}</button>
       ${open ? (d.status === 'ignored' ? `<button class="btn sm" data-act="unignore">${ICON.wake}Stop ignoring</button>` : `<button class="btn sm" data-act="ignore">${ICON.snooze}Ignore…</button>`) : ''}
-      ${open ? `<button class="btn sm" data-act="close">${ICON.check}Close issue</button>` : ''}` : '';
+      ${open ? `<button class="btn sm" data-act="close">${ICON.check}Close issue</button>` : ''}` : '');
     const problems = d.problems.map((p) => `<div class="iss-prob${p.clearedAt ? ' done' : ''}">
         <div class="iss-prob-head"><span class="iss-chip ${esc(p.severity)}${p.clearedAt ? ' done' : ''}">${esc(p.name)}</span>
           <span class="muted">${esc(p.rule)}</span>
@@ -371,6 +494,7 @@
         }).join('')}</table></details>` : ''}`;
     $('#noteAdd')?.addEventListener('click', addNote);
     $('#noteText')?.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) addNote(); });
+    if (st) restoreDrawer(st);
   }
 
   async function act(path, body, msg) {
@@ -386,8 +510,8 @@
   async function addNote() {
     const t = $('#noteText').value.trim();
     if (!t) { $('#noteText').focus(); return; }
-    const kept = $('#noteText').value;
-    if (!(await act('/notes', { text: t }, 'Note added'))) $('#noteText').value = kept;
+    // act() re-renders keeping the draft; a saved note empties the box.
+    if ((await act('/notes', { text: t }, 'Note added')) && $('#noteText')) $('#noteText').value = '';
   }
 
   function assignDialog() {
@@ -453,9 +577,18 @@
     try { S.cfg = await api('/api/issues/config'); } catch (e) { toast(e.message, 'error'); return; }
     try { S.fields = (await api('/api/fields')).fields.map((f) => f.name); } catch { S.fields = []; }
     const draft = S.cfg.rules.map((r) => JSON.parse(JSON.stringify(r)));
+    // What the editor opened with: live updates may replace S.cfg meanwhile, but saving must send
+    // this version (so the server can say someone else saved in between) and compare with these settings.
+    const base = { version: S.cfg.version, reassignMinutes: S.cfg.reassignMinutes, autoClose: S.cfg.autoClose };
+    const reassignVal = () => Math.max(0, Math.round(Number($('#irReassign')?.value) || 0));
+    let pristine = '';
+    const snapshot = () => JSON.stringify([draft, reassignVal()]);
     const opSel = (k, v) => `<select class="select" data-k="${k}">${Object.entries(OPS).map(([o, l]) => `<option value="${o}" ${o === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
     const num = (k, v, min = 0) => `<input class="input" type="number" min="${min}" step="1" data-k="${k}" value="${esc(v)}">`;
     const row = (r, i) => {
+      // Never show a condition the draft doesn't have (an undefined op would look like ">" but fail to save).
+      if (r.kind === 'field' && !hasOwn(OPS, r.op)) r.op = 'gt';
+      if (r.clear?.mode === 'custom' && r.kind === 'field' && !hasOwn(OPS, r.clear.op)) r.clear.op = 'lt';
       const c = r.clear || { mode: 'auto', count: 2 };
       let trig = '';
       let clear = '';
@@ -504,26 +637,37 @@
       wide: true,
       body: `<p style="font-size:13px">Every check-in tests every rule. A rule <b>fails</b> after that many failing check-ins in a row and opens an issue for the device;
           problems that start while it's open are added to it (one issue per device). A problem <b>clears</b> after that many passing check-ins in a row,
-          and ${S.cfg.autoClose === false ? 'when none are left the issue is marked <b>All clear</b> and waits for someone to close it (automatic closing is off in Admin → Issues)' : 'the issue closes itself when none are left'}. A passing check-in resets the fail count, and a failing one resets the clear count.</p>
+          and ${base.autoClose === false ? 'when none are left the issue is marked <b>All clear</b> and waits for someone to close it (automatic closing is off in Admin → Issues)' : 'the issue closes itself when none are left'}. A passing check-in resets the fail count, and a failing one resets the clear count.</p>
         <div class="callout iss-reassign"><b>Same person when it comes back</b>
-          <span class="iss-reassign-row">If a device gets a new issue within <span class="bx-unit"><input class="input" type="number" min="0" max="43200" id="irReassign" value="${S.cfg.reassignMinutes}">min</span> of its last issue closing, it goes to whoever had that one. 0 turns this off.</span></div>
+          <span class="iss-reassign-row">If a device gets a new issue within <span class="bx-unit"><input class="input" type="number" min="0" max="43200" id="irReassign" value="${esc(base.reassignMinutes)}">min</span> of its last issue closing, it goes to whoever had that one. 0 turns this off.</span></div>
         <div id="irList"></div>
         <div class="bx-add"><span class="muted">Add a rule:</span>${PRESETS.map((p) => `<button class="btn sm" data-preset="${p.key}">${ICON.plus}${esc(p.label)}</button>`).join('')}</div>
         <datalist id="irFields">${S.fields.map((f) => `<option value="${esc(f)}">`).join('')}</datalist>`,
+      guard: () => snapshot() === pristine,
       actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
         try {
-          const reassign = Math.max(0, Math.round(Number($('#irReassign').value) || 0));
-          if (reassign !== S.cfg.reassignMinutes) await api('/api/issues/settings', { method: 'PUT', body: { reassignMinutes: reassign } });
-          const r = await api('/api/issues/rules', { method: 'PUT', body: { rules: draft, version: S.cfg.version } });
-          S.cfg = { ...S.cfg, rules: r.rules, version: r.version, reassignMinutes: reassign };
+          // One request: the reassign window is only saved if the rules are valid (and not stale).
+          const reassign = reassignVal();
+          const body = { rules: draft, version: base.version };
+          if (reassign !== base.reassignMinutes) body.reassignMinutes = reassign;
+          const r = await api('/api/issues/rules', { method: 'PUT', body });
+          S.cfg = { ...S.cfg, rules: r.rules, version: r.version, reassignMinutes: r.reassignMinutes ?? S.cfg.reassignMinutes };
           toast('Issue rules saved');
           scheduleReload();
         } catch (e) { toast(e.message, 'error'); return false; }
       } }],
     });
     draw();
+    pristine = snapshot();
     const list = $('#irList');
     const setPath = (obj, k, v) => { if (k.startsWith('clear.')) { obj.clear = obj.clear || { mode: 'auto', count: 2 }; obj.clear[k.slice(6)] = v; } else obj[k] = v; };
+    // A new type starts from that type's defaults (90 % doesn't become 90 minutes).
+    const FRESH = {
+      field: () => ({ field: '', op: 'gt', value: '', count: 5, clear: { mode: 'auto', count: 2 } }),
+      skew: () => ({ field: 'system_time', op: '', value: 5, count: 5, clear: { mode: 'auto', count: 2 } }),
+      stale: () => ({ field: '', op: '', value: 30, count: 1, clear: { mode: 'auto', count: 1 } }),
+    };
+    const OPPOSITE = { gt: 'lte', gte: 'lt', lt: 'gte', lte: 'gt', eq: 'neq', neq: 'eq', contains: 'ncontains', ncontains: 'contains', empty: 'nempty', nempty: 'empty' };
     list.addEventListener('input', (e) => {
       const k = e.target.dataset.k;
       const box = e.target.closest('.ir');
@@ -531,6 +675,16 @@
       if (!k || !r) return;
       let v = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
       if (e.target.type === 'number') v = e.target.value === '' ? '' : Number(e.target.value);
+      if (k === 'kind') {
+        if (v !== r.kind && hasOwn(FRESH, v)) Object.assign(r, FRESH[v](), { kind: v });
+        return; // redrawn on change
+      }
+      // A separate clear condition on the same field follows the trigger field.
+      if (k === 'field' && r.kind === 'field' && r.clear?.mode === 'custom' && (!r.clear.field || r.clear.field === r.field)) {
+        r.clear.field = v;
+        const cf = box.querySelector('[data-k="clear.field"]');
+        if (cf) cf.value = v;
+      }
       setPath(r, k, v);
       if (k === 'enabled') box.classList.toggle('off', !v);
       if (k === 'op' || k === 'clear.op') { const t = box.querySelector(`[data-k="${k === 'op' ? 'value' : 'clear.value'}"]`); if (t) t.disabled = NO_VALUE.has(v); }
@@ -539,14 +693,16 @@
       const k = e.target.dataset.k;
       const r = draft[Number(e.target.closest('.ir')?.dataset.i)];
       if (!r) return;
-      if (k === 'kind') {
-        if (r.kind === 'skew') { r.field = r.field && /time/i.test(r.field) ? r.field : 'system_time'; r.value = r.value && Number(r.value) > 0 ? r.value : 5; }
-        if (r.kind === 'stale') { r.value = Number(r.value) >= 1 ? r.value : 30; }
-        r.clear = { mode: 'auto', count: r.clear?.count || (r.kind === 'stale' ? 1 : 2) };
-        draw();
-      }
+      if (k === 'kind') draw();
       if (k === 'clear.mode') {
-        if (r.clear.mode === 'custom' && r.kind === 'field') { r.clear.field = r.clear.field || r.field; r.clear.op = r.clear.op || ({ gt: 'lt', gte: 'lt', lt: 'gt', lte: 'gt', eq: 'neq', neq: 'eq' }[r.op] || 'lt'); }
+        if (r.clear.mode === 'custom' && r.kind === 'field') {
+          r.clear.field = r.clear.field || r.field;
+          if (!hasOwn(OPS, r.clear.op)) {
+            r.clear.op = OPPOSITE[r.op] || 'lt';
+            // "is closed" → "is not closed", "contains error" → "does not contain error": same value.
+            if (['eq', 'neq', 'contains', 'ncontains', 'gt', 'gte', 'lt', 'lte'].includes(r.op) && !r.clear.value) r.clear.value = r.value;
+          }
+        }
         if (r.clear.mode === 'custom' && r.kind === 'skew') r.clear.value = r.clear.value ?? Math.max(0, Number(r.value) - 1);
         draw();
       }
@@ -605,11 +761,11 @@
       const b = e.target.closest('[data-status]');
       if (!b) return;
       S.status = b.dataset.status; local.set('issues.status', S.status);
-      syncControls(); loadList();
+      syncControls(); loadList({ reset: true });
     });
     let t;
-    $('#search').addEventListener('input', (e) => { clearTimeout(t); t = setTimeout(() => { S.q = e.target.value.trim(); loadList(); }, 250); });
-    $('#assigneeFilter').addEventListener('change', (e) => { S.assignee = e.target.value; local.set('issues.assignee', S.assignee); loadList(); });
+    $('#search').addEventListener('input', (e) => { clearTimeout(t); t = setTimeout(() => { S.q = e.target.value.trim(); loadList({ reset: true }); }, 250); });
+    $('#assigneeFilter').addEventListener('change', (e) => { S.assignee = e.target.value; local.set('issues.assignee', S.assignee); loadList({ reset: true }); });
     $('#stats').addEventListener('click', (e) => {
       const q = e.target.closest('[data-q]')?.dataset.q;
       if (!q) return;
@@ -617,12 +773,12 @@
       else if (q === 'mine') { S.status = 'active'; S.assignee = 'me'; }
       else { S.status = q; S.assignee = ''; }
       local.set('issues.status', S.status); local.set('issues.assignee', S.assignee);
-      syncControls(); loadList();
+      syncControls(); loadList({ reset: true });
     });
-    $('#moreBtn').addEventListener('click', () => { S.limit += 200; loadList(); });
-    $('#list').addEventListener('click', (e) => { const r = e.target.closest('.iss-row[data-id]'); if (r) openIssue(Number(r.dataset.id)); });
-    $('#dClose').addEventListener('click', closeDrawer);
-    $('#scrim').addEventListener('click', closeDrawer);
+    $('#moreBtn').addEventListener('click', loadMore);
+    $('#list').addEventListener('click', (e) => { const r = e.target.closest('.iss-row[data-id]'); if (r && Number(r.dataset.id) !== S.openId) leaveDrawer(() => openIssue(Number(r.dataset.id))); });
+    $('#dClose').addEventListener('click', () => leaveDrawer(closeDrawer));
+    $('#scrim').addEventListener('click', () => leaveDrawer(closeDrawer));
     $('#dActions').addEventListener('click', (e) => {
       const a = e.target.closest('[data-act]')?.dataset.act;
       if (a === 'assign') assignDialog();
@@ -648,12 +804,17 @@
       local.set('settings', s);
       applyTheme();
     });
+    // The account menu closes itself on Esc (usermenu.js); note before it does whether it was open,
+    // so that Esc only closes the menu and not the drawer or dialog behind it too.
+    let menuWasOpen = false;
+    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') menuWasOpen = Boolean($('#umMenu.open') || $('#exportMenu.open')); }, true);
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
-      if (!$('#modalBack').hidden) closeModal();
-      else if (S.openId) closeDrawer();
+      if (menuWasOpen) { menuWasOpen = false; $('#exportMenu').classList.remove('open'); return; }
+      if (!$('#modalBack').hidden) requestCloseModal();
+      else if (S.openId) leaveDrawer(closeDrawer);
     });
-    $('#modalBack').addEventListener('mousedown', (e) => { if (e.target === e.currentTarget) closeModal(); });
+    $('#modalBack').addEventListener('mousedown', (e) => { if (e.target === e.currentTarget) requestCloseModal(); });
   }
 
   init();

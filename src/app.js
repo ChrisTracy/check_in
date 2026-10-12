@@ -11,7 +11,7 @@ import fastifyStatic from '@fastify/static';
 import fastifyCookie from '@fastify/cookie';
 import { registerCompression } from './compress.js';
 import { HttpError, normalizeInput } from './store.js';
-import { csvRow, parseCsv, decodeCell } from './csv.js';
+import { recordRow, csvHeader, parseCsvRows, decodeCell, decodeText } from './csv.js';
 import { ROOT } from './config.js';
 import { registerAuth } from './auth/plugin.js';
 import { trustProxyOption, safeProto } from './auth/security.js';
@@ -304,7 +304,7 @@ export function buildApp({ config, store, accounts, oidc }) {
   app.get('/api/records', view, async (req, reply) => {
     const q = req.query;
     if (q.idsOnly === '1' || q.idsOnly === 'true') return store.ids();
-    const filters = {};
+    const filters = Object.create(null);
     for (const [k, v] of Object.entries(flattenParams(q))) {
       if (k.startsWith('f.') && k.length > 2) filters[k.slice(2)] = v;
     }
@@ -365,8 +365,9 @@ export function buildApp({ config, store, accounts, oidc }) {
     const requested = req.query.fields ? String(req.query.fields).split(',').map((s) => s.trim()).filter(Boolean) : null;
     const columns = requested || ['id', 'created', 'modified', ...store.fields().map((f) => f.name)];
     function* gen() {
-      yield csvRow(columns);
-      for (const rec of store.iterate()) yield csvRow(columns.map((c) => rec[c]));
+      yield csvHeader(columns);
+      // Own properties only: a column called "constructor" or "toString" must not export Object's built-ins.
+      for (const rec of store.iterate()) yield recordRow(columns.map((c) => (Object.hasOwn(rec, c) ? rec[c] : undefined)));
     }
     reply.header('Content-Type', 'text/csv; charset=utf-8');
     reply.header('Content-Disposition', `attachment; filename="checkins-${stamp()}.csv"`);
@@ -377,10 +378,10 @@ export function buildApp({ config, store, accounts, oidc }) {
     const fieldNames = store.fields().map((f) => f.name);
     const columns = ['history_id', 'id', 'version', 'action', 'at', 'changed_fields', ...fieldNames];
     function* gen() {
-      yield csvRow(columns);
+      yield csvHeader(columns);
       for (const h of store.iterateHistory()) {
-        yield csvRow([h.hid, h.id, h.version, h.action, h.at, Object.keys(h.changes).join(';'),
-          ...fieldNames.map((f) => h.data[f])]);
+        yield recordRow([h.hid, h.id, h.version, h.action, h.at, Object.keys(h.changes).join(';'),
+          ...fieldNames.map((f) => (Object.hasOwn(h.data, f) ? h.data[f] : undefined))]);
       }
     }
     reply.header('Content-Type', 'text/csv; charset=utf-8');
@@ -397,21 +398,23 @@ export function buildApp({ config, store, accounts, oidc }) {
       throw new HttpError(415, 'Send the CSV file as the raw request body with Content-Type: text/csv');
     }
     let rows;
-    try { rows = parseCsv(req.body); } catch (e) { throw new HttpError(400, 'Could not parse CSV: ' + e.message); }
+    try { rows = parseCsvRows(req.body); } catch (e) { throw new HttpError(400, 'Could not parse CSV: ' + e.message); }
     if (!rows.length) throw new HttpError(400, 'CSV has no data rows');
-    const header = Object.keys(rows[0]);
+    const header = rows.names || Object.keys(rows[0].row);
     if (!header.some((h) => h.toLowerCase() === 'id')) throw new HttpError(400, 'CSV must have an "id" column');
 
     const errors = [];
     const pending = [];
-    rows.forEach((row, i) => {
+    // `row` in errors is the line the row starts on in the file (quoted cells can span lines).
+    rows.forEach(({ row, line }) => {
       try {
         const decoded = {};
-        for (const k of Object.keys(row)) if (k !== '__proto__') decoded[k] = decodeCell(row[k]);
+        // The id column is always text (an id like [1] or 42 must not turn into an array or number).
+        for (const k of Object.keys(row)) if (k !== '__proto__') decoded[k] = k.toLowerCase() === 'id' ? decodeText(row[k]) : decodeCell(row[k]);
         const { id, fields } = normalizeInput(decoded, { maxFields: store.maxFields, skipEmpty: true });
         pending.push(store.enqueue(id, fields));
       } catch (e) {
-        if (errors.length < 200) errors.push({ row: i + 2, error: e.message });
+        if (errors.length < 200) errors.push({ row: line, error: e.message });
       }
     });
     const results = await Promise.all(pending);
@@ -442,7 +445,43 @@ export function buildApp({ config, store, accounts, oidc }) {
     else broadcast('delete', e);
   });
   store.on('clear', () => broadcast('clear', {}));
-  const heartbeat = setInterval(() => { for (const res of clients) res.write(': ping\n\n'); }, 25_000);
+  // Each stream remembers who opened it. That identity is checked again on every heartbeat and as
+  // soon as access changes (a user disabled, deleted or signed out, sessions revoked, the API key
+  // replaced...), and the stream is ended once it could no longer be opened, so live updates stop.
+  const streamAllowed = (a) => {
+    if (!a) return false;
+    if (a.kind === 'session') {
+      const s = accounts.checkSession(a.sid);
+      return Boolean(s && s.id === a.userId && can(s.role, 'view'));
+    }
+    if (a.kind === 'basic') {
+      const u = accounts.get(a.userId);
+      return Boolean(u && !u.disabled && u.password_hash && u.password_hash === a.pwHash && can(u.role, 'view')
+        && (accounts.passwordLogin !== 'admins' || u.role === 'admin'));
+    }
+    if (a.kind === 'apikey') return a.apiKey ? accounts.checkApiKey(a.apiKey) : a.loadTest === true;
+    return false;
+  };
+  const revalidateStreams = () => {
+    for (const res of clients) {
+      let ok = false;
+      try { ok = streamAllowed(res.ciAuth); } catch { ok = false; }
+      if (ok) continue;
+      clients.delete(res);
+      try { res.end('event: signedout\ndata: {}\n\n'); } catch { /* already gone */ }
+    }
+  };
+  let revalidatePending = false;
+  const onAccessChange = () => {
+    if (revalidatePending) return;
+    revalidatePending = true;
+    setImmediate(() => { revalidatePending = false; revalidateStreams(); });
+  };
+  accounts.on('access', onAccessChange);
+  const heartbeat = setInterval(() => {
+    revalidateStreams();
+    for (const res of clients) res.write(': ping\n\n');
+  }, config.sseHeartbeatMs ?? 25_000);
   heartbeat.unref();
 
   app.get('/api/events', view, (req, reply) => {
@@ -455,6 +494,8 @@ export function buildApp({ config, store, accounts, oidc }) {
       'X-Accel-Buffering': 'no',
     });
     res.write(`retry: 3000\nevent: hello\ndata: ${JSON.stringify({ rev: store.rev })}\n\n`);
+    const a = req.auth || {};
+    res.ciAuth = { kind: a.kind, sid: a.sid, userId: a.userId, pwHash: a.pwHash, apiKey: a.apiKey, loadTest: a.loadTest === true };
     clients.add(res);
     req.raw.on('close', () => clients.delete(res));
   });
@@ -464,6 +505,7 @@ export function buildApp({ config, store, accounts, oidc }) {
   // would keep showing "Live" while nothing arrives.
   app.addHook('preClose', async () => {
     clearInterval(heartbeat);
+    accounts.off('access', onAccessChange);
     for (const res of clients) res.end();
     clients.clear();
   });

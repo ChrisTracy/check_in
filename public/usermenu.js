@@ -74,6 +74,8 @@
           <p style="font-size:12px">At least 10 characters. Your other sessions will be signed out.</p>`,
         actions: [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async () => {
           const next = document.getElementById('pwNew').value;
+          if (!next) { toast('Enter a new password', 'error'); return false; }
+          if (next.length < 10) { toast('Password must be at least 10 characters', 'error'); return false; }
           if (next !== document.getElementById('pwNew2').value) { toast('Passwords do not match', 'error'); return false; }
           const res = await fetch('/api/auth/password', { method: 'POST', credentials: 'same-origin',
             headers: { 'content-type': 'application/json', 'x-csrf-token': me.csrf || '' },

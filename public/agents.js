@@ -34,6 +34,17 @@
   let root = null;
 
   function origin() { return location.origin; }
+  /** The same rules as the server's ?extra= check (src/agents.js); '' when the value is fine. */
+  const extraError = (v) => { const p = extraProblem(v); return p ? p + ' The command below leaves the extra fields out until this is fixed.' : ''; };
+  function extraProblem(v) {
+    const t = String(v ?? '').trim();
+    if (!t) return '';
+    if (t.length > 300) return 'Extra fields can be at most 300 characters.';
+    const bad = [...new Set(t.replace(/[A-Za-z0-9_.:@/ =,+${}%-]/g, ''))];
+    if (bad.length) return `Not allowed: ${bad.map((c) => (c === ' ' ? 'space' : c)).join(' ')}. Use letters, numbers, spaces, _ . : @ / = , + - and variables like \${NAME} or %NAME%. Quotes, $( ), ; and similar would run as commands on the machine.`;
+    if (/\$(?!\{[A-Za-z_][A-Za-z0-9_]*(:-[^}$]*)?\})/.test(t)) return '$ can only be used as ${NAME} or ${NAME:-fallback}.';
+    return '';
+  }
   function query() {
     const p = new URLSearchParams();
     if (st.every !== 5) p.set('every', st.every);
@@ -153,7 +164,8 @@
                    <small>${keyNeeded ? 'Ask a power user or admin for it. It is saved on each machine, not on this page.' : 'This server accepts check-ins without a key.'}</small>`}
           </div>
           <label class="field"><span class="field-label">Extra fields <small>optional</small></span>
-            <input class="input mono" id="agExtra" placeholder="${st.os === 'windows' ? 'site=Dallas,owner=%USERNAME%' : 'site=Dallas,owner=${OWNER:-it}'}" value="${esc(st.extra)}" spellcheck="false">
+            <input class="input mono" id="agExtra" placeholder="${st.os === 'windows' ? 'site=Dallas,owner=%USERNAME%' : 'site=Dallas,owner=${OWNER:-it}'}" value="${esc(st.extraRaw ?? st.extra)}" spellcheck="false"${extraError(st.extraRaw ?? st.extra) ? ' aria-invalid="true"' : ''} aria-describedby="agExtraErr">
+            <small class="ag-extra-err" id="agExtraErr" role="alert"${extraError(st.extraRaw ?? st.extra) ? '' : ' hidden'}>${esc(extraError(st.extraRaw ?? st.extra))}</small>
             <small>Sent with every check-in. A value can use the machine's environment variables, read on every run: <code>\${NAME}</code>, <code>\${NAME:-fallback}</code> or <code>%NAME%</code>. ${st.os === 'windows' ? 'Set them as System variables so the scheduled task can see them.' : 'Put them in /etc/environment or the agent config so the timer or cron job can see them.'}</small>
           </label>
         </div>
@@ -254,7 +266,18 @@
         st.ports[st.os] = v.replace(/^,|,$/g, '').split(',').filter((p) => p && Number(p) >= 1 && Number(p) <= 65535).slice(0, 20).join(',');
         update();
       }
-      if (e.target.id === 'agExtra') { st.extra = e.target.value.replace(/[^A-Za-z0-9_.:@/ =,+${}%-]/g, ''); if (st.extra !== e.target.value) e.target.value = st.extra; update(); }
+      if (e.target.id === 'agExtra') {
+        // Say what's wrong instead of silently deleting characters (quotes, $(...), ;): those
+        // would run as commands on the machine, so the server refuses them too.
+        st.extraRaw = e.target.value;
+        const err = extraError(st.extraRaw);
+        const box = $('#agExtraErr', root);
+        box.textContent = err;
+        box.hidden = !err;
+        e.target.toggleAttribute('aria-invalid', Boolean(err));
+        st.extra = err ? '' : st.extraRaw;
+        update();
+      }
     });
   }
 

@@ -589,3 +589,190 @@ test('issues: RDP and SSH closed rules (port_3389 / port_22 from port checks)', 
   await checkin(7, {});
   assert.equal((await list()).total, 0);
 });
+
+test('issues: limit and offset are validated (no 500 for huge or non-numeric values)', async (t) => {
+  const { A, checkin, enable, setRules } = await setup(t);
+  await enable();
+  await setRules([MEM]);
+  await checkin(0, { mem_pct: 95 });
+  for (const q of ['offset=1e400', 'offset=abc', 'limit=1e400', 'limit=Infinity', 'offset=-Infinity', 'limit=1&limit=2']) {
+    const r = await A.reader({ url: '/api/issues?' + q });
+    assert.equal(r.statusCode, 400, `${q}: ${r.body}`);
+  }
+  // Huge but finite values clamp to safe numbers.
+  let r = await A.reader({ url: '/api/issues?offset=99999999999999999999' });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.deepEqual([r.j().issues.length, r.j().total], [0, 1]);
+  r = await A.reader({ url: '/api/issues?limit=99999999999999999999&offset=-5' });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal(r.j().issues.length, 1);
+  r = await A.reader({ url: '/api/issues?limit=0' });
+  assert.equal(r.j().issues.length, 1, 'limit is at least 1');
+});
+
+test('issues: paging with offset reaches past 1000; opened_asc breaks ties by id ascending', async (t) => {
+  const { app, A, accounts, enable, setRules, list } = await setup(t);
+  await enable();
+  await setRules([{ ...MEM, field: 'x', op: 'gt', value: '0' }]);
+  const key = accounts.generateApiKey('bulk');
+  // Many devices in one batch: every issue opens at the same time.
+  const devices = Array.from({ length: 1005 }, (_, i) => ({ id: `d-${String(i).padStart(4, '0')}`, x: 1 }));
+  const w = await app.inject({ method: 'POST', url: '/api/checkin', headers: { 'x-api-key': key }, payload: devices });
+  assert.ok(w.statusCode < 300, w.body);
+  const all = await list('?limit=1000');
+  assert.equal(all.total, 1005);
+  assert.equal(all.issues.length, 1000);
+  const rest = await list('?limit=1000&offset=1000');
+  assert.equal(rest.issues.length, 5);
+  const ids = new Set([...all.issues, ...rest.issues].map((i) => i.id));
+  assert.equal(ids.size, 1005, 'pages do not overlap');
+  const asc = (await list('?sort=opened_asc&limit=5')).issues.map((i) => i.id);
+  assert.deepEqual(asc, [...asc].sort((a, b) => a - b), 'same opened time: lowest id first');
+  assert.equal(asc[0], Math.min(...ids));
+  const desc = (await list('?limit=5')).issues.map((i) => i.id);
+  assert.deepEqual(desc, [...desc].sort((a, b) => b - a));
+  assert.equal(desc[0], Math.max(...ids));
+});
+
+test('issues: ops, kinds and severities must be real values (not Object.prototype names)', async (t) => {
+  const { A, enable } = await setup(t);
+  await enable();
+  const put = (rule) => A.power({ method: 'PUT', url: '/api/issues/rules', payload: { rules: [rule] } });
+  for (const op of ['constructor', 'toString', '__proto__', 'hasOwnProperty', 'valueOf']) {
+    let r = await put({ ...CPU, op });
+    assert.equal(r.statusCode, 400, `op ${op}: ${r.body}`);
+    assert.match(r.j().error, /unknown trigger condition/);
+    r = await put({ ...CPU, clear: { ...CPU.clear, op } });
+    assert.equal(r.statusCode, 400, `clear op ${op}: ${r.body}`);
+    assert.match(r.j().error, /unknown clear condition/);
+  }
+  let r = await put({ ...CPU, op: ['gt'] });
+  assert.equal(r.statusCode, 400, 'op must be a string');
+  for (const kind of ['constructor', 'nope', 7]) {
+    r = await put({ ...CPU, kind });
+    assert.equal(r.statusCode, 400, `kind ${kind}: ${r.body}`);
+    assert.match(r.j().error, /unknown type/);
+  }
+  for (const severity of ['toString', 'urgent', 1]) {
+    r = await put({ ...CPU, severity });
+    assert.equal(r.statusCode, 400, `severity ${severity}: ${r.body}`);
+    assert.match(r.j().error, /unknown severity/);
+  }
+  r = await put({ ...CPU, kind: undefined, severity: undefined });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.deepEqual([r.j().rules[0].kind, r.j().rules[0].severity], ['field', 'warning'], 'missing kind/severity use the defaults');
+});
+
+test('issues: API rejects wrong types (enabled, assignee, note text, close reason, reassign window)', async (t) => {
+  const { A, users, checkin, enable, setRules, list, one } = await setup(t);
+  await enable();
+  await setRules([MEM]);
+  await checkin(0, { mem_pct: 95 });
+  const id = (await list()).issues[0].id;
+  for (const payload of [{ enabled: 'true' }, { enabled: 'false' }, { enabled: 1 }, { enabled: null }, { autoClose: 'false' }, { enabled: true, autoClose: 0 }]) {
+    const r = await A.admin({ method: 'PUT', url: '/api/admin/issues', payload });
+    assert.equal(r.statusCode, 400, `${JSON.stringify(payload)}: ${r.body}`);
+  }
+  let cfg = (await A.reader({ url: '/api/issues/config' })).j();
+  assert.deepEqual([cfg.enabled, cfg.autoClose], [true, true], 'nothing changed by the bad requests');
+
+  for (const assignee of [true, false, '2', 1.5, 0, -1, {}, [users.uma.id]]) {
+    const r = await A.user({ method: 'PUT', url: `/api/issues/${id}/assign`, payload: { assignee } });
+    assert.equal(r.statusCode, 400, `assignee ${JSON.stringify(assignee)}: ${r.body}`);
+  }
+  assert.equal((await one(id)).assignedTo, null, 'still unassigned');
+  let r = await A.user({ method: 'PUT', url: `/api/issues/${id}/assign`, payload: { assignee: users.uma.id } });
+  assert.equal(r.statusCode, 200, r.body);
+  r = await A.user({ method: 'PUT', url: `/api/issues/${id}/assign`, payload: { assignee: null } });
+  assert.equal(r.j().assignedTo, null);
+
+  for (const text of [{ a: 1 }, ['x'], 5, true]) {
+    r = await A.user({ method: 'POST', url: `/api/issues/${id}/notes`, payload: { text } });
+    assert.equal(r.statusCode, 400, `note ${JSON.stringify(text)}: ${r.body}`);
+  }
+  assert.equal((await one(id)).events.filter((e) => e.type === 'note').length, 0);
+  for (const reason of [{ a: 1 }, ['x'], 5]) {
+    r = await A.user({ method: 'POST', url: `/api/issues/${id}/close`, payload: { reason } });
+    assert.equal(r.statusCode, 400, `reason ${JSON.stringify(reason)}: ${r.body}`);
+  }
+  assert.equal((await one(id)).status, 'open');
+  r = await A.user({ method: 'POST', url: `/api/issues/${id}/close`, payload: {} });
+  assert.equal(r.statusCode, 200, 'the reason is optional');
+  assert.equal(r.j().closeReason, '');
+
+  for (const reassignMinutes of [true, null, {}, '']) {
+    r = await A.power({ method: 'PUT', url: '/api/issues/settings', payload: { reassignMinutes } });
+    assert.equal(r.statusCode, 400, `reassign ${JSON.stringify(reassignMinutes)}: ${r.body}`);
+  }
+  cfg = (await A.reader({ url: '/api/issues/config' })).j();
+  assert.equal(cfg.reassignMinutes, 60);
+});
+
+test('issues: rules and the reassign window save together; a stale version gets 409 and saves nothing', async (t) => {
+  const { A, enable } = await setup(t);
+  await enable();
+  const cfg = (await A.power({ url: '/api/issues/config' })).j();
+  // Invalid rules: the reassign window is not saved either.
+  let r = await A.power({ method: 'PUT', url: '/api/issues/rules', payload: { rules: [{ ...CPU, op: 'nope' }], version: cfg.version, reassignMinutes: 5 } });
+  assert.equal(r.statusCode, 400);
+  let now = (await A.power({ url: '/api/issues/config' })).j();
+  assert.deepEqual([now.reassignMinutes, now.version, now.rules.length], [60, cfg.version, 0]);
+  // Invalid reassign window: the rules are not saved.
+  r = await A.power({ method: 'PUT', url: '/api/issues/rules', payload: { rules: [CPU], version: cfg.version, reassignMinutes: -1 } });
+  assert.equal(r.statusCode, 400);
+  now = (await A.power({ url: '/api/issues/config' })).j();
+  assert.deepEqual([now.version, now.rules.length], [cfg.version, 0]);
+  // Both valid: saved in one go.
+  r = await A.power({ method: 'PUT', url: '/api/issues/rules', payload: { rules: [CPU], version: cfg.version, reassignMinutes: 5 } });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal(r.j().reassignMinutes, 5);
+  now = (await A.power({ url: '/api/issues/config' })).j();
+  assert.deepEqual([now.reassignMinutes, now.version, now.rules.length], [5, cfg.version + 1, 1]);
+  // A second editor who opened at the old version can't overwrite (rules or window).
+  r = await A.admin({ method: 'PUT', url: '/api/issues/rules', payload: { rules: [MEM], version: cfg.version, reassignMinutes: 30 } });
+  assert.equal(r.statusCode, 409);
+  assert.match(r.j().error, /Someone else changed/);
+  now = (await A.power({ url: '/api/issues/config' })).j();
+  assert.deepEqual([now.reassignMinutes, now.rules[0].name], [5, 'High CPU']);
+});
+
+test('issues: renaming a rule or changing its severity updates open problems, not closed history', async (t) => {
+  const { A, checkin, enable, setRules, list, one } = await setup(t);
+  await enable();
+  let [mem] = await setRules([MEM]);
+  await checkin(0, { mem_pct: 95 });
+  await checkin(1, { mem_pct: 10 });
+  const closedId = (await list('?status=closed')).issues[0].id;
+  await checkin(2, { mem_pct: 95 });
+  const openId = (await list()).issues[0].id;
+  assert.notEqual(openId, closedId);
+  [mem] = await setRules([{ ...mem, name: 'Memory full', severity: 'critical' }]);
+  let d = await one(openId);
+  assert.equal(d.status, 'open', 'a rename does not clear the problem');
+  assert.deepEqual([d.title, d.severity, d.problems[0].name, d.problems[0].severity], ['Memory full', 'critical', 'Memory full', 'critical']);
+  assert.equal((await list('?q=Memory full')).total, 1);
+  const old = await one(closedId);
+  assert.deepEqual([old.problems[0].name, old.problems[0].severity], ['High memory', 'warning'], 'closed history keeps the old name');
+  // A changed condition updates the open problem's rule text too.
+  await setRules([{ ...mem, value: '80' }]);
+  d = await one(openId);
+  assert.equal(d.problems[0].rule, 'mem_pct > 80');
+  assert.equal(d.status, 'open');
+});
+
+test('issues: quiet=1 answers { enabled: false } instead of 409 when the list is off', async (t) => {
+  const { A, checkin, enable, setRules, list } = await setup(t);
+  await enable();
+  await setRules([MEM]);
+  await checkin(0, { mem_pct: 95 });
+  const id = (await list()).issues[0].id;
+  assert.equal((await A.reader({ url: '/api/issues?quiet=1' })).j().total, 1, 'on: the normal answer');
+  await A.admin({ method: 'PUT', url: '/api/admin/issues', payload: { enabled: false } });
+  assert.equal((await A.reader({ url: '/api/issues' })).statusCode, 409);
+  assert.equal((await A.reader({ url: `/api/issues/${id}` })).statusCode, 409);
+  for (const url of ['/api/issues?quiet=1', `/api/issues/${id}?quiet=1`]) {
+    const r = await A.reader({ url });
+    assert.equal(r.statusCode, 200, url);
+    assert.deepEqual(r.j(), { enabled: false });
+  }
+});

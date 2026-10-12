@@ -18,7 +18,8 @@ function cleanName(name) {
   const n = String(name ?? '').trim().replace(/\s+/g, ' ');
   if (!n) throw new HttpError(400, 'View name is required');
   if (n.length > 80) throw new HttpError(400, 'View name must be 80 characters or fewer');
-  if (n.toLowerCase() === 'default') throw new HttpError(400, '“Default” is reserved. Pick another name.');
+  // "Default View" is the built-in layout in the views menu; a saved view with that name would look like it.
+  if (/^default( view)?$/i.test(n)) throw new HttpError(400, `“${n}” is reserved. Pick another name.`);
   return n;
 }
 

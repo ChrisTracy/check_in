@@ -78,10 +78,15 @@ export function decrypt(key, token) {
   }
 }
 
-/** Simple fixed-window limiter for login attempts. */
+/**
+ * Simple fixed-window limiter for login attempts. `limits` gives some keys their own maximum by
+ * prefix, e.g. { 'ip:': 50 } so one address can make more failed attempts in total (an office
+ * behind one NAT address) than any single username from it.
+ */
 export class RateLimiter {
-  constructor({ max = 10, windowMs = 15 * 60 * 1000 } = {}) {
+  constructor({ max = 10, windowMs = 15 * 60 * 1000, limits = {} } = {}) {
     this.max = max;
+    this.limits = limits;
     this.windowMs = windowMs;
     this.hits = new Map();
     setInterval(() => {
@@ -89,9 +94,13 @@ export class RateLimiter {
       for (const [k, v] of this.hits) if (v.reset < now) this.hits.delete(k);
     }, 60_000).unref();
   }
+  maxFor(key) {
+    for (const [prefix, n] of Object.entries(this.limits)) if (String(key).startsWith(prefix)) return n;
+    return this.max;
+  }
   blocked(key) {
     const h = this.hits.get(key);
-    return h && h.reset > Date.now() && h.count >= this.max;
+    return Boolean(h && h.reset > Date.now() && h.count >= this.maxFor(key));
   }
   fail(key) {
     const now = Date.now();
@@ -117,7 +126,7 @@ export class RateLimiter {
     const busy = (k) => this.inflight.get(k) || 0;
     for (;;) {
       if (keys.some((k) => this.blocked(k))) return { blocked: true };
-      if (keys.every((k) => this.#count(k) + busy(k) < this.max)) break;
+      if (keys.every((k) => this.#count(k) + busy(k) < this.maxFor(k))) break;
       await new Promise((resolve) => { for (const k of keys) { if (!this.waiters.has(k)) this.waiters.set(k, []); this.waiters.get(k).push(resolve); } });
     }
     for (const k of keys) this.inflight.set(k, busy(k) + 1);

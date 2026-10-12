@@ -125,9 +125,9 @@ If the app can't sit behind a reverse proxy or load balancer, it can serve HTTPS
 1. **Install a certificate**, in one of three ways:
    - **PEM files:** the certificate (with intermediates after it, as a full chain) plus the private key. Encrypted keys are accepted with their password and stored decrypted, as nginx does.
    - **PFX / P12:** the usual export from Windows certificate stores and many CAs. The password is stored encrypted with the app secret.
-   - **Generate self-signed:** for testing or internal use. Clients warn until they trust it; use **Download certificate** to install it as trusted.
+   - **Generate self-signed:** for testing or internal use. Clients warn until they trust it; use **Download certificate** to install it as trusted. Enter host names (DNS names, `*.name`) and IPv4 / IPv6 addresses, without ports; **Valid for** is 1 to 3650 days.
 
-   The upload is checked before anything is saved: wrong passwords, a key that doesn't match the certificate, and unreadable files are all rejected with a clear message.
+   The upload is checked before anything is saved: wrong passwords, a key that doesn't match the certificate, expired or not-yet-valid certificates, and unreadable files are all rejected with a clear message.
 2. **Choose a mode:**
    - **Off:** HTTP only (the default).
    - **HTTPS and HTTP:** both work, which is handy while moving devices over.
@@ -152,9 +152,9 @@ Notes:
 - each domain must resolve to this server from the internet, and
 - port 80 must reach the app's HTTP port. With Docker Compose that means `PUBLISH_PORT=80` (maps `80:3000`). Behind a firewall or NAT, forward port 80.
 
-Wildcards (`*.example.com`), IP addresses and internal names (`.local`, `.lan`) can't be validated over HTTP-01 and are rejected. DNS-01 isn't supported; for those cases use a deploy key (below) with your own ACME client.
+Wildcards (`*.example.com`), IP addresses, single-label names (`server`) and internal names (`.local`, `.lan`, `.internal`, `.localhost`, `.home.arpa`) can't be validated over HTTP-01 and are rejected. International names (`bücher.example`) are requested in their punycode form (`xn--bcher-kva.example`). DNS-01 isn't supported; for those cases use a deploy key (below) with your own ACME client.
 
-Settings: domain names (up to 20), an optional email for expiry notices, the CA (**Let's Encrypt**, **Let's Encrypt staging** for testing, or **Another ACME CA** with its directory URL and optional External Account Binding key ID and HMAC for ZeroSSL, Google Trust Services, Sectigo and others), and the key type (ECDSA P-256 by default, or RSA 2048). Turning it on the first time needs the CA's terms of service accepted. A private CA (such as step-ca) must be trusted by the server: set `NODE_EXTRA_CA_CERTS` to its root certificate.
+Settings: domain names (up to 20), an optional email for expiry notices, the CA (**Let's Encrypt**, **Let's Encrypt staging** for testing, or **Another ACME CA** with its directory URL and optional External Account Binding key ID and HMAC for ZeroSSL, Google Trust Services, Sectigo and others), and the key type (ECDSA P-256 by default, or RSA 2048). Turning it on the first time needs the CA's terms of service accepted, and **Get certificate now** (`POST /api/admin/tls/acme/obtain`) only works while automatic certificates are on (`409` otherwise). A private CA (such as step-ca) must be trusted by the server: set `NODE_EXTRA_CA_CERTS` to its root certificate.
 
 How it behaves:
 
@@ -224,11 +224,11 @@ The active threshold is now a shared, server-side setting. When a power user cha
 | **HTTP Basic** | Scripts that should act as a specific user | `curl -u alice:password …`. The script gets that user's role |
 | **API key** | Devices and services | `X-API-Key: <key>`, `Authorization: Bearer <key>` or `?api_key=<key>`. The key acts as a **User** |
 
-Check-ins **require the API key** by default (or a user with at least the User role). A key is generated on first start and stored encrypted. **Power users and admins** can see and regenerate it on the **Add Device** page, which fills it into the install command, and in **Admin → API key**. Only **admins** can use their own key or turn the requirement off. Reading data always requires sign-in, Basic auth or the key.
+Check-ins **require the API key** by default (or a user with at least the User role). A key is generated on first start and stored encrypted. **Power users and admins** can see and regenerate it on the **Add Device** page, which fills it into the install command, and in **Admin → API key**. Only **admins** can use their own key or turn the requirement off. A custom key must be 16 to 256 printable ASCII characters (letters, numbers, punctuation) with no spaces, so every device can send it in a header or URL. Reading data always requires sign-in, Basic auth or the key.
 
 Upgrading from a version where check-ins were open: if the database already has records and no key, check-ins stay open so your devices keep working, and a key is generated so an admin can turn the requirement on. A key saved by an older version can't be shown (only its hash was stored); start once with `API_KEY` set to it, or regenerate it.
 
-Failed sign-ins are rate-limited (10 attempts per 15 minutes per IP and username). Passwords are hashed with scrypt, the API key is stored as a SHA-256 hash, and the SSO client secret is encrypted with AES-256-GCM.
+Failed sign-ins are rate-limited: 10 failed attempts per 15 minutes per IP address and username, and 50 per IP address in total (so one person's typos don't lock out an office behind one address). A successful sign-in resets that username's count. Passwords are hashed with scrypt, the API key is stored as a SHA-256 hash, and the SSO client secret is encrypted with AES-256-GCM.
 
 
 Sign-in protections:
@@ -243,8 +243,10 @@ Sign-in protections:
 - **Add user**: give them a username, role and password. Or choose *Single sign-on only*: the account is linked on their first Microsoft sign-in when their Entra sign-in name (UPN) matches its username or email. From then on the account is tied to their Entra object ID.
 - **How accounts are linked:** only *single sign-on only* accounts (no password) that aren't already linked are ever linked automatically. Accounts with a password are never linked, guests from other tenants are never linked, and the user-editable `email` claim is never used for matching. A Microsoft sign-in that doesn't match gets its own new account (if auto-create is on) instead. To move an existing password user to Microsoft sign-in, remove their password in **Reset password**.
 - Change a role from the drop-down, reset or set a password, disable or enable, or delete.
-- You can't delete or disable yourself, or remove the last active admin.
-- Anyone signed in can change their own password from the account menu.
+- You can't delete or disable yourself, or remove the last active admin. You also can't leave no admin who can actually sign in: removing the last such admin's password (or deleting, disabling or demoting them, or turning single sign-on off) is refused unless another admin has a password, or single sign-on is working and linked to an admin account. **Remove password** isn't offered then.
+- Resetting your own password here keeps you signed in on this browser; your other sessions are signed out. For anyone else, all their sessions end.
+- Disabling, deleting or signing a user out (or a password reset) also ends their open live-update streams straight away; streams are re-checked on every heartbeat too, so a dashboard stops receiving updates once its session, user, role or API key is no longer valid.
+- Anyone signed in can change their own password from the account menu (at least 10 characters; an empty new password is refused).
 
 ### Setting up Microsoft Entra ID SSO
 
@@ -264,7 +266,8 @@ SSO behaviour (configurable in the same screen):
 - **Create users automatically on first sign-in:** on by default. Turn it off to allow only users an admin has already added.
 - **Update role from Entra on every sign-in:** on by default. Turn it off if you'd rather manage roles in the dashboard.
 - **Role when no mapping matches:** `Reader` by default, or *No access* to deny sign-in.
-- **Password sign-in:** *Everyone*, or *Admins only*. With *Admins only*, the login page shows only Microsoft sign-in, plus a small **Administrator sign-in** link as a break-glass way in.
+- **Password sign-in:** *Everyone*, or *Admins only*. With *Admins only*, the login page shows only Microsoft sign-in, plus a small **Administrator sign-in** link as a break-glass way in. *Admins only* can be chosen only once single sign-on is set up, turned on and saved; otherwise nobody else could sign in (`400`).
+- **Public URL** must be just an origin such as `https://checkin.contoso.com` (no path, query or spaces). Without it the redirect URI is built from the request's `Host` header, and an unusable `Host` asks you to set the Public URL instead.
 
 Signing out ends the session in this app only. It doesn't sign the person out of Microsoft.
 
@@ -320,7 +323,7 @@ curl -X POST http://localhost:3000/api/checkin -H "Content-Type: application/jso
 
 | Method & path | Description |
 |---|---|
-| `GET /api/records` | All records. Optional parameters: `q` (text search), `f.<field>=<value>` (exact match; several are combined with AND, or with OR when you add `match=any`), `sort=<field>`, `order=asc\|desc`, `limit`, `offset`, `sinceRev=<n>` (only records changed since that revision), `status=active\|aging\|stale` (comma-separate for several), `createdAfter`, `createdBefore`, `modifiedAfter`, `modifiedBefore` (an ISO date/time such as `2026-10-01T09:00:00Z`, or a relative age such as `15m`, `2h`, `7d`, `1w`). Status and date parameters always combine with AND, even with `match=any` |
+| `GET /api/records` | All records. Optional parameters: `q` (text search over the id and field values, not field names; case-insensitive for A–Z), `f.<field>=<value>` (exact match on the value as text, so `f.online=true` matches both JSON `true` and the text `"true"`, and `f.created` / `f.modified` must equal the stored timestamp exactly — use the date parameters below for ranges; several are combined with AND, or with OR when you add `match=any`), `sort=<field>`, `order=asc\|desc`, `limit` and `offset` (whole numbers ≥ 0; anything else is a `400`), `sinceRev=<n>` (only records changed since that revision), `status=active\|aging\|stale` (comma-separate for several), `createdAfter`, `createdBefore`, `modifiedAfter`, `modifiedBefore` (an ISO date/time such as `2026-10-01T09:00:00Z`, or a relative age such as `15m`, `2h`, `7d`, `1w`). Status and date parameters always combine with AND, even with `match=any` |
 | `GET /api/records?idsOnly=1` | Just the id of every record, plus the current `rev` |
 | `GET /api/records/:id` | One record |
 | `GET /api/records/:id/history?limit=500` | One record and its history, newest first. Each entry includes `changes: { field: [old, new] }` and a full snapshot in `data` |
@@ -405,18 +408,18 @@ All need the issues list turned on (otherwise `409`), except `GET /api/issues/co
 
 | Method & path | Role | Description |
 |---|---|---|
-| `PUT /api/admin/issues` | Admin | `{ "enabled": true }` turns the issues list on or off; `{ "autoClose": false }` stops issues closing themselves when every problem clears (default `true`) |
+| `PUT /api/admin/issues` | Admin | `{ "enabled": true }` turns the issues list on or off; `{ "autoClose": false }` stops issues closing themselves when every problem clears (default `true`). Both must be real booleans (`400` otherwise) |
 | `GET /api/issues/config` | Reader | `{ enabled, reassignMinutes, rules, version }` (each rule also has readable `text` and `clearText`) |
-| `PUT /api/issues/rules` | Power user | `{ "rules": [...], "version": 3 }` replaces every rule (`409` if someone saved in between). A rule: `{ "name", "kind": "field" \| "skew" \| "stale", "severity": "critical" \| "warning" \| "info", "enabled", "field", "op", "value", "count": 5, "clear": { "mode": "auto" \| "custom", "field", "op", "value", "count": 2 } }`. `count` = failing check-ins in a row before it opens, `clear.count` = passing check-ins in a row before it clears (1-1000, defaults 5 and 2). For `stale`, `value` is the minutes without a check-in |
-| `PUT /api/issues/settings` | Power user | `{ "reassignMinutes": 60 }` (0 = off) |
-| `GET /api/issues` | Reader | `?status=active` (default: open and ignored) `\| open \| ignored \| allclear \| closed \| all`, `q` (device, problem, person or issue number), `assignee=me \| none \| <user id>`, `sort=opened \| opened_asc \| updated`, `limit` (≤1000), `offset`. Returns `{ issues, total, summary }` |
+| `PUT /api/issues/rules` | Power user | `{ "rules": [...], "version": 3 }` replaces every rule (`409` if someone saved in between). A rule: `{ "name", "kind": "field" \| "skew" \| "stale", "severity": "critical" \| "warning" \| "info", "enabled", "field", "op", "value", "count": 5, "clear": { "mode": "auto" \| "custom", "field", "op", "value", "count": 2 } }`. `count` = failing check-ins in a row before it opens, `clear.count` = passing check-ins in a row before it clears (1-1000, defaults 5 and 2). For `stale`, `value` is the minutes without a check-in. An unknown `kind`, `severity` or `op` is a `400`. Add `"reassignMinutes"` to save the reassign window in the same step: nothing is saved unless the rules and the window are both valid. Problems still open take a renamed rule's new name, severity and wording |
+| `PUT /api/issues/settings` | Power user | `{ "reassignMinutes": 60 }` (0 = off; a number) |
+| `GET /api/issues` | Reader | `?status=active` (default: open and ignored) `\| open \| ignored \| allclear \| closed \| all`, `q` (device, problem, person or issue number), `assignee=me \| none \| <user id>`, `sort=opened \| opened_asc \| updated` (ties go by issue number in the same direction), `limit` (1-1000, default 200), `offset` (page through with `offset` for more than 1,000; values that aren't numbers are a `400`). Returns `{ issues, total, summary }`. With `quiet=1` (here and on `GET /api/issues/:id`), a list that is turned off answers `{ "enabled": false }` instead of `409` |
 | `GET /api/issues/summary` | Reader | Counts: `{ enabled, open, ignored, unassigned, mine, allClear, closed, total }` |
 | `GET /api/issues/:id` | Reader | One issue with its problems, `events` (log and notes), `snapshot` (the device's fields when it opened) and `current` (the device now) |
 | `GET /api/issues/assignees` | User | People issues can be assigned to (enabled users) |
-| `PUT /api/issues/:id/assign` | User | `{ "assignee": 12 }`, or `null` to unassign |
+| `PUT /api/issues/:id/assign` | User | `{ "assignee": 12 }` (a user id), or `null` to unassign |
 | `POST /api/issues/:id/ignore` · `/unignore` | User | `{ "minutes": 240 }` (1 minute to 90 days) |
-| `POST /api/issues/:id/close` | User | `{ "reason": "optional" }` |
-| `POST /api/issues/:id/notes` · `DELETE /api/issues/:id/notes/:noteId` | User | `{ "text" }` (up to 4,000 characters). You can delete your own notes; power users and admins can delete any |
+| `POST /api/issues/:id/close` | User | `{ "reason": "optional" }` (text) |
+| `POST /api/issues/:id/notes` · `DELETE /api/issues/:id/notes/:noteId` | User | `{ "text" }` (text, up to 4,000 characters). You can delete your own notes; power users and admins can delete any |
 | `GET /api/issues/export.csv` | User | One row per issue, with every problem, note and log line. `?kind=log` gives one row per log entry and note instead. Takes the same filters as `GET /api/issues` (default `status=all`) |
 | `DELETE /api/issues?confirm=true` | Power user | Deletes every issue (open, ignored and closed) with their problems, notes and logs |
 
@@ -424,15 +427,22 @@ All need the issues list turned on (otherwise `409`), except `GET /api/issues/co
 
 | Method & path | Description |
 |---|---|
-| `GET /api/export.csv` | Every record. Columns are `id,created,modified`, then every field. Use `?fields=id,status,site` to choose columns |
+| `GET /api/export.csv` | Every record. Columns are `id,created,modified`, then every field. Use `?fields=id,status,site` to choose columns (a column a record doesn't have is empty) |
 | `GET /api/history/export.csv` | Every stored history entry |
-| `POST /api/import` | Upload CSV as the raw body with `Content-Type: text/csv`. Each row is processed as a check-in (create or update, with history). An `id` column is required. Empty cells are skipped so they don't overwrite existing values. `created` and `modified` columns are ignored |
+| `POST /api/import` | Upload CSV as the raw body with `Content-Type: text/csv`. Each row is processed as a check-in (create or update, with history). An `id` column is required. Empty cells are skipped so they don't overwrite existing values. `created` and `modified` columns are ignored. Each column name may appear only once (`id`, `ID` and `Id` count as the same). Errors give the line the row starts on in the file |
 
 ```bash
 curl -X POST http://localhost:3000/api/import -H "Content-Type: text/csv" --data-binary @devices.csv
 ```
 
 The dashboard's export menu can also download the **current view**: only the filtered rows, with the visible columns in their current order.
+
+Exports are spreadsheet-friendly and import back with their types:
+
+- Numbers, `true` / `false` and JSON objects or arrays are written as-is and imported with that type. Only the plain form counts: `42`, `-3.5` and `1e+21` are numbers, but `007`, `1.50` and `TRUE` stay text.
+- Text that only looks like a number or true/false (the text `"42"`, typical of check-ins sent as a query string) is also written plainly, so it opens as a number in Excel, and imports back as a number.
+- Text a spreadsheet could run as a formula (starting with `=`, `+`, `-`, `@`, a tab or CR, other than a plain number like `-5`) gets a leading apostrophe: `'=SUM(A1)`. Import removes that apostrophe. Any other leading apostrophe in your data (`'s-Hertogenbosch`) is kept as text.
+- Column names get the same guard (a field called `@user` is written `'@user`), and import removes it. The `id` column is always imported as text, wherever it is in the file.
 
 ## Dashboard
 
@@ -445,7 +455,7 @@ The dashboard's export menu can also download the **current view**: only the fil
   Click a box to show just those devices (click again to clear); the box filter is saved with views. A device's details show which boxes it's in, since when, or how far along it is (for example "4 min of 10 min").
 - **Search** across every field. Press `/` to jump to the search box.
 - **Filters:** use the **Filter** button or the funnel icon on any column header. The conditions offered depend on the field:
-  - **Text fields** (custom fields, ID, Any field): contains, does not contain, is, is not, starts with, greater/less than, matches regex, is empty, is not empty. The panel shows the most common values for one-click filtering.
+  - **Text fields** (custom fields, ID, Any field): contains, does not contain, is, is not, starts with, greater/less than, matches regex, is empty, is not empty. The panel shows the most common values for one-click filtering. **Any field is empty** means none of the record's fields has a value (the ID doesn't count). Fields whose names start with `_` are shown like any other; only the server's own `_version`, `_rev` and `_boxes` are hidden.
   - **Status:** is / is not Active, Aging or Stale, with live counts. If your data has its own `status` field, the built-in one is labelled **Status (check-in)**.
   - **Created and Modified:** in the last N minutes, hours or days, more than N ago, after or before a date and time, or on a given day, plus presets such as "Last 15 min" and "Over a day ago". Relative conditions move with the clock.
 
@@ -454,7 +464,7 @@ The dashboard's export menu can also download the **current view**: only the fil
 - **Group by** any field or by status. Click a group header to collapse it.
 - **Layouts:** Table, Cards, or an Activity feed of recent changes.
 - **Columns:** show or hide, drag to reorder (in the header or the Columns panel), and drag a column edge to resize it (double-click the edge to reset).
-- **Sort:** click a header to sort. Shift+click adds a secondary sort.
+- **Sort:** click a header to sort. Shift+click adds a secondary sort. Empty values always sort last, in either direction.
 - **Phones and tablets:** on a phone the header shrinks to the logo and your account menu, which also holds Pause, Import, Export, Clear all and dark mode. The status counts sit in one compact row, and the less-used toolbar controls scroll sideways under the search box. Menus, filters and dialogs open as bottom sheets, and Admin opens full screen with users shown as cards. The first visit on a phone starts in card view. Held sideways, the page scrolls so the list gets nearly the whole screen.
 - **Graph tab:** in a record's details, **Graph** plots CPU %, RAM %, disk space used % and disk activity % over the record's stored history (the last `HISTORY_LIMIT` check-ins), with hover details, per-line toggles and a min / avg / max / latest table. It reads `cpu_pct`, `ram_pct`, `disk_pct` and `disk_busy_pct` (what the agents send) or common alternatives such as `cpu`, `mem_pct`, `disk` and `disk_util_pct`. The tab is greyed out for records without any of these.
 - **Saved views:** save the current filters, search, sort, grouping, columns and layout under a name. Views are stored on the server:
@@ -468,7 +478,7 @@ The dashboard's export menu can also download the **current view**: only the fil
   - **Team default** (power users and admins) is a team view that opens for everyone who hasn't picked their own.
   - With neither set, the dashboard reopens the way you left it in that browser. In the views menu, a star with one person marks your default and a star with two people marks the team default (hover for a description). Deleting a view clears any default that pointed to it.
 - **Record drawer:** click a row to see every field and a timeline of changes.
-- **Multi-select:** tick the checkboxes in the table (Shift+click selects a range) or on cards. The header checkbox selects every matching row. A bar appears where you can **Delete** or **Export** the selection; the Delete key works too. Esc clears the selection.
+- **Multi-select:** tick the checkboxes in the table (Shift+click selects a range) or on cards. The header checkbox selects every matching row. A bar appears where you can **Delete** or **Export** the selection; the Delete key works too (Backspace doesn't, so it can't delete by accident). Esc clears the selection.
 - **Live updates:** changes stream in as they happen.
 - **Pause check-ins** (power users and admins): the server stops accepting check-ins and CSV imports until resumed. Every open dashboard shows a banner saying who paused it and when.
 - **Import:** use the button, or drag a `.csv` file onto the page.
@@ -488,7 +498,7 @@ Power users and admins set the rules with **Issue rules** on the Issues page. **
 
 Every check-in counts, even when no values changed (the device still reports the same reading). How long "5 in a row" takes depends on how often a device checks in: 25 minutes for agents on a 5-minute schedule. The presets: high CPU and high memory (fail after 5, clear after 2, with a lower clear threshold), low disk space (2/2), clock skew (3/2), offline (30 minutes, clears on the next check-in), failed services (3/2), and **RDP closed** / **SSH closed** (`port_3389` / `port_22` is `closed` on 2 check-ins in a row, clears on the first check-in where it's `open` again). The port rules use the fields the agents' port checks save (see [Port checks](#port-checks)), so they only apply to devices that check those ports, which includes the load test's simulated devices.
 
-Rule changes apply right away. Problems from a deleted or turned-off rule leave their issues, and an issue closes if nothing is left. A new or changed rule starts counting from each device's latest check-in, which counts as the first, so a rule that fails after 1 check-in opens issues as soon as it's saved. A check-in is never counted twice: saving the rules again or clearing the issues list doesn't add to the counts.
+Rule changes apply right away. Problems from a deleted or turned-off rule leave their issues, and an issue closes if nothing is left. Renaming a rule or changing its severity updates the problems that are still open (closed issues keep the old name in their history). If two people edit the rules at once, the second **Save** is refused with a message and the editor stays open, so nobody's changes are overwritten without them knowing; closing the editor with unsaved changes asks first. A new or changed rule starts counting from each device's latest check-in, which counts as the first, so a rule that fails after 1 check-in opens issues as soon as it's saved. A check-in is never counted twice: saving the rules again or clearing the issues list doesn't add to the counts.
 
 ### How issues behave
 
@@ -507,26 +517,26 @@ Rule changes apply right away. Problems from a deleted or turned-off rule leave 
 
 **Export** gives a CSV of every issue: one row each with problems, notes and the log. You can also export the issue log (one row per entry) or just the issues matching the current filters. **Clear issues** (power users and admins) deletes every issue, open and closed, with their problems, notes and logs, after a confirmation. Rules and settings stay. Problems that are still happening open new issues straight away.
 
-Everything updates live: the list, the open issue and the dashboard button follow changes from other people and from check-ins without a refresh.
+Everything updates live: the list, the open issue and the dashboard button follow changes from other people and from check-ins without a refresh; a note you're typing and the sections you've opened stay as they are. **Show more** loads the next 200 issues, as many times as you like.
 
 ## Load test page
 
 Admins can open **Load test** from the account menu (`/loadtest`). The Issues and Load test pages have the same account menu, top right, as the dashboard. It runs a simulated fleet inside the server, so you can watch the dashboard, status boxes and issues under load without installing anything.
 
-- **Devices and interval:** choose how many simulated devices there are (up to 20,000) and how often each one checks in. The target rate is shown (2,000 devices every 10 s = 200 check-ins a second). Check-ins are spread evenly over the interval. **Apply** changes the fleet while it runs, and **Burst** makes every device check in at once.
+- **Devices and interval:** choose how many simulated devices there are (up to 20,000) and how often each one checks in. The target rate is shown (2,000 devices every 10 s = 200 check-ins a second). Check-ins are spread evenly over the interval (slow fleets show e.g. `0.03/s (1 every 36 s)`). **Apply** changes the fleet while it runs without restarting the cycle (devices keep their turn; nothing happens if nothing changed). Shrinking the fleet deletes the simulated records of the devices dropped, which closes their issues. **Burst** makes every device that isn't offline check in once, as fast as the server takes them but never more than 1,000 at a time; a second burst is refused (409) until the first has been sent. Values must be plain numbers (devices a whole number); a count must be a whole number of at least 1. After a restart the device count starts from the number of simulated records in the database (up to 20,000).
 - **They start healthy and active.** Each device has its own realistic, slightly noisy readings, using the same fields as the agents: `cpu_pct`, `ram_pct`, `disk_max_pct`, `disk_busy_pct`, `system_time`, `failed_services`, `failed_service_names`, `reboot_required`, `domain_joined`, hostname, OS, site and so on, plus `role`.
 - **A mixed fleet.** Every 5th device is a server with a role and that role's services. Windows servers can be web (`W3SVC`, `WAS`), SQL (`MSSQLSERVER`, `SQLSERVERAGENT`), domain controller (`NTDS`, `DNS`, `Netlogon`, `Kdc`), file (`LanmanServer`, `DFSR`) or app servers. Linux servers can be web (`nginx`), database (`postgresql`) or container hosts (`docker`, `containerd`). A simulated device's ID is always its hostname, which shows its role: `SIM-SRV-SQL-00030`, `SIM-LNX-WEB-00045`, `SIM-WS-00001`. The rest are workstations, laptops and kiosks, with the usual Windows or Linux services (`Spooler`, `wuauserv`, `W32Time`, `TermService`… or `sshd`, `cron`…).
 - **Remote access:** Windows devices report RDP as `port_3389 = open` and Linux devices report SSH as `port_22 = open`, the way the agents' port checks do. So the **RDP open / closed** and **SSH open / closed** status-box presets and issue rules such as `port_3389 is closed` work against them. Stopping the service behind the port (`TermService` or `sshd`) also closes the port.
-- **Problems:** trigger **high CPU, high memory, low disk space, high disk activity, clock skew, failed services, RDP closed, SSH closed, reboot required, not domain joined** or **offline** (stops checking in) on a percentage or a number of devices (RDP closed counts only Windows devices, and SSH closed only Linux ones). Affected devices report the problem from their next check-in. You can change the amount while it runs: the same devices stay affected, and more are added or some removed at the edge. **Remove** (or **Make every device healthy**) puts them back to normal from their next check-in, so issues clear on their own clear rules.
-- **Specific devices:** find a device by name, role, service or site (**All**, or **Changed** for the ones you've changed). Open it and choose exactly what's wrong: any of the problems above, whether its RDP or SSH port is open or closed, and which of its services are stopped. A stopped service shows in `failed_services` / `failed_service_names` the way the agents report it, so an issue rule such as `failed_service_names contains MSSQLSERVER` catches it. Changes reach the server straight away, not at the device's next turn. They add to the percentage problems, and **Make healthy** (one device) or **Make all of these healthy** undoes them.
+- **Problems:** trigger **high CPU, high memory, low disk space, high disk activity, clock skew, failed services, RDP closed, SSH closed, reboot required, not domain joined** or **offline** (stops checking in) on a percentage or a number of devices (RDP closed counts only Windows devices, and SSH closed only Linux ones). Affected devices report the problem from their next check-in. You can change the amount, or the fleet size, while it runs: the same devices stay affected, and more are added or some removed at the edge. A percentage too small to pick anyone shows **0 devices (too few)**. **Remove** (or **Make every device healthy**) puts them back to normal from their next check-in, so issues clear on their own clear rules.
+- **Specific devices:** find a device by name, role, service or site (**All**, or **Changed** for the ones you've changed). Open it and choose exactly what's wrong: any of the problems above, whether its RDP or SSH port is open or closed, and which of its services are stopped. A stopped service shows in `failed_services` / `failed_service_names` the way the agents report it, so an issue rule such as `failed_service_names contains MSSQLSERVER` catches it. Changes reach the server straight away, not at the device's next turn (that also goes for **Make all of these healthy**, including devices that were offline). Quick clicks are sent one after another, so the device ends up exactly as last clicked. They add to the percentage problems, and **Make healthy** (one device) or **Make all of these healthy** undoes them.
 - **Live numbers:** check-ins per second against the target, latency (p50, p95, max), server CPU (% of one core), event-loop delay, memory, total sent, failures (and how many were turned away because check-ins were paused), simulated devices in the database and open issues. There are charts of the last 2 minutes with hover details.
-- **Real requests:** every check-in goes through the real API (routing, body parsing, auth, the write queue, history, status boxes, issues and live updates) using Fastify's in-process request injection. Only the network socket is skipped, so to measure the network and a reverse proxy too, use `scripts/loadtest.js` or `scripts/loadtest-fleet.ps1` from another machine. The simulator uses the server's own CPU, which the CPU number includes. It never has more than 1,000 requests waiting: if the server falls behind, the extra check-ins are counted as *skipped* rather than piling up.
-- **Simulated devices are ordinary records** whose ID is their hostname (`SIM-…`) with `simulated = true`, so they appear on the dashboard and can open issues like real devices. **Remove simulated devices** (after stopping) deletes them and their history and closes their issues, without touching real devices (only `SIM-` IDs that are also marked `simulated = true`, plus `sim-` ones from older versions). The simulation itself doesn't survive a restart, but the records do (they go stale) until you remove them.
+- **Real requests:** every check-in goes through the real API (routing, body parsing, auth, the write queue, history, status boxes, issues and live updates) using Fastify's in-process request injection. Only the network socket is skipped, so to measure the network and a reverse proxy too, use `scripts/loadtest.js` or `scripts/loadtest-fleet.ps1` from another machine. The simulator uses the server's own CPU, which the CPU number includes. It never has more than 1,000 requests waiting: if the server falls behind, the extra check-ins are counted as *skipped* rather than piling up. **Stop** answers once the check-ins already in flight have landed.
+- **Simulated devices are ordinary records** whose ID is their hostname (`SIM-…`) with `simulated = true`, so they appear on the dashboard and can open issues like real devices. **Remove simulated devices** (after stopping) deletes them and their history and closes their issues, without touching real devices (only `SIM-` IDs that are also marked `simulated = true`, plus `sim-` ones from older versions). It never takes over a real device: if a record with a simulated device's ID already exists and isn't marked `simulated = true`, that device is skipped and listed as *skipped (name taken by a real device)*, and Remove leaves the record alone. The simulation itself doesn't survive a restart, but the records do (they go stale) until you remove them.
 
 | Method & path | Role | Description |
 |---|---|---|
 | `GET /api/admin/loadtest` | Admin | Status, live numbers, the last 2 minutes and active problems |
-| `POST /api/admin/loadtest/start` · `/stop` · `/burst` | Admin | `start` takes `{ "devices": 2000, "interval": 10 }` |
+| `POST /api/admin/loadtest/start` · `/stop` · `/burst` | Admin | `start` takes `{ "devices": 2000, "interval": 10 }`. `stop` waits for in-flight check-ins; `burst` returns `burst` (devices queued) and is 409 while one is running |
 | `PUT /api/admin/loadtest` | Admin | `{ "devices", "interval" }`, applied live |
 | `POST /api/admin/loadtest/scenarios` | Admin | `{ "key": "high_cpu", "mode": "percent" \| "count", "amount": 10 }`. Keys: `high_cpu`, `high_memory`, `low_disk`, `disk_busy`, `clock_skew`, `failed_services`, `rdp_closed`, `ssh_closed`, `reboot_required`, `not_domain_joined`, `offline` |
 | `PUT` · `DELETE /api/admin/loadtest/scenarios/:id` | Admin | Change the amount, or remove it (`all` removes every problem) |

@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { HttpError } from '../store.js';
 import { hashPassword, verifyPassword, passwordProblem, randomToken, sha256, encrypt, decrypt } from './security.js';
 
@@ -39,6 +40,28 @@ export const capsFor = (role) => Object.fromEntries(Object.keys(CAPS).map((c) =>
 
 const USERNAME_RE = /^[A-Za-z0-9._@+-]{2,128}$/;
 
+/** Why a custom API key can't be used by devices (they send it in a header / URL), or null. */
+export function apiKeyProblem(key) {
+  if (typeof key !== 'string' || !key) return 'API key is required';
+  if (!/^[\x21-\x7e]+$/.test(key)) return 'API key may only contain printable ASCII characters (letters, numbers, punctuation) and no spaces';
+  if (key.length < 16) return 'API key must be at least 16 characters';
+  if (key.length > 256) return 'API key must be at most 256 characters';
+  return null;
+}
+
+/** The SSO public URL as a bare origin (https://host[:port]), '' for none; HttpError(400) if it isn't one. */
+export function publicOrigin(value) {
+  const v = String(value ?? '').trim();
+  if (!v) return '';
+  const bad = () => new HttpError(400, 'Public URL must be just the address people use, like https://checkin.contoso.com (no path, query or spaces)');
+  if (/[\s<>"'`\\]/.test(v) || !/^https?:\/\//i.test(v)) throw bad();
+  let u;
+  try { u = new URL(v); } catch { throw bad(); }
+  if (!/^https?:$/.test(u.protocol) || !u.hostname || u.username || u.password || u.search || u.hash || v.includes('?') || v.includes('#')) throw bad();
+  if (u.pathname !== '/' && u.pathname.replace(/\/+$/, '') !== '') throw bad();
+  return u.origin;
+}
+
 export const DEFAULT_SSO = {
   enabled: false,
   tenantId: '',
@@ -53,8 +76,17 @@ export const DEFAULT_SSO = {
   groupMap: [],
 };
 
-export class Accounts {
+// Settings whose change can end someone's access (live streams re-check who they belong to).
+const ACCESS_SETTINGS = new Set(['passwordLogin', 'apiKey', 'apiKeyRequired', 'sso']);
+
+/**
+ * Emits 'access' ({ userId? }) whenever something changes that can take away someone's access:
+ * a user disabled, demoted, deleted or signed out, sessions revoked, the API key replaced, or the
+ * sign-in options changed. Open live-update streams listen and re-check their identity.
+ */
+export class Accounts extends EventEmitter {
   constructor(db, { secret, sessionTtlHours = 12 }) {
+    super();
     this.db = db;
     this.secret = secret;
     this.ttlMs = sessionTtlHours * 3600 * 1000;
@@ -110,6 +142,10 @@ export class Accounts {
   setSetting(key, value) {
     this.s.setSetting.run(key, JSON.stringify(value));
     this.settingsCache.set(key, value);
+    if (ACCESS_SETTINGS.has(key)) this.#accessChanged({ setting: key });
+  }
+  #accessChanged(info = {}) {
+    try { this.emit('access', info); } catch { /* a listener's problem must not fail the change */ }
   }
 
   get staleMinutes() { return this.getSetting('staleMinutes', 15); }
@@ -152,11 +188,18 @@ export class Accounts {
     }
     if (typeof patch.clientSecret === 'string' && patch.clientSecret) next.clientSecretEnc = encrypt(this.secret, patch.clientSecret);
     if (patch.clearSecret) next.clientSecretEnc = '';
-    if (next.publicUrl && !/^https?:\/\/[^/]+/i.test(next.publicUrl)) throw new HttpError(400, 'Public URL must start with http:// or https://');
-    next.publicUrl = next.publicUrl.replace(/\/+$/, '');
+    next.publicUrl = publicOrigin(next.publicUrl);
     if (next.tenantId && !/^[A-Za-z0-9.-]{3,100}$/.test(next.tenantId)) throw new HttpError(400, 'Tenant ID looks invalid');
     if (next.enabled && (!next.tenantId || !next.clientId || !next.clientSecretEnc)) {
       throw new HttpError(400, 'Tenant ID, client ID and client secret are required to enable SSO');
+    }
+    // Turning single sign-on off (or breaking it) must not leave no admin able to sign in.
+    const readyAfter = Boolean(next.enabled && next.tenantId && next.clientId && next.clientSecretEnc);
+    if (this.ssoReady() && !readyAfter && this.signInAdmins() > 0 && this.signInAdmins({ ssoReady: false }) === 0) {
+      throw new HttpError(400, 'No admin could sign in without single sign-on. Give an admin account a password first.');
+    }
+    if (this.passwordLogin === 'admins' && this.ssoReady() && !readyAfter) {
+      throw new HttpError(400, 'Password sign-in is set to admins only, so nobody else could sign in without single sign-on. Allow everyone to use passwords first (Admin, Settings).');
     }
     this.setSetting('sso', next);
     return this.publicSso();
@@ -177,8 +220,9 @@ export class Accounts {
   get apiKeyRequired() { return this.getSetting('apiKeyRequired', null) !== false; }
   setApiKeyRequired(required) { this.setSetting('apiKeyRequired', Boolean(required)); return this.apiKeyInfo(); }
   setApiKey(key, by) {
-    if (!key) throw new HttpError(400, 'API key is required');
-    if (key.length < 16) throw new HttpError(400, 'API key must be at least 16 characters');
+    key = String(key ?? '').trim();
+    const p = apiKeyProblem(key);
+    if (p) throw new HttpError(400, p);
     this.setSetting('apiKey', { hash: sha256(key), enc: encrypt(this.secret, key), prefix: key.slice(0, 6), created: new Date().toISOString(), by });
     return this.apiKeyInfo();
   }
@@ -222,6 +266,22 @@ export class Accounts {
   // ---------------------------------------------------------------- users
   count() { return this.db.prepare('SELECT COUNT(*) AS n FROM users').get().n; }
   adminCount() { return this.db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND disabled = 0").get().n; }
+  /** Can this account actually sign in: enabled, with a password, or linked to a working single sign-on? */
+  canSignIn(u, ssoReady = this.ssoReady()) {
+    return Boolean(u && !u.disabled && (u.password_hash || (ssoReady && u.sso_sub)));
+  }
+  /**
+   * Active admins who can sign in. `change` describes one user's account after a pending change
+   * ({ id, row }; row null = deleted), and `ssoReady` a pending single sign-on state.
+   */
+  signInAdmins({ change, ssoReady = this.ssoReady() } = {}) {
+    let n = 0;
+    for (let u of this.db.prepare("SELECT * FROM users WHERE role = 'admin' OR id = ?").all(change?.id ?? -1)) {
+      if (change && u.id === change.id) u = change.row;
+      if (u && u.role === 'admin' && this.canSignIn(u, ssoReady)) n++;
+    }
+    return n;
+  }
 
   publicUser(u) {
     if (!u) return null;
@@ -273,9 +333,16 @@ export class Accounts {
     const losingAdmin = u.role === 'admin' && !u.disabled && (next.role !== 'admin' || next.disabled);
     if (losingAdmin && this.adminCount() <= 1) throw new HttpError(400, 'You cannot remove the last active admin');
     if (id === actorId && next.disabled) throw new HttpError(400, 'You cannot disable your own account');
+    // Never leave no admin who can sign in (e.g. removing the last admin's password without SSO).
+    if (u.role === 'admin' && this.canSignIn(u) && this.signInAdmins({ change: { id, row: { ...u, ...next } } }) === 0) {
+      throw new HttpError(400, patch.removePassword
+        ? 'This is the last admin who can sign in: removing the password would lock everyone out. Set up single sign-on and link an admin account first.'
+        : 'You cannot remove the last admin who can sign in');
+    }
     this.db.prepare('UPDATE users SET name = ?, email = ?, role = ?, disabled = ?, password_hash = ?, updated = ? WHERE id = ?')
       .run(next.name, next.email, next.role, next.disabled, next.password_hash, new Date().toISOString(), id);
     if (next.disabled || patch.password || patch.removePassword) this.revokeSessions(id, patch.keepSession);
+    this.#accessChanged({ userId: id });
     return this.publicUser(this.get(id));
   }
 
@@ -284,8 +351,12 @@ export class Accounts {
     if (!u) throw new HttpError(404, 'User not found');
     if (id === actorId) throw new HttpError(400, 'You cannot delete your own account');
     if (u.role === 'admin' && !u.disabled && this.adminCount() <= 1) throw new HttpError(400, 'You cannot delete the last active admin');
+    if (u.role === 'admin' && this.canSignIn(u) && this.signInAdmins({ change: { id, row: null } }) === 0) {
+      throw new HttpError(400, 'You cannot delete the last admin who can sign in');
+    }
     this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
     this.db.prepare('DELETE FROM users WHERE id = ?').run(id);
+    this.#accessChanged({ userId: id });
   }
 
   async verifyLogin(username, password) {
@@ -318,10 +389,21 @@ export class Accounts {
     if (newExp - row.expires > 60_000) this.s.touch.run(newExp, id);
     return row;
   }
-  destroySession(token) { if (token) this.db.prepare('DELETE FROM sessions WHERE id = ?').run(sha256(token)); }
+  /** Is this session (by its stored id) still valid? Read-only: doesn't extend it. Returns the row or null. */
+  checkSession(sid) {
+    if (!sid) return null;
+    const row = this.s.session.get(sid);
+    return row && row.expires >= Date.now() && !row.disabled ? row : null;
+  }
+  destroySession(token) {
+    if (!token) return;
+    this.db.prepare('DELETE FROM sessions WHERE id = ?').run(sha256(token));
+    this.#accessChanged({});
+  }
   revokeSessions(userId, keepSid) {
     if (keepSid) this.db.prepare('DELETE FROM sessions WHERE user_id = ? AND id <> ?').run(userId, keepSid);
     else this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+    this.#accessChanged({ userId });
   }
 
   // ---------------------------------------------------------------- SSO users
@@ -389,7 +471,7 @@ export class Accounts {
         role = mapped || fallback;
         if (!role) throw new HttpError(403, 'You no longer have a role assigned for this app.');
         // Never let a sync demote the last admin and lock everyone out.
-        if (u.role === 'admin' && role !== 'admin' && this.adminCount() <= 1) role = 'admin';
+        if (u.role === 'admin' && role !== 'admin' && this.signInAdmins({ change: { id: u.id, row: { ...u, role } } }) === 0) role = 'admin';
       }
       this.db.prepare('UPDATE users SET name = ?, email = ?, role = ?, updated = ? WHERE id = ?')
         .run(name || u.name, email || u.email, role, now, u.id);

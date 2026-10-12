@@ -50,6 +50,16 @@
     document.documentElement.dataset.theme = dark ? 'dark' : 'light';
   }
   const fmtMs = (v) => (v >= 100 ? Math.round(v) : v >= 10 ? v.toFixed(0) : v.toFixed(1));
+  /** Check-ins per second for d devices every i seconds; slow fleets read "0.03/s (1 every 36 s)", not 0. */
+  function fmtRate(d, i) {
+    const r = d / i;
+    if (r >= 1) return `${nf.format(r >= 10 ? Math.round(r) : Math.round(r * 10) / 10)} check-ins/s`;
+    const every = i / d;
+    const shown = r >= 0.01 ? Math.round(r * 100) / 100 : Number(r.toPrecision(1));
+    return `${shown}/s (1 every ${every >= 10 ? nf.format(Math.round(every)) : Math.round(every * 10) / 10} s)`;
+  }
+  const affText = (n) => (n ? `${nf.format(n)} device${n === 1 ? '' : 's'}` : '0 devices (too few)');
+  const affTitle = (n) => (n ? '' : 'This amount picks no devices with the current fleet size: raise it or use a number of devices');
 
   // ------------------------------------------------------------ rendering
   function render() {
@@ -63,7 +73,7 @@
     updateTarget();
     const last = s.history.at(-1) || {};
     $('#tRate').textContent = nf.format(s.running ? s.rate : last.ok || 0);
-    $('#tRateSub').textContent = s.running ? `target ${nf.format(s.target)}${s.inflight ? ` · ${nf.format(s.inflight)} in flight` : ''}` : 'not running';
+    $('#tRateSub').textContent = s.running ? `target ${fmtRate(s.devices, s.interval).replace(' check-ins/s', '')}${s.inflight ? ` · ${nf.format(s.inflight)} in flight` : ''}` : 'not running';
     $('#tP95').textContent = last.p95 ? fmtMs(last.p95) + ' ms' : '–';
     $('#tP50').textContent = last.p50 ? `p50 ${fmtMs(last.p50)} ms · max ${fmtMs(last.max)} ms` : 'p50 –';
     $('#tCpu').textContent = last.cpu !== undefined ? last.cpu + '%' : '–';
@@ -78,6 +88,10 @@
     $('#tIssuesSub').textContent = s.issues ? `${nf.format(s.issues.ignored)} ignored · ${nf.format(s.issues.closed)} closed` : 'issues are off';
     $('#lastError').hidden = !s.stats.lastError || !bad;
     $('#lastError').textContent = s.stats.lastError ? 'Last error: ' + s.stats.lastError : '';
+    $('#takenNote').hidden = !s.taken;
+    $('#takenNote').textContent = s.taken ? `${nf.format(s.taken)} device${s.taken === 1 ? '' : 's'} skipped (name taken by a real device): ${s.takenIds.join(', ')}${s.taken > s.takenIds.length ? '…' : ''}. The simulator never writes to or removes a record that isn't marked simulated.` : '';
+    $('#burstBtn').disabled = !!s.bursting;
+    $('#burstBtn').title = s.bursting ? `A burst is being sent (${nf.format(s.queued)} still queued)` : 'Every device checks in once, right now';
     $('#removeBtn').disabled = s.running || !s.simDevices;
     $('#removeBtn').title = s.running ? 'Stop the test first' : s.simDevices ? '' : 'No simulated devices';
     renderScenarios();
@@ -87,13 +101,13 @@
     // The fleet changed size or problems moved: refresh the device list (unless someone is mid-edit).
     const sig = `${s.devices}|${s.scenarios.map((x) => x.id + ':' + x.affected).join(',')}|${s.customCount}`;
     if (sig !== dev.sig) { const first = !dev.sig; dev.sig = sig; if (first || !$('#devList').contains(document.activeElement)) loadDevices(); }
-    $$('.lt-chart').forEach(drawChart);
+    drawCharts();
   }
 
   function updateTarget() {
     const d = Number($('#devices').value) || 0;
     const i = Number($('#interval').value) || 0;
-    $('#target').textContent = d && i ? `${nf.format(Math.round(d / i * 10) / 10)} check-ins/s` : '–';
+    $('#target').textContent = d > 0 && i > 0 ? fmtRate(d, i) : '–';
   }
 
   let catalogDrawn = false;
@@ -105,7 +119,10 @@
     const typing = $('#active').contains(document.activeElement) && document.activeElement.matches('input');
     if (typing) {
       // Keep what's being typed; just refresh the counts.
-      for (const sc of s.scenarios) { const el = $(`.lt-sc[data-id="${sc.id}"] .lt-sc-aff`); if (el) el.textContent = `${nf.format(sc.affected)} device${sc.affected === 1 ? '' : 's'}`; }
+      for (const sc of s.scenarios) {
+        const el = $(`.lt-sc[data-id="${sc.id}"] .lt-sc-aff`);
+        if (el) { el.textContent = affText(sc.affected); el.title = affTitle(sc.affected); el.classList.toggle('lt-warn', !sc.affected); }
+      }
     } else if (sig !== renderScenarios.sig) {
       renderScenarios.sig = sig;
       $('#active').innerHTML = s.scenarios.length ? s.scenarios.map((sc) => `<div class="lt-sc" data-id="${esc(sc.id)}">
@@ -113,7 +130,7 @@
         <div class="lt-sc-name"><b>${esc(sc.label)}</b><small>${esc(sc.desc)} · since ${esc(new Date(sc.startedAt).toLocaleTimeString())}</small></div>
         <span class="lt-sc-amt"><input class="input" type="number" min="1" step="1" value="${esc(sc.amount)}" data-amt>
           <select class="select" data-mode><option value="percent" ${sc.mode === 'percent' ? 'selected' : ''}>%</option><option value="count" ${sc.mode === 'count' ? 'selected' : ''}>devices</option></select></span>
-        <span class="lt-sc-aff">${nf.format(sc.affected)} device${sc.affected === 1 ? '' : 's'}</span>
+        <span class="lt-sc-aff${sc.affected ? '' : ' lt-warn'}" title="${esc(affTitle(sc.affected))}">${esc(affText(sc.affected))}</span>
         <button class="btn sm" data-remove>Remove</button></div>`).join('')
       : '<p class="lt-healthy"><span class="dot fresh"></span> Every device is healthy.</p>';
     }
@@ -129,6 +146,12 @@
   }
 
   // Single-series line charts with a crosshair tooltip (one y-axis each).
+  let hovered = null; // { key, clientX } while the pointer is over a chart, so a redraw keeps the crosshair
+  function drawCharts() {
+    $$('.lt-chart').forEach(drawChart);
+    const fig = hovered && $(`.lt-chart[data-key="${hovered.key}"]`);
+    if (fig) hover({ target: fig, clientX: hovered.clientX });
+  }
   function drawChart(fig) {
     const key = fig.dataset.key;
     const unit = fig.dataset.unit;
@@ -166,6 +189,7 @@
     const fig = e.target.closest('.lt-chart');
     const c = fig?._chart;
     const tip = $('#tip');
+    if (fig) hovered = { key: fig.dataset.key, clientX: e.clientX };
     if (!c || !c.shown.length) { tip.hidden = true; return; }
     const svg = $('svg', fig);
     const rect = svg.getBoundingClientRect();
@@ -186,6 +210,7 @@
   }
   function unhover(e) {
     const fig = e.target.closest('.lt-chart');
+    hovered = null;
     $('#tip').hidden = true;
     if (!fig) return;
     $$('.lt-cross, .lt-hover', fig).forEach((n) => n.setAttribute('visibility', 'hidden'));
@@ -197,12 +222,15 @@
   async function loadDevices() {
     try {
       const r = await api(`/api/admin/loadtest/sims?limit=60&filter=${encodeURIComponent(dev.kind)}&q=${encodeURIComponent(dev.q)}`);
+      // Changes still on their way to the server win over what it had when it answered.
+      for (const d of r.devices) { const p = pend.get(d.id); if (p) Object.assign(d, clone(p.want)); }
       dev.list = r.devices; dev.total = r.total;
       renderDevices();
     } catch (e) { $('#devList').innerHTML = `<div class="warn-box">${esc(e.message)}</div>`; }
   }
   const problemLabel = (key) => st.catalog.find((c) => c.key === key)?.label || key;
   function devChips(d) {
+    if (d.taken) return '<span class="lt-chip warn" title="A real device already uses this name, so the simulator skips it">Skipped: name taken</span>';
     const chips = [
       ...d.problems.map((k) => `<span class="lt-chip bad">${esc(problemLabel(k))}</span>`),
       ...d.stopped.map((n) => `<span class="lt-chip bad">${esc(n)} stopped</span>`),
@@ -244,16 +272,46 @@
     $('#devList').innerHTML = dev.list.length ? dev.list.map(devRow).join('')
       : `<p class="lt-healthy">${dev.kind === 'custom' ? 'No devices have been changed.' : 'No devices match.'}</p>`;
   }
-  async function setDevice(id, change) {
+  // One device's changes go to the server one request at a time, each built from the latest thing the
+  // user asked for (shown straight away), so quick clicks never undo each other.
+  const pend = new Map(); // id -> { want: {problems, stopped, closed}, server: last device the server sent, busy }
+  const clone = (b) => ({ problems: b.problems.slice(), stopped: b.stopped.slice(), closed: b.closed.slice() });
+  const key = (b) => JSON.stringify([[...b.problems].sort(), [...b.stopped].sort(), [...b.closed].sort()]);
+  function setDevice(id, change) {
     const d = dev.list.find((x) => x.id === id);
-    const body = { problems: d.problems.slice(), stopped: d.stopped.slice(), closed: d.closed.slice() };
-    change(body);
-    try {
-      const r = await api(`/api/admin/loadtest/sims/${id}`, { method: 'PUT', body });
-      Object.assign(d, r.device);
-      st = r; render();
-      if (dev.kind === 'custom' && !changed(d)) { dev.open = null; loadDevices(); } else renderDevices();
-    } catch (e) { toast(e.message, 'error'); renderDevices(); }
+    if (!d) return;
+    let p = pend.get(id);
+    if (!p) { p = { want: clone(d), server: { ...d, ...clone(d) }, busy: false }; pend.set(id, p); }
+    change(p.want);
+    Object.assign(d, clone(p.want));
+    renderDevices();
+    if (!p.busy) sendDevice(id, p);
+  }
+  async function sendDevice(id, p) {
+    p.busy = true;
+    for (;;) {
+      const body = clone(p.want);
+      try {
+        const r = await api(`/api/admin/loadtest/sims/${encodeURIComponent(id)}`, { method: 'PUT', body });
+        p.server = r.device;
+        st = r;
+        if (key(body) !== key(p.want)) continue; // more clicks while this was on its way: send the latest
+        pend.delete(id);
+        showDevice(id, r.device);
+        render();
+        return;
+      } catch (e) {
+        toast(e.message, 'error');
+        pend.delete(id);
+        showDevice(id, p.server); // back to what the server has
+        return;
+      }
+    }
+  }
+  function showDevice(id, device) {
+    const d = dev.list.find((x) => x.id === id);
+    if (d) Object.assign(d, device);
+    if (d && dev.kind === 'custom' && !changed(d)) { dev.open = null; loadDevices(); } else renderDevices();
   }
   function bindDevices() {
     $('#devKind').addEventListener('click', (e) => {
@@ -302,7 +360,14 @@
       render();
     });
     $('#applyBtn').addEventListener('click', async () => { if (await run('/api/admin/loadtest', { method: 'PUT', body: settings() }, 'Applied')) { dirty = false; render(); } });
-    $('#burstBtn').addEventListener('click', () => run('/api/admin/loadtest/burst', { method: 'POST' }, `Burst: ${nf.format(st.devices)} check-ins sent at once`));
+    $('#burstBtn').addEventListener('click', async () => {
+      try {
+        st = await api('/api/admin/loadtest/burst', { method: 'POST' });
+        render();
+        const skipped = Math.max(0, st.devices - st.burst - (st.taken || 0));
+        toast(st.burst ? `Burst: ${nf.format(st.burst)} check-ins on their way, up to ${nf.format(st.maxInflight)} at a time${skipped ? ` (${nf.format(skipped)} offline skipped)` : ''}` : 'Nothing to burst: every device is offline');
+      } catch (e) { toast(e.message, 'error'); }
+    });
     for (const id of ['#devices', '#interval']) {
       $(id).addEventListener('input', () => { dirty = true; updateTarget(); $('#applyBtn').hidden = !st?.running; });
       $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') (st?.running ? $('#applyBtn') : $('#startBtn')).click(); });
@@ -316,7 +381,10 @@
       amounts[body.key] = { amount: body.amount, mode: body.mode };
       local.set('loadtest.amounts', amounts);
       const label = $('b', row).textContent;
-      await run('/api/admin/loadtest/scenarios', { method: 'POST', body }, `${label} triggered${st?.running ? '' : ' (start the test to send it)'}`);
+      if (!(await run('/api/admin/loadtest/scenarios', { method: 'POST', body }))) return;
+      const sc = st.scenarios.at(-1);
+      if (sc && !sc.affected) toast(`${label} triggered, but it picks none of the devices it applies to: raise the amount or use a number of devices`, 'error');
+      else toast(`${label} triggered on ${affText(sc?.affected || 0)}${st?.running ? '' : ' (start the test to send it)'}`);
     });
     $('#active').addEventListener('click', (e) => {
       const b = e.target.closest('[data-remove]');
@@ -324,10 +392,15 @@
       const id = b.closest('.lt-sc').dataset.id;
       run(`/api/admin/loadtest/scenarios/${id}`, { method: 'DELETE' }, 'Removed: those devices are healthy from their next check-in');
     });
-    $('#active').addEventListener('change', (e) => {
+    $('#active').addEventListener('change', async (e) => {
       const row = e.target.closest('.lt-sc');
       if (!row || !e.target.matches('[data-amt], [data-mode]')) return;
-      run(`/api/admin/loadtest/scenarios/${row.dataset.id}`, { method: 'PUT', body: { amount: Number($('[data-amt]', row).value), mode: $('[data-mode]', row).value } });
+      const ok = await run(`/api/admin/loadtest/scenarios/${row.dataset.id}`, { method: 'PUT', body: { amount: Number($('[data-amt]', row).value), mode: $('[data-mode]', row).value } });
+      if (!ok) {
+        // Rejected: put the boxes back to what is really running.
+        const sc = st.scenarios.find((x) => x.id === row.dataset.id);
+        if (sc) { $('[data-amt]', row).value = sc.amount; $('[data-mode]', row).value = sc.mode; }
+      }
     });
     $('#healAll').addEventListener('click', () => run('/api/admin/loadtest/scenarios/all', { method: 'DELETE' }, 'Every device is healthy from its next check-in'));
     $('#removeBtn').addEventListener('click', () => modal({
@@ -345,7 +418,7 @@
     });
     document.addEventListener('pointermove', (e) => { if (e.target.closest?.('.lt-hit')) hover(e); });
     document.addEventListener('pointerout', (e) => { if (e.target.closest?.('.lt-hit')) unhover(e); });
-    window.addEventListener('resize', () => st && $$('.lt-chart').forEach(drawChart));
+    window.addEventListener('resize', () => st && drawCharts());
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('#modalBack').hidden = true; });
   }
 

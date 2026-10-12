@@ -148,7 +148,9 @@ test('security 4: X-Forwarded-Proto never reaches the installer scripts as-is', 
 });
 
 test('security 5: "password sign-in for admins only" covers HTTP Basic', async (t) => {
-  const { app } = await setup(t);
+  const { app, accounts } = await setup(t);
+  // Limiting password sign-in needs single sign-on to be working (see admin 3).
+  accounts.updateSso({ enabled: true, tenantId: 'contoso.example', clientId: 'client-1', clientSecret: 'secret-1' });
   const admin = basic('admin', 'admin-password-1');
   const user = basic('uma', 'uma-password-1');
   assert.equal((await app.inject({ url: '/api/auth/me', headers: { authorization: user } })).statusCode, 200, 'cached before the change');

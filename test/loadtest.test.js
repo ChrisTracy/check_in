@@ -253,3 +253,294 @@ test('load test: RDP and SSH (port_3389 / port_22) like the agents report them',
   await until(() => store.get(lsrv.id).port_22 === 'open' && store.get(wsrv.id).port_3389 === 'open');
   await admin({ method: 'POST', url: '/api/admin/loadtest/stop' });
 });
+
+// ------------------------------------------------------------------ regressions
+const ADMIN = { authorization: basic('admin', 'admin-password-1') };
+
+test('load test: burst respects the in-flight cap, keeps the event loop free, one at a time, skips offline', async (t) => {
+  const { app, store, admin } = await setup(t);
+  const lt = app.loadTest;
+  await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: 6000 } });
+  await admin({ method: 'POST', url: '/api/admin/loadtest/scenarios', payload: { key: 'offline', mode: 'count', amount: 100 } });
+  let maxInflight = 0;
+  let maxGap = 0;
+  let last = performance.now();
+  const timer = setInterval(() => {
+    const now = performance.now();
+    maxGap = Math.max(maxGap, now - last);
+    last = now;
+    maxInflight = Math.max(maxInflight, lt.inflight);
+  }, 10);
+  t.after(() => clearInterval(timer));
+  const r = await admin({ method: 'POST', url: '/api/admin/loadtest/burst' });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal(r.j().burst, 5900, 'offline devices are not counted (or sent)');
+  assert.ok(r.j().inflight <= 1000);
+  const again = await admin({ method: 'POST', url: '/api/admin/loadtest/burst' });
+  assert.equal(again.statusCode, 409, 'a second burst while one is running is refused');
+  await until(() => sims(store).length === 5900, 60000);
+  await until(() => lt.inflight === 0 && !lt.bursting);
+  clearInterval(timer);
+  assert.ok(maxInflight > 0 && maxInflight <= 1000, `in flight peaked at ${maxInflight}`);
+  assert.ok(maxGap < 250, `event loop blocked for ${Math.round(maxGap)} ms`);
+  assert.equal((await admin({ method: 'POST', url: '/api/admin/loadtest/burst' })).statusCode, 200, 'a new burst once the last one is done');
+  await until(() => lt.inflight === 0 && !lt.bursting, 60000);
+});
+
+test('load test: percentage picks are stable when the fleet grows or shrinks', async (t) => {
+  const { app, admin } = await setup(t);
+  const lt = app.loadTest;
+  await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: 1000 } });
+  await admin({ method: 'POST', url: '/api/admin/loadtest/scenarios', payload: { key: 'high_cpu', mode: 'percent', amount: 10 } });
+  await admin({ method: 'POST', url: '/api/admin/loadtest/scenarios', payload: { key: 'ssh_closed', mode: 'percent', amount: 50 } });
+  await admin({ method: 'POST', url: '/api/admin/loadtest/scenarios', payload: { key: 'reboot_required', mode: 'count', amount: 40 } });
+  const sets = () => lt.scenarios.map((s) => new Set(s.set));
+  const subset = (a, b) => [...a].every((k) => b.has(k));
+  const s1000 = sets();
+  assert.equal(s1000[0].size, 100);
+  let r = await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: 1001 } });
+  assert.equal(r.statusCode, 200);
+  const s1001 = sets();
+  assert.ok(subset(s1000[0], s1001[0]) && s1001[0].size === 100, 'one more device changes nothing');
+  await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: 1100 } });
+  const s1100 = sets();
+  assert.equal(s1100[0].size, 110);
+  for (let k = 0; k < 3; k++) assert.ok(subset(s1000[k], s1100[k]), `scenario ${k}: growing keeps every pick`);
+  assert.deepEqual([...s1100[2]].sort(), [...s1000[2]].sort(), 'a count stays the same devices');
+  await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: 900 } });
+  const s900 = sets();
+  assert.equal(s900[0].size, 90);
+  for (let k = 0; k < 2; k++) {
+    // Either only picks were dropped, or (when the dropped devices held more than their share) every
+    // remaining pick was kept and topped up with the next-ranked devices.
+    const kept = new Set([...s1100[k]].filter((i) => i < 900));
+    assert.ok(subset(s900[k], s1100[k]) || subset(kept, s900[k]), `scenario ${k}: shrinking keeps picks`);
+    assert.ok([...s900[k]].every((i) => i < 900));
+  }
+  // A count keeps its picks that are still in the fleet and tops up with the next-ranked ones.
+  assert.equal(s900[2].size, 40);
+  assert.ok([...s1100[2]].filter((i) => i < 900).every((i) => s900[2].has(i)));
+  // Changing the amount is stable too.
+  r = await admin({ method: 'PUT', url: `/api/admin/loadtest/scenarios/${lt.scenarios[0].id}`, payload: { amount: 20 } });
+  assert.ok(subset(s900[0], lt.scenarios[0].set) && lt.scenarios[0].set.size === 180);
+});
+
+test('load test: shrinking the fleet deletes the dropped simulated records and closes their issues', async (t) => {
+  const { app, store, admin } = await setup(t);
+  await admin({ method: 'PUT', url: '/api/admin/issues', payload: { enabled: true } });
+  const cfg = (await admin({ url: '/api/issues/config' })).j();
+  await admin({ method: 'PUT', url: '/api/issues/rules', payload: { version: cfg.version, rules: [
+    { name: 'Reboot', field: 'reboot_required', op: 'eq', value: 'true', count: 1, clear: { count: 1 } },
+  ] } });
+  await admin({ method: 'POST', url: '/api/admin/loadtest/scenarios', payload: { key: 'reboot_required', amount: 100 } });
+  await admin({ method: 'POST', url: '/api/admin/loadtest/start', payload: { devices: 120, interval: 1 } });
+  await until(() => sims(store).length === 120);
+  await until(async () => (await admin({ url: '/api/issues' })).j().total === 120);
+  // A real device that looks simulated by name but isn't marked simulated is never touched.
+  const keepId = app.loadTest.id(110);
+  const r = await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: 50 } });
+  assert.equal(r.statusCode, 200);
+  assert.equal(sims(store).length, 50, 'dropped devices are deleted straight away');
+  assert.ok(!store.get(keepId));
+  await sleep(1500);
+  assert.equal(sims(store).length, 50, 'and they stay gone (nothing in flight brings them back)');
+  assert.ok(sims(store).every((x) => app.loadTest.index(x.id) < 50));
+  await until(async () => (await admin({ url: '/api/issues' })).j().total === 50);
+  await admin({ method: 'POST', url: '/api/admin/loadtest/stop' });
+});
+
+test('load test: Apply keeps the cycle position (no-op when unchanged), so no device goes stale', async (t) => {
+  const { app, store, admin } = await setup(t);
+  const lt = app.loadTest;
+  await admin({ method: 'POST', url: '/api/admin/loadtest/start', payload: { devices: 100, interval: 1 } });
+  await until(() => sims(store).length === 100 && !lt.first);
+  await sleep(400);
+  const t0 = lt.t0;
+  lt.configure({ devices: 100, interval: 1 });
+  assert.equal(lt.t0, t0, 'nothing changed: the clock is left alone');
+  const pos = lt.cursor % lt.devices;
+  lt.configure({ interval: 2 });
+  assert.equal(lt.cursor, pos, 'the next device due is still the same one');
+  // Apply over and over (faster than a cycle): every device still checks in.
+  const start = new Date().toISOString();
+  const end = Date.now() + 4500;
+  let flip = false;
+  while (Date.now() < end) {
+    flip = !flip;
+    const r = await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: 100, interval: flip ? 1.5 : 2 } });
+    assert.equal(r.statusCode, 200);
+    await sleep(250);
+  }
+  const stale = sims(store).filter((x) => x.modified < start);
+  assert.equal(stale.length, 0, `${stale.length} devices never checked in again`);
+  await admin({ method: 'POST', url: '/api/admin/loadtest/stop' });
+});
+
+test('load test: "Make all of these healthy" sends at once, offline devices included', async (t) => {
+  const { app, store, admin } = await setup(t);
+  await admin({ method: 'POST', url: '/api/admin/loadtest/start', payload: { devices: 30, interval: 3600 } });
+  await until(() => sims(store).length === 30 && !app.loadTest.first);
+  const [a, b] = [app.loadTest.id(0), app.loadTest.id(1)];
+  await admin({ method: 'PUT', url: `/api/admin/loadtest/sims/${a}`, payload: { problems: ['high_cpu', 'reboot_required'] } });
+  await until(() => store.get(a).reboot_required === true);
+  await admin({ method: 'PUT', url: `/api/admin/loadtest/sims/${b}`, payload: { problems: ['offline'] } });
+  await sleep(50);
+  const before = store.get(b).modified;
+  const r = await admin({ method: 'DELETE', url: '/api/admin/loadtest/sims' });
+  assert.equal(r.j().customCount, 0);
+  await until(() => store.get(a).reboot_required === false && store.get(a).cpu_pct < 92, 3000);
+  await until(() => store.get(b).modified > before, 3000);
+  await admin({ method: 'POST', url: '/api/admin/loadtest/stop' });
+});
+
+test('load test: a real device with a simulated name is never written or removed', async (t) => {
+  const { app, store, admin } = await setup(t);
+  const lt = app.loadTest;
+  const realId = lt.id(3);
+  await app.inject({ method: 'POST', url: '/api/checkin', headers: ADMIN, payload: { id: realId, cpu_pct: 5, owner: 'finance' } });
+  // A record that says simulated: 1 (not true) is a real one too.
+  const oneId = lt.id(4);
+  await app.inject({ method: 'POST', url: '/api/checkin', headers: ADMIN, payload: { id: oneId, simulated: 1 } });
+  let r = await admin({ method: 'POST', url: '/api/admin/loadtest/start', payload: { devices: 20, interval: 1 } });
+  await until(() => sims(store).filter((x) => x.simulated === true).length === 18);
+  await admin({ method: 'POST', url: '/api/admin/loadtest/burst' });
+  await admin({ method: 'PUT', url: `/api/admin/loadtest/sims/${realId}`, payload: { problems: ['high_cpu'] } });
+  await sleep(1200);
+  r = await admin({ url: '/api/admin/loadtest' });
+  assert.equal(r.j().taken, 2);
+  assert.deepEqual(r.j().takenIds, [realId, oneId].sort());
+  const real = store.get(realId);
+  assert.equal(real.simulated, undefined);
+  assert.equal(real._version, 1, 'never written by the simulator');
+  assert.equal(real.owner, 'finance');
+  assert.equal(store.get(oneId)._version, 1);
+  await admin({ method: 'POST', url: '/api/admin/loadtest/stop' });
+  r = await admin({ method: 'DELETE', url: '/api/admin/loadtest/devices?confirm=true' });
+  assert.equal(r.j().deleted, 18);
+  assert.ok(store.get(realId) && store.get(oneId), 'Remove leaves them alone');
+});
+
+test('load test: Stop then Remove (and Remove during a burst) leaves nothing behind', async (t) => {
+  const { app, store, admin } = await setup(t);
+  await admin({ method: 'POST', url: '/api/admin/loadtest/start', payload: { devices: 5000, interval: 3600 } });
+  await admin({ method: 'POST', url: '/api/admin/loadtest/burst' });
+  await until(() => app.loadTest.inflight > 50, 10000);
+  let r = await admin({ method: 'POST', url: '/api/admin/loadtest/stop' });
+  assert.equal(r.j().inflight, 0, 'stop answers once in-flight check-ins have landed');
+  r = await admin({ method: 'DELETE', url: '/api/admin/loadtest/devices?confirm=true' });
+  assert.equal(r.statusCode, 200, r.body);
+  await sleep(500);
+  assert.equal(sims(store).length, 0);
+  // A burst while stopped, removed straight away (no waiting in between).
+  await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: 4000 } });
+  await admin({ method: 'POST', url: '/api/admin/loadtest/burst' });
+  await until(() => app.loadTest.inflight > 50, 10000);
+  r = await admin({ method: 'DELETE', url: '/api/admin/loadtest/devices?confirm=true' });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.ok(r.j().deleted > 0);
+  await sleep(500);
+  assert.equal(sims(store).length, 0);
+  assert.equal(app.loadTest.inflight, 0);
+});
+
+test('load test: built-in property names are not problems; loose numbers are rejected', async (t) => {
+  const { app, store, admin } = await setup(t);
+  const bad = ['__proto__', 'toString', 'constructor', '__defineGetter__', 'hasOwnProperty', 'valueOf'];
+  for (const key of bad) {
+    assert.equal((await admin({ method: 'POST', url: '/api/admin/loadtest/scenarios', payload: { key } })).statusCode, 400, key);
+  }
+  assert.equal(app.loadTest.scenarios.length, 0);
+  await admin({ method: 'POST', url: '/api/admin/loadtest/start', payload: { devices: 10, interval: 1 } });
+  await until(() => sims(store).length === 10);
+  const id = app.loadTest.id(4);
+  for (const k of bad) {
+    assert.equal((await admin({ method: 'PUT', url: `/api/admin/loadtest/sims/${id}`, payload: { problems: [k] } })).statusCode, 400, k);
+    assert.equal((await admin({ method: 'PUT', url: `/api/admin/loadtest/sims/${id}`, payload: { stopped: [k] } })).statusCode, 400, k);
+    assert.equal((await admin({ method: 'PUT', url: `/api/admin/loadtest/sims/${id}`, payload: { closed: [k] } })).statusCode, 400, k);
+  }
+  assert.equal((await admin({ method: 'PUT', url: `/api/admin/loadtest/sims/${id}`, payload: { problems: [{}] } })).statusCode, 400);
+  assert.equal(app.loadTest.overrides.size, 0);
+  // Check-ins keep working.
+  const sent = (await admin({ url: '/api/admin/loadtest' })).j().stats;
+  await sleep(1200);
+  const now = (await admin({ url: '/api/admin/loadtest' })).j().stats;
+  assert.ok(now.ok > sent.ok && now.errors === 0, JSON.stringify(now));
+
+  // Loose numbers.
+  for (const devices of [true, [5], '0x10', 2.5, '', null, '1e3', {}]) {
+    assert.equal((await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices } })).statusCode, 400, JSON.stringify(devices));
+  }
+  for (const interval of [true, [5], '0x10', '', null]) {
+    assert.equal((await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { interval } })).statusCode, 400, JSON.stringify(interval));
+  }
+  // Nothing is half-applied when one value is bad.
+  assert.equal((await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: 20, interval: 'x' } })).statusCode, 400);
+  assert.equal(app.loadTest.devices, 10);
+  assert.equal((await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: '12' } })).j().devices, 12, 'a plain number string is fine');
+  const sc = (k, mode, amount) => admin({ method: 'POST', url: '/api/admin/loadtest/scenarios', payload: { key: k, mode, amount } });
+  assert.equal((await sc('high_cpu', 'count', 0.4)).statusCode, 400, 'a count that rounds to 0');
+  assert.equal((await sc('high_cpu', 'count', 2.5)).statusCode, 400);
+  assert.equal((await sc('high_cpu', 'count', true)).statusCode, 400);
+  assert.equal((await sc('high_cpu', 'percent', [5])).statusCode, 400);
+  assert.equal((await sc('high_cpu', 'percent', 0)).statusCode, 400);
+  assert.equal((await sc('high_cpu', 'bogus', 5)).statusCode, 400);
+  assert.equal((await sc('high_cpu', 'count', 20001)).statusCode, 400);
+  let r = await sc('high_cpu', 'percent', 1);
+  assert.equal(r.statusCode, 200);
+  assert.equal(r.j().scenarios[0].affected, 0, 'a small percentage of a small fleet picks nobody (and says so)');
+  const sid = r.j().scenarios[0].id;
+  assert.equal((await admin({ method: 'PUT', url: `/api/admin/loadtest/scenarios/${sid}`, payload: { mode: 'count', amount: 0.3 } })).statusCode, 400);
+  assert.equal((await admin({ method: 'PUT', url: `/api/admin/loadtest/scenarios/${sid}`, payload: { amount: 'abc' } })).statusCode, 400);
+  r = await admin({ url: '/api/admin/loadtest' });
+  assert.equal(r.j().scenarios[0].amount, 1);
+  assert.equal(r.j().scenarios[0].mode, 'percent');
+  // Slow fleets don't show a target of 0.
+  r = await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: 1, interval: 36 } });
+  assert.equal(r.j().target, 0.03);
+  await admin({ method: 'POST', url: '/api/admin/loadtest/stop' });
+});
+
+test('load test: after a restart the fleet size comes from the simulated records in the database', async (t) => {
+  const { app, store } = await setup(t);
+  const { LoadTest } = await import('../src/loadtest.js');
+  const ids = [];
+  for (let i = 0; i < 700; i++) ids.push(app.loadTest.id(i));
+  await Promise.all(ids.map((id) => store.upsert({ id, simulated: true })));
+  await store.upsert({ id: 'SIM-REAL-9', cpu_pct: 1 });
+  const lt = new LoadTest({ app, store, log: {} });
+  t.after(() => lt.close());
+  assert.equal(lt.devices, 700);
+});
+
+test('load test: after a restart with gaps, the fleet size is the highest simulated number', async (t) => {
+  const { app, store } = await setup(t);
+  const { LoadTest } = await import('../src/loadtest.js');
+  const ids = [];
+  for (let i = 0; i < 900; i++) ids.push(app.loadTest.id(i));
+  await Promise.all(ids.map((id) => store.upsert({ id, simulated: true })));
+  store.deleteMany(ids.slice(0, 850)); // only 50 left, but numbered up to 900
+  const lt = new LoadTest({ app, store, log: {} });
+  t.after(() => lt.close());
+  assert.equal(lt.devices, 900);
+});
+
+test('load test: Burst and Start are refused while Remove is running, and nothing comes back', async (t) => {
+  const { app, store, admin } = await setup(t);
+  await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { devices: 3000, interval: 3600 } });
+  await admin({ method: 'POST', url: '/api/admin/loadtest/burst' });
+  await until(() => app.loadTest.inflight > 50, 10000);
+  const removing = app.loadTest.removeDevices(); // sets the flag straight away, then waits for in-flight check-ins
+  assert.equal(app.loadTest.removing, true);
+  const b = await admin({ method: 'POST', url: '/api/admin/loadtest/burst' });
+  assert.equal(b.statusCode, 409, b.body);
+  const s = await admin({ method: 'POST', url: '/api/admin/loadtest/start' });
+  assert.equal(s.statusCode, 409, s.body);
+  const r = await removing;
+  assert.ok(r.deleted > 0);
+  await sleep(500);
+  assert.equal(sims(store).length, 0);
+  assert.equal(app.loadTest.running, false);
+  // Afterwards everything works again.
+  assert.equal((await admin({ method: 'POST', url: '/api/admin/loadtest/burst' })).statusCode, 200);
+  await until(() => sims(store).length === 3000, 20000);
+});

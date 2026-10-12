@@ -2,7 +2,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { HttpError } from '../store.js';
 import { ROLES, CAPS, can, capsFor, roleLevel } from './accounts.js';
-import { RateLimiter, sha256, encrypt, decrypt, verifyPassword, safeReturnTo, safeProto } from './security.js';
+import { RateLimiter, sha256, encrypt, decrypt, verifyPassword, passwordProblem, safeReturnTo, safeProto } from './security.js';
 import { ROOT } from '../config.js';
 import { LOADTEST_TOKEN } from '../loadtest.js';
 
@@ -10,6 +10,10 @@ const SESSION_COOKIE = 'ci_session';
 const OIDC_COOKIE = 'ci_oidc';
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+// A Host header we are willing to build absolute URLs from: a DNS name, IPv4 or [IPv6], optional port.
+const HOST_RE = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]{2,45}\])(?::\d{1,5})?$/;
+/** Failed sign-ins allowed per address + username, and per address in total (an office behind one NAT). */
+export const LOGIN_LIMITS = { perUser: 10, perIp: 50 };
 
 /**
  * Authentication & authorisation.
@@ -23,14 +27,30 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
  * Routes declare the capability they need with `config: { cap: '...' }`.
  */
 export function registerAuth(app, { accounts, oidc, config, broadcast, views }) {
-  const loginLimiter = new RateLimiter({ max: 10, windowMs: 15 * 60_000 });
+  const loginLimiter = new RateLimiter({ max: LOGIN_LIMITS.perUser, limits: { 'ip:': LOGIN_LIMITS.perIp }, windowMs: 15 * 60_000 });
+  const loginKeys = (ip, username) => ['login:' + ip + ':' + String(username || '').trim().toLowerCase(), 'ip:' + ip];
+
+  // An empty body sent as application/json (e.g. a bodyless DELETE from fetch with a JSON header)
+  // means "no fields", not a 400 that would come before the sign-in / role check.
+  const jsonParser = app.getDefaultJsonParser('error', 'error');
+  app.removeContentTypeParser('application/json');
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
+    if (body === '' || /^\s*$/.test(body)) return done(null, {});
+    return jsonParser(req, body, done);
+  });
   const basicCache = new Map(); // sha256(header) -> { userId, exp }
 
   const secureCookie = (req) => (config.cookieSecure === 'auto' ? safeProto(req) === 'https' : config.cookieSecure === 'true');
   const setSessionCookie = (req, reply, token) => reply.setCookie(SESSION_COOKIE, token, {
     path: '/', httpOnly: true, sameSite: 'lax', secure: secureCookie(req), maxAge: Math.floor(accounts.ttlMs / 1000),
   });
-  const baseUrl = (req) => accounts.sso().publicUrl || `${safeProto(req)}://${req.headers.host}`;
+  const baseUrl = (req) => {
+    const pub = accounts.sso().publicUrl;
+    if (pub) return pub;
+    const host = String(req.headers.host || '');
+    if (!HOST_RE.test(host)) throw new HttpError(400, 'Could not work out this server\'s address from the request. Set the Public URL in Admin → Single sign-on.');
+    return `${safeProto(req)}://${host}`;
+  };
   const redirectUri = (req) => `${baseUrl(req)}/auth/oidc/callback`;
 
   function userAuth(u, kind, extra = {}) {
@@ -58,23 +78,25 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
       const passwordAllowed = (u) => accounts.passwordLogin !== 'admins' || u.role === 'admin';
       if (hit && hit.exp > Date.now()) {
         const u = accounts.get(hit.userId);
-        if (u && !u.disabled && passwordAllowed(u)) return userAuth(u, 'basic');
+        if (u && !u.disabled && passwordAllowed(u)) return userAuth(u, 'basic', { pwHash: u.password_hash });
       }
       // Checks in progress count against the limit, so parallel guesses can't all get in first.
-      const g = await loginLimiter.guard(['ip:' + ip], () => (i > 0 ? accounts.verifyLogin(raw.slice(0, i), raw.slice(i + 1)) : null));
+      const keys = loginKeys(ip, i > 0 ? raw.slice(0, i) : '');
+      const g = await loginLimiter.guard(keys, () => (i > 0 ? accounts.verifyLogin(raw.slice(0, i), raw.slice(i + 1)) : null));
       if (g.blocked) throw new HttpError(429, 'Too many failed sign-in attempts. Try again later.');
       const u = g.result;
       if (!u) throw Object.assign(new HttpError(401, 'Invalid username or password'), { basic: true });
+      loginLimiter.clear(keys[0]);
       if (!passwordAllowed(u)) throw new HttpError(403, 'Password sign-in is limited to admins on this server. Use single sign-on.');
       if (basicCache.size > 1000) basicCache.clear();
       basicCache.set(cacheKey, { userId: u.id, exp: Date.now() + 5 * 60_000 });
-      return userAuth(u, 'basic');
+      return userAuth(u, 'basic', { pwHash: u.password_hash });
     }
     // The load test's own simulated check-ins (app.inject only: a random per-process token).
     const lt = req.headers['x-loadtest-token'];
     if (lt && typeof lt === 'string' && lt.length === LOADTEST_TOKEN.length && req.ip === '127.0.0.1'
       && crypto.timingSafeEqual(Buffer.from(lt), Buffer.from(LOADTEST_TOKEN))) {
-      return { kind: 'apikey', role: 'user', name: 'Load test', userId: null };
+      return { kind: 'apikey', role: 'user', name: 'Load test', userId: null, loadTest: true };
     }
     // 3. API key
     const key = req.headers['x-api-key']
@@ -82,7 +104,7 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
       || req.query?.api_key || req.query?.apikey;
     if (key) {
       if (!accounts.checkApiKey(key)) throw new HttpError(401, 'Invalid API key');
-      return { kind: 'apikey', role: 'user', name: 'API key', userId: null };
+      return { kind: 'apikey', role: 'user', name: 'API key', userId: null, apiKey: key };
     }
     return { kind: 'anon', role: null, name: 'anonymous', userId: null };
   }
@@ -99,8 +121,9 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
     }
   });
 
-  // Enforce capability + CSRF.
-  app.addHook('preHandler', async (req, reply) => {
+  // Enforce capability + CSRF. Runs before the body is parsed, so callers without the right to
+  // use a route get 401/403 rather than a complaint about what they sent.
+  app.addHook('preParsing', async (req, reply) => {
     const cap = req.routeOptions?.config?.cap;
     if (!cap) return;
     const a = req.auth || { kind: 'anon', role: null };
@@ -192,9 +215,9 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
   app.post('/api/auth/login', { config: { cap: 'public' } }, async (req, reply) => {
     requireJson(req);
     const { username, password } = req.body;
-    const key = 'login:' + req.ip + ':' + String(username || '').toLowerCase();
+    const [key, ipKey] = loginKeys(req.ip, username);
     // Checks in progress count against the limit, so parallel guesses can't all get in first.
-    const g = await loginLimiter.guard([key, 'ip:' + req.ip], () => accounts.verifyLogin(username, password));
+    const g = await loginLimiter.guard([key, ipKey], () => accounts.verifyLogin(username, password));
     if (g.blocked) throw new HttpError(429, 'Too many failed sign-in attempts. Wait a few minutes and try again.');
     const u = g.result;
     if (!u) throw new HttpError(401, 'Incorrect username or password');
@@ -219,6 +242,8 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
     const a = req.auth;
     if (!a.user) throw new HttpError(400, 'Only signed-in users can change their password');
     const { current, next } = req.body || {};
+    const problem = passwordProblem(next);
+    if (problem) throw new HttpError(400, next ? problem : 'Enter a new password');
     if (a.user.password_hash && !(await verifyPassword(current || '', a.user.password_hash))) {
       throw new HttpError(400, 'Current password is incorrect');
     }
@@ -305,6 +330,9 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
     if ('passwordLogin' in body) {
       if (!can(role, 'sso')) throw new HttpError(403, 'Only admins can change sign-in options');
       if (![true, 'admins'].includes(body.passwordLogin)) throw new HttpError(400, 'passwordLogin must be true or "admins"');
+      if (body.passwordLogin === 'admins' && accounts.passwordLogin !== 'admins' && !accounts.ssoReady()) {
+        throw new HttpError(400, 'Set up and turn on single sign-on before limiting password sign-in to admins, or nobody else could sign in.');
+      }
       accounts.setSetting('passwordLogin', body.passwordLogin);
     }
     const s = { staleMinutes: accounts.staleMinutes, passwordLogin: accounts.passwordLogin };
@@ -313,13 +341,17 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
   });
 
   // ---------------------------------------------------------------- admin: users
-  app.get('/api/admin/users', { config: { cap: 'users' } }, async () => ({ users: accounts.list(), roles: ROLES }));
+  app.get('/api/admin/users', { config: { cap: 'users' } }, async () => ({ users: accounts.list(), roles: ROLES, ssoReady: accounts.ssoReady() }));
   app.post('/api/admin/users', { config: { cap: 'users' } }, async (req, reply) => {
     const u = await accounts.create(req.body || {});
     return reply.code(201).send({ ok: true, user: u });
   });
   app.patch('/api/admin/users/:id', { config: { cap: 'users' } }, async (req) => {
-    const u = await accounts.update(Number(req.params.id), req.body || {}, req.auth.userId);
+    const id = Number(req.params.id);
+    const { keepSession, ...patch } = req.body || {};
+    // Changing your own password here keeps you signed in on this browser (other sessions end).
+    if (id === req.auth.userId && req.auth.sid) patch.keepSession = req.auth.sid;
+    const u = await accounts.update(id, patch, req.auth.userId);
     basicCache.clear();
     return { ok: true, user: u };
   });
@@ -331,7 +363,11 @@ export function registerAuth(app, { accounts, oidc, config, broadcast, views }) 
   });
 
   // ---------------------------------------------------------------- admin: SSO
-  const ssoBody = (req) => ({ ...accounts.publicSso(), redirectUri: redirectUri(req), ready: accounts.ssoReady() });
+  const ssoBody = (req) => {
+    let uri = '';
+    try { uri = redirectUri(req); } catch { /* shown as empty: set the Public URL */ }
+    return { ...accounts.publicSso(), redirectUri: uri, ready: accounts.ssoReady() };
+  };
   app.get('/api/admin/sso', { config: { cap: 'sso' } }, async (req) => ssoBody(req));
   app.put('/api/admin/sso', { config: { cap: 'sso' } }, async (req) => {
     const body = req.body || {};

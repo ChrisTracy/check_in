@@ -3,6 +3,7 @@ import path from 'node:path';
 import https from 'node:https';
 import tls from 'node:tls';
 import crypto from 'node:crypto';
+import net from 'node:net';
 import { safeProto } from './auth/security.js';
 import { HttpError } from './store.js';
 import { encrypt, decrypt } from './auth/security.js';
@@ -31,6 +32,41 @@ function writeSecureFile(file, data) {
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, data, { mode: 0o600 });
   fs.renameSync(tmp, file);
+}
+
+/**
+ * Host names for a self-signed certificate: DNS names (a leading "*." is allowed) or IPv4 / IPv6
+ * addresses, without ports. Returns [{ name, ip }] or throws HttpError(400).
+ */
+export function parseCertNames(input) {
+  const raw = (Array.isArray(input) ? input : String(input ?? '').split(/[\s,]+/)).map((h) => String(h).trim()).filter(Boolean);
+  if (!raw.length) throw new HttpError(400, 'Enter at least one host name or IP address');
+  if (raw.length > 100) throw new HttpError(400, 'At most 100 host names');
+  const label = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/i;
+  const out = [];
+  for (const r of raw) {
+    const n = r.startsWith('[') && r.endsWith(']') ? r.slice(1, -1) : r;
+    const show = r.slice(0, 80);
+    if (net.isIP(n)) { out.push({ name: n, ip: true }); continue; }
+    if (/^\[.*\]:\d+$/.test(r) || /^[^:]+:\d+$/.test(r)) throw new HttpError(400, `Leave the port out of host names: ${show}`);
+    if (/^[\d.]+$/.test(n)) throw new HttpError(400, `Not a valid IP address: ${show}`);
+    if (n.includes(':')) throw new HttpError(400, `Not a valid IPv6 address: ${show}`);
+    const name = n.replace(/\.$/, '');
+    const labels = (name.startsWith('*.') ? name.slice(2) : name).split('.');
+    if (name.length > 253 || !labels.every((l) => label.test(l))) {
+      throw new HttpError(400, `Not a valid host name: ${show} (use letters, numbers and dashes, separated by dots)`);
+    }
+    out.push({ name: name.toLowerCase(), ip: false });
+  }
+  return out;
+}
+
+/** Refuse certificates that are expired or not valid yet (uploads, deploys, ACME). */
+function assertCurrent(info) {
+  if (info.expired) throw new HttpError(400, `That certificate expired on ${info.validTo.slice(0, 10)}. Install a current certificate.`);
+  if (Date.parse(info.validFrom) > Date.now() + 5 * 60_000) {
+    throw new HttpError(400, `That certificate is not valid until ${info.validFrom.slice(0, 16).replace('T', ' ')} UTC. Check the clock on the machine that made it.`);
+  }
 }
 
 function derToPem(der) {
@@ -234,7 +270,7 @@ export class TlsManager {
     if (!pfx?.length) throw new HttpError(400, 'Empty .pfx file');
     if (pfx.length > MAX_PFX) throw new HttpError(400, 'PFX file is too large');
     const info = inspectMaterial({ pfx, passphrase });
-    if (info.expired) throw new HttpError(400, `That certificate expired on ${info.validTo.slice(0, 10)}`);
+    assertCurrent(info);
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     writeSecureFile(this.#file('pfx'), pfx);
     for (const f of ['cert', 'key']) fs.rmSync(this.#file(f), { force: true });
@@ -259,7 +295,7 @@ export class TlsManager {
       throw new HttpError(400, /passphrase|bad decrypt/i.test(e.message) ? 'The private key is encrypted; send it unencrypted' : 'Could not read the private key: ' + e.message);
     }
     const info = inspectMaterial({ cert, key: pkcs8 });
-    if (info.expired) throw new HttpError(400, `That certificate expired on ${info.validTo.slice(0, 10)}`);
+    assertCurrent(info);
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     writeSecureFile(this.#file('cert'), cert);
     writeSecureFile(this.#file('key'), pkcs8);
@@ -330,24 +366,30 @@ export class TlsManager {
       mat = { pfx: buf, passphrase: pfxPass };
       files = { pfx: buf };
     } else if (type === 'self-signed') {
-      const names = (Array.isArray(body.hostnames) ? body.hostnames : String(body.hostnames || '').split(/[\s,]+/))
-        .map((h) => String(h).trim()).filter(Boolean);
-      if (!names.length) throw new HttpError(400, 'Enter at least one host name or IP address');
-      if (names.some((n) => !/^[A-Za-z0-9.*:-]{1,253}$/.test(n))) throw new HttpError(400, 'Host names may contain only letters, numbers, dots, dashes, colons and *');
-      const days = Math.min(Math.max(Number(body.days) || 365, 1), 3650);
+      const names = parseCertNames(body.hostnames);
+      const days = body.days === undefined || body.days === null || body.days === '' ? 365 : Number(body.days);
+      if (!Number.isInteger(days) || days < 1 || days > 3650) throw new HttpError(400, 'Valid for (days) must be a whole number from 1 to 3650');
       const { generate } = await import('selfsigned');
-      const isIp = (n) => /^\d{1,3}(\.\d{1,3}){3}$/.test(n) || n.includes(':');
-      const pems = await generate([{ name: 'commonName', value: names[0] }], {
-        days,
-        keySize: 2048,
-        algorithm: 'sha256',
-        extensions: [
-          { name: 'basicConstraints', cA: false },
-          { name: 'keyUsage', digitalSignature: true, keyEncipherment: true },
-          { name: 'extKeyUsage', serverAuth: true },
-          { name: 'subjectAltName', altNames: names.map((n) => (isIp(n) ? { type: 7, ip: n } : { type: 2, value: n })) },
-        ],
-      });
+      // selfsigned 5 takes dates, not a number of days. Start a minute early for clock skew.
+      const notBeforeDate = new Date(Date.now() - 60_000);
+      const notAfterDate = new Date(notBeforeDate.getTime() + days * 86400_000);
+      let pems;
+      try {
+        pems = await generate([{ name: 'commonName', value: names[0].name }], {
+          notBeforeDate,
+          notAfterDate,
+          keySize: 2048,
+          algorithm: 'sha256',
+          extensions: [
+            { name: 'basicConstraints', cA: false },
+            { name: 'keyUsage', digitalSignature: true, keyEncipherment: true },
+            { name: 'extKeyUsage', serverAuth: true },
+            { name: 'subjectAltName', altNames: names.map((n) => (n.ip ? { type: 7, ip: n.name } : { type: 2, value: n.name })) },
+          ],
+        });
+      } catch (e) {
+        throw new HttpError(400, 'Could not create the certificate: ' + String(e?.message || e).slice(0, 200));
+      }
       mat = { cert: pems.cert, key: pems.private };
       files = { cert: pems.cert, key: pems.private };
     } else {
@@ -355,6 +397,7 @@ export class TlsManager {
     }
 
     const info = inspectMaterial(mat); // throws a friendly 400 if unusable
+    assertCurrent(info); // an expired (or not yet valid) certificate would be refused by every browser
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     if (files.pfx) {
       writeSecureFile(this.#file('pfx'), files.pfx);

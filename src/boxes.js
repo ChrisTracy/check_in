@@ -27,7 +27,9 @@ const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'bas
 
 /** Does `data` (a record's fields) match the box's condition? */
 export function testBox(box, data) {
-  const v = box.field === 'id' ? data.id : data[box.field];
+  // Own properties only: a box on "constructor" must not see Object.prototype.constructor (and
+  // must agree with the history backfill, which reads the stored JSON).
+  const v = Object.hasOwn(data, box.field) ? data[box.field] : undefined;
   switch (box.op) {
     case 'empty': return isBlank(v);
     case 'nempty': return !isBlank(v);

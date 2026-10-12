@@ -1,3 +1,4 @@
+import { domainToASCII } from 'node:url';
 import { HttpError } from './store.js';
 import { encrypt, decrypt } from './auth/security.js';
 
@@ -29,6 +30,25 @@ const DEFAULTS = {
 };
 const CHECK_EVERY_MS = 6 * 3600_000;
 const DOMAIN_RE = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$/;
+// Names that only exist on a local network: a public CA can never check them.
+const PRIVATE_SUFFIXES = ['local', 'lan', 'internal', 'localhost', 'home.arpa', 'localdomain', 'intranet', 'corp', 'home'];
+
+/** Normalise one domain for a certificate (IDN → punycode). Throws HttpError(400) with a clear reason. */
+export function acmeDomain(input) {
+  const d = String(input).trim().toLowerCase().replace(/\.$/, '');
+  const show = d.slice(0, 80);
+  if (d.startsWith('*.')) throw new HttpError(400, 'Wildcard names need the DNS-01 challenge, which isn\'t supported. List each name instead.');
+  if (/^[\d.]+$/.test(d) || d.includes(':')) throw new HttpError(400, `IP addresses can't get certificates this way, only domain names: ${show}`);
+  // International names (bücher.example) are requested in their ASCII (punycode) form.
+  const ascii = /[^\x00-\x7f]/.test(d) ? domainToASCII(d) : d;
+  if (!ascii) throw new HttpError(400, `Not a valid domain name: ${show}`);
+  if (!ascii.includes('.')) throw new HttpError(400, `Use the full public domain name, not "${show}" (names like "localhost" or "server" can't get certificates)`);
+  if (PRIVATE_SUFFIXES.some((x) => ascii === x || ascii.endsWith('.' + x))) {
+    throw new HttpError(400, `${show} is a local-network name; a public certificate authority can only issue for domains registered on the internet`);
+  }
+  if (!DOMAIN_RE.test(ascii)) throw new HttpError(400, `Not a valid public domain name: ${show} (use letters, numbers and dashes, separated by dots)`);
+  return ascii;
+}
 
 export class AcmeManager {
   constructor({ accounts, tls, log = console, checkEveryMs = CHECK_EVERY_MS, loadClient }) {
@@ -77,13 +97,10 @@ export class AcmeManager {
     const patch = {};
     if ('domains' in body) {
       const list = (Array.isArray(body.domains) ? body.domains : String(body.domains || '').split(/[\s,]+/))
-        .map((d) => String(d).trim().toLowerCase().replace(/\.$/, '')).filter(Boolean);
-      const unique = [...new Set(list)];
+        .map((d) => String(d).trim()).filter(Boolean);
+      if (list.length > 100) throw new HttpError(400, 'At most 20 domains');
+      const unique = [...new Set(list.map(acmeDomain))];
       if (unique.length > 20) throw new HttpError(400, 'At most 20 domains');
-      for (const d of unique) {
-        if (d.startsWith('*.')) throw new HttpError(400, 'Wildcard names need the DNS-01 challenge, which isn\'t supported. List each name instead.');
-        if (!DOMAIN_RE.test(d)) throw new HttpError(400, `Not a public domain name: ${d.slice(0, 80)} (IP addresses and names like "localhost" can't get certificates)`);
-      }
       patch.domains = unique;
     }
     if ('email' in body) {
@@ -116,6 +133,7 @@ export class AcmeManager {
     }
     if (body.enabled === true && !s.enabled && body.agreeTos !== true) throw new HttpError(400, 'Accept the certificate authority\'s terms of service to continue');
     if ('enabled' in body) patch.enabled = body.enabled === true;
+    if (body.enabled === true && body.agreeTos === true) patch.tosAgreedAt = new Date().toISOString();
     const next = { ...s, ...patch };
     if (next.ca === 'custom' && !next.directoryUrl && next.enabled) throw new HttpError(400, 'Enter the ACME directory address for your certificate authority');
     if (next.enabled && !next.domains.length) throw new HttpError(400, 'Enter at least one domain name');
@@ -155,9 +173,15 @@ export class AcmeManager {
     return this.obtain('renewal').catch(() => null);
   }
 
-  /** Get a certificate now (from the admin page, or when renewal is due). One at a time. */
+  /**
+   * Get a certificate now (from the admin page, or when renewal is due). One at a time. Only when
+   * automatic certificates are turned on, which needs the CA's terms to have been accepted.
+   */
   obtain(reason = 'requested') {
     if (this.running) return this.running;
+    const s = this.#raw();
+    // Turning it on is only possible after accepting the terms (recorded as tosAgreedAt).
+    if (!s.enabled) return Promise.reject(new HttpError(409, 'Turn on automatic certificates (and accept the certificate authority\'s terms) first'));
     this.running = this.#obtain(reason).finally(() => { this.running = null; this.progress = null; });
     return this.running;
   }

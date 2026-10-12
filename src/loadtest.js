@@ -11,7 +11,16 @@ import { HttpError } from './store.js';
  * Simulated devices are ordinary records whose id is their hostname (`SIM-WS-00001`, `SIM-SRV-SQL-00030`...)
  * and `simulated: true`, so the
  * dashboard, status boxes and issues react to them exactly as to real ones. "Remove simulated
- * devices" deletes them. Nothing about the simulation survives a restart (the records do).
+ * devices" deletes them. Nothing about the simulation survives a restart (the records do; the
+ * fleet size is picked up again from how many there are).
+ *
+ * The simulator never has more than MAX_INFLIGHT requests outstanding: regular turns are skipped
+ * when it is full, and urgent sends (Burst, a device that was just changed) wait in a queue that is
+ * drained a chunk at a time as slots free up, yielding to the event loop between chunks.
+ *
+ * It never writes over a record it didn't make: before its first check-in for an id, a record with
+ * that id that isn't `simulated: true` (a real device that happens to have a SIM- name) makes the
+ * simulator skip that device for good (counted as "name taken by a real device").
  */
 
 /** Lets the simulator's own requests through auth. Random per process and never sent anywhere. */
@@ -21,6 +30,21 @@ const LEGACY_PREFIX = 'sim-'; // simulated devices from before ids matched hostn
 const nextPrefix = (p) => p.slice(0, -1) + String.fromCharCode(p.charCodeAt(p.length - 1) + 1);
 const MAX_DEVICES = 20_000;
 const MAX_INFLIGHT = 1000;
+const CHUNK = 100;          // urgent sends started per turn of the event loop
+
+/** A number from JSON: a finite number, or a plain decimal string. Anything else (true, [5], "0x10") is NaN. */
+function num(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : NaN;
+  if (typeof v === 'string' && /^\s*-?\d+(\.\d+)?\s*$/.test(v)) return Number(v);
+  return NaN;
+}
+const has = (obj, k) => typeof k === 'string' && Object.hasOwn(obj, k);
+/** Per-scenario rank of a device: a 32-bit mix of (seed, index), stable however big the fleet is. */
+function rank(seed, i) {
+  let h = (seed ^ Math.imul(i + 1, 0x9e3779b1)) >>> 0;
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
+  return h >>> 0;
+}
 
 export const SCENARIOS = {
   high_cpu: { label: 'High CPU', desc: 'cpu_pct 92-99', apply: (f, r) => { f.cpu_pct = 92 + Math.round(r() * 7); f.load_1m = Math.round((f.cpu_cores * (0.95 + r() * 0.5)) * 10) / 10; } },
@@ -81,7 +105,20 @@ export class LoadTest {
     this.overrides = new Map();  // index -> { problems: Set<key>, stopped: Set<service>, at } for specific devices
     this.statics = new Map();    // index -> per-device constants
     this.inflight = 0;
+    this.urgent = new Set();     // indices waiting to be sent as soon as there is room (Burst, changed devices)
+    this.bursting = false;       // a burst is still being sent
+    this.lastBurst = 0;          // devices queued by the last burst
+    this.claims = new Map();     // index -> 'ours' | 'taken' (a real record already has that id)
+    this.drains = [];            // resolvers waiting for inflight to reach 0
     this.resetStats();
+    // After a restart, pick up the fleet that is still in the database.
+    try {
+      // The highest device number, not the count: a run that skipped some devices (or a name taken
+      // by a real device) still has records numbered up to the old fleet size.
+      const n = this.db().prepare(`SELECT MAX(CAST(substr(id, -5) AS INTEGER)) AS n FROM records WHERE id >= ? AND id < ? AND json_type(data, '$.simulated') = 'true'`)
+        .get(SIM_PREFIX, nextPrefix(SIM_PREFIX)).n || 0;
+      if (n > this.devices) this.devices = Math.min(MAX_DEVICES, n);
+    } catch { /* no records table yet */ }
     this.history = [];           // one point per second: { t, sent, ok, err, p95, cpu, lag }
     this.loop = monitorEventLoopDelay({ resolution: 20 });
     this.loop.enable();
@@ -160,7 +197,8 @@ export class LoadTest {
     const apply = (key) => {
       const sc = SCENARIOS[key];
       if (sc.apply) sc.apply(f, r);
-      // Two of its own services: its role's main one (servers) and the print spooler / cron.
+      // Two of its own services: its role's main one (servers; otherwise wuauserv on Windows,
+      // systemd-journald on Linux) and Spooler (Windows) or chronyd (Linux).
       if (sc.services) for (const name of [s.roleServices[0] || s.services[4], s.services[3]]) stopped.add(name);
       if (sc.port && s.ports.includes(sc.port)) closed.add(sc.port);
     };
@@ -197,6 +235,7 @@ export class LoadTest {
       closed: o ? s.ports.filter((p) => o.closed.has(p)) : [],
       scenarios: this.scenarios.filter((sc) => sc.set.has(i)).map((sc) => SCENARIOS[sc.key].label),
       offline: this.#offline(i),
+      taken: this.claims.get(i) === 'taken',
     };
   }
   /** Search the fleet by name, role, OS, site or service; filter = 'custom' for the changed ones. */
@@ -223,47 +262,98 @@ export class LoadTest {
     const i = this.index(id);
     const s = this.#static(i);
     if (!Array.isArray(problems) || !Array.isArray(stopped) || !Array.isArray(closed)) throw new HttpError(400, 'problems, stopped and closed must be lists');
-    for (const k of problems) if (!SCENARIOS[k] || SCENARIOS[k].services || SCENARIOS[k].port) throw new HttpError(400, `Unknown problem: ${String(k).slice(0, 40)}`);
-    const ports = closed.map(Number);
-    for (const p of ports) if (!s.ports.includes(p)) throw new HttpError(400, `${s.hostname} has no ${PORTS[p]?.label || 'port ' + String(p).slice(0, 10)} port to close`);
-    for (const n of stopped) if (!s.services.includes(n)) throw new HttpError(400, `${s.hostname} doesn't run ${String(n).slice(0, 60)}`);
+    for (const k of problems) if (!has(SCENARIOS, k) || SCENARIOS[k].services || SCENARIOS[k].port) throw new HttpError(400, `Unknown problem: ${String(k).slice(0, 40)}`);
+    const ports = closed.map(num);
+    for (const p of ports) if (!s.ports.includes(p)) throw new HttpError(400, `${s.hostname} has no ${Object.hasOwn(PORTS, String(p)) ? PORTS[p].label : 'port ' + String(p).slice(0, 10)} port to close`);
+    for (const n of stopped) if (typeof n !== 'string' || !s.services.includes(n)) throw new HttpError(400, `${s.hostname} doesn't run ${String(n).slice(0, 60)}`);
     if (!problems.length && !stopped.length && !ports.length) this.overrides.delete(i);
     else {
       if (!this.overrides.has(i) && this.overrides.size >= 5000) throw new HttpError(400, 'At most 5,000 customized devices');
       this.overrides.set(i, { problems: new Set(problems), stopped: new Set(stopped), closed: new Set(ports), at: new Date().toISOString() });
     }
-    // Show it straight away rather than at the device's next turn.
-    if (this.running && !this.#offline(i)) this.#send(i, true);
+    // Show it straight away rather than at the device's next turn (still within the in-flight cap).
+    if (this.running) this.#queue([i]);
     return this.describe(i);
   }
-  healAllDevices() { this.overrides.clear(); return this.state(); }
-
-  // ------------------------------------------------------------ control
-  configure({ devices, interval } = {}) {
-    if (devices !== undefined) {
-      const n = Math.round(Number(devices));
-      if (!Number.isFinite(n) || n < 1 || n > MAX_DEVICES) throw new HttpError(400, `Devices must be between 1 and ${MAX_DEVICES.toLocaleString()}`);
-      if (n < this.devices) {
-        for (const k of [...this.statics.keys()]) if (k >= n) this.statics.delete(k);
-        for (const k of [...this.overrides.keys()]) if (k >= n) this.overrides.delete(k);
-      }
-      this.devices = n;
-      for (const sc of this.scenarios) this.#choose(sc);
-    }
-    if (interval !== undefined) {
-      const s = Number(interval);
-      if (!Number.isFinite(s) || s < 1 || s > 3600) throw new HttpError(400, 'Interval must be between 1 and 3600 seconds');
-      this.interval = s;
-    }
-    if (this.running) this.#rebase();
+  healAllDevices() {
+    const changed = [...this.overrides.keys()];
+    this.overrides.clear();
+    // Like one device's Make healthy: they report it straight away (offline ones come back too).
+    if (this.running) this.#queue(changed);
     return this.state();
   }
 
+  // ------------------------------------------------------------ control
+  configure({ devices, interval } = {}) {
+    // Validate everything before changing anything.
+    let n = this.devices;
+    let iv = this.interval;
+    if (devices !== undefined) {
+      n = num(devices);
+      if (!Number.isInteger(n) || n < 1 || n > MAX_DEVICES) throw new HttpError(400, `Devices must be a whole number between 1 and ${MAX_DEVICES.toLocaleString()}`);
+    }
+    if (interval !== undefined) {
+      iv = num(interval);
+      if (!Number.isFinite(iv) || iv < 1 || iv > 3600) throw new HttpError(400, 'Interval must be a number between 1 and 3600 seconds');
+    }
+    if (n === this.devices && iv === this.interval) return this.state(); // nothing changed: keep the cycle going as it is
+    const old = this.devices;
+    // Where the cycle is: the next device due. Kept, so Apply doesn't start over from device #1.
+    const pos = this.running ? this.cursor % old : 0;
+    if (n < old) this.#drop(n, old);
+    this.devices = n;
+    this.interval = iv;
+    if (n !== old) for (const sc of this.scenarios) this.#choose(sc);
+    if (this.running) this.#rebase(pos < n ? pos : 0);
+    return this.state();
+  }
+
+  /** The fleet shrank: forget devices n..old-1 and delete the records the simulator made for them. */
+  #drop(n, old) {
+    const ids = [];
+    for (let k = n; k < old; k++) ids.push(this.id(k));
+    for (const k of [...this.statics.keys()]) if (k >= n) this.statics.delete(k);
+    for (const k of [...this.overrides.keys()]) if (k >= n) this.overrides.delete(k);
+    for (const k of [...this.claims.keys()]) if (k >= n) this.claims.delete(k);
+    for (const k of [...this.urgent]) if (k >= n) this.urgent.delete(k);
+    this.store.flush(); // anything of theirs already queued is committed first, so it goes too
+    this.#deleteSims(ids);
+    // (Check-ins of theirs still in flight are deleted when they land: see #send.)
+  }
+  /** Delete those of these ids whose records are simulated (never a real device's). */
+  #deleteSims(ids) {
+    const mine = ids.filter((id) => this.#owner(id) === 'sim');
+    return mine.length ? this.store.deleteMany(mine).length : 0;
+  }
+  /** Who has a record with this id: 'none', 'sim' (simulated: true) or 'real'. */
+  #owner(id) {
+    this.ownerStmt ??= this.db().prepare("SELECT json_type(data, '$.simulated') AS t FROM records WHERE id = ?");
+    const row = this.ownerStmt.get(id);
+    return !row ? 'none' : row.t === 'true' ? 'sim' : 'real';
+  }
+  /** May the simulator write device i? Checked once, before its first check-in. */
+  #mine(i) {
+    let c = this.claims.get(i);
+    if (!c) {
+      c = this.#owner(this.id(i)) === 'real' ? 'taken' : 'ours';
+      this.claims.set(i, c);
+      if (c === 'taken') this.log.warn?.({ id: this.id(i) }, 'load test: a real device has this name; skipping it');
+    }
+    return c === 'ours';
+  }
+  takenIds() {
+    const out = [];
+    for (const [i, c] of this.claims) if (c === 'taken' && i < this.devices) out.push(this.id(i));
+    return out.sort();
+  }
+
   start(opts = {}) {
+    if (this.removing) throw new HttpError(409, 'Simulated devices are being removed');
     if (opts.devices !== undefined || opts.interval !== undefined) this.configure(opts);
     if (this.running) return this.state();
     this.running = true;
     this.resetStats();
+    this.claims.clear(); // look again: a real device may have gone (or arrived) since
     this.stats.startedAt = new Date().toISOString();
     this.#rebase();
     // Everything starts healthy: the first round checks every device in straight away (spread over a few seconds).
@@ -274,7 +364,10 @@ export class LoadTest {
     return this.state();
   }
 
+  /** Stops sending. Check-ins already in flight still land: await drain() before relying on that. */
   stop() {
+    this.urgent.clear();
+    this.bursting = false;
     if (!this.running) return this.state();
     this.running = false;
     clearInterval(this.timer);
@@ -282,15 +375,58 @@ export class LoadTest {
     return this.state();
   }
 
-  /** Every device checks in once, right now (as fast as the server takes them). */
+  /** Resolves once nothing is in flight and the store's queue is committed. */
+  async drain(ms = 30000) {
+    if (this.inflight > 0) {
+      await new Promise((resolve) => {
+        const t = setTimeout(resolve, ms);
+        this.drains.push(() => { clearTimeout(t); resolve(); });
+      });
+    }
+    this.store.flush();
+  }
+
+  /** Every device checks in once, as fast as the server takes them (never more than MAX_INFLIGHT at a time). */
   burst() {
-    for (let i = 0; i < this.devices; i++) if (!this.#offline(i)) this.#send(i, true);
+    if (this.removing) throw new HttpError(409, 'Simulated devices are being removed');
+    if (this.bursting) throw new HttpError(409, 'A burst is already being sent');
+    const list = [];
+    for (let i = 0; i < this.devices; i++) if (!this.#offline(i) && this.#mine(i)) list.push(i);
+    this.lastBurst = list.length;
+    if (list.length) { this.bursting = true; this.#queue(list); }
     return this.state();
   }
 
-  #rebase() {
-    this.t0 = performance.now();
-    this.cursor = 0; // check-ins scheduled so far this run
+  /** Send these devices as soon as there is room. */
+  #queue(list) {
+    if (this.removing) return;
+    for (const i of list) this.urgent.add(i);
+    this.#schedulePump();
+  }
+  #schedulePump() {
+    if (this.pumpScheduled || !this.urgent.size) return;
+    this.pumpScheduled = true;
+    setImmediate(() => { this.pumpScheduled = false; this.#pump(); });
+  }
+  #pump() {
+    let started = 0;
+    for (const i of this.urgent) {
+      if (this.inflight >= MAX_INFLIGHT || started >= CHUNK) break;
+      this.urgent.delete(i);
+      if (i >= this.devices || this.#offline(i)) continue;
+      this.#send(i);
+      started++;
+    }
+    if (!this.urgent.size) this.bursting = false;
+    // More to do and room for it: carry on after other work has had a turn.
+    else if (this.inflight < MAX_INFLIGHT) this.#schedulePump();
+  }
+
+  /** Restart the clock so that device `pos` is the next one due. */
+  #rebase(pos = 0) {
+    const span = this.first ? Math.min(this.interval, 5) : this.interval;
+    this.t0 = performance.now() - (pos / this.devices) * span * 1000;
+    this.cursor = pos; // check-ins scheduled since t0
   }
 
   #tick() {
@@ -311,8 +447,10 @@ export class LoadTest {
     }
   }
 
-  async #send(i, force = false) {
-    if (!force && this.inflight >= MAX_INFLIGHT) { this.stats.skipped++; return; }
+  async #send(i) {
+    if (this.inflight >= MAX_INFLIGHT) { this.stats.skipped++; return; }
+    if (!this.#mine(i)) return;
+    const id = this.id(i);
     this.inflight++;
     this.stats.sent++;
     this.window.sent++;
@@ -332,6 +470,10 @@ export class LoadTest {
       this.stats.errors++; this.window.err++; this.stats.lastError = e.message;
     } finally {
       this.inflight--;
+      // The fleet shrank while this was in flight: don't leave it behind.
+      if (i >= this.devices) { try { this.store.flush(); this.#deleteSims([id]); } catch { /* ignore */ } }
+      if (this.inflight === 0 && this.drains.length) for (const done of this.drains.splice(0)) done();
+      if (this.urgent.size) this.#schedulePump();
     }
   }
 
@@ -339,26 +481,36 @@ export class LoadTest {
   #choose(sc) {
     // Port problems only pick devices that have that port (RDP: Windows, SSH: Linux).
     const port = SCENARIOS[sc.key].port;
-    // Stable picks: the same devices each time for this scenario (shuffled by its seed), so
-    // changing the amount adds or removes devices at the edge instead of reshuffling.
-    if (!sc.order || sc.fleet !== this.devices) {
-      const r = rng(sc.seed);
-      sc.fleet = this.devices;
-      sc.order = Array.from({ length: this.devices }, (_, k) => k).filter((k) => !port || this.#static(k).ports.includes(port));
-      for (let k = sc.order.length - 1; k > 0; k--) { const j = Math.floor(r() * (k + 1)); [sc.order[k], sc.order[j]] = [sc.order[j], sc.order[k]]; }
-    }
-    const pool = sc.order.length;
-    const want = sc.mode === 'count' ? Math.min(pool, sc.amount) : Math.round(pool * sc.amount / 100);
-    sc.set = new Set(sc.order.slice(0, want));
+    // Stable picks: devices are ranked by a hash of (scenario seed, index), which doesn't depend on
+    // the fleet size. The devices already picked stay picked (if still in the fleet); changing the
+    // amount or the fleet size only adds the next-ranked devices or drops the last-ranked ones.
+    const pool = [];
+    for (let k = 0; k < this.devices; k++) if (!port || this.#static(k).ports.includes(port)) pool.push(k);
+    const want = sc.mode === 'count' ? Math.min(pool.length, sc.amount) : Math.round(pool.length * sc.amount / 100);
+    const r = new Map(pool.map((k) => [k, rank(sc.seed, k)]));
+    const order = pool.sort((a, b) => r.get(a) - r.get(b) || a - b);
+    const set = new Set();
+    if (sc.set) for (const k of sc.set) if (r.has(k)) set.add(k);
+    for (let j = 0; j < order.length && set.size < want; j++) set.add(order[j]);
+    for (let j = order.length - 1; j >= 0 && set.size > want; j--) set.delete(order[j]);
+    sc.set = set;
+  }
+
+  /** Checks a mode and amount: percent in (0, 100], count a whole number 1..MAX_DEVICES. */
+  #amount(mode, amount) {
+    if (mode !== 'percent' && mode !== 'count') throw new HttpError(400, 'Mode must be "percent" or "count"');
+    const a = num(amount);
+    if (mode === 'percent' && !(a > 0 && a <= 100)) throw new HttpError(400, 'Percent must be more than 0 and at most 100');
+    if (mode === 'count' && !(Number.isInteger(a) && a >= 1 && a <= MAX_DEVICES)) throw new HttpError(400, `Count must be a whole number from 1 to ${MAX_DEVICES.toLocaleString()}`);
+    return a;
   }
 
   addScenario({ key, mode = 'percent', amount = 10 } = {}) {
-    if (!SCENARIOS[key]) throw new HttpError(400, 'Unknown scenario');
-    const m = mode === 'count' ? 'count' : 'percent';
-    const a = Number(amount);
-    if (!Number.isFinite(a) || a <= 0 || (m === 'percent' && a > 100) || (m === 'count' && a > MAX_DEVICES)) throw new HttpError(400, m === 'percent' ? 'Percent must be between 0 and 100' : 'Count must be at least 1');
+    if (!has(SCENARIOS, key)) throw new HttpError(400, 'Unknown scenario');
+    const m = mode;
+    const a = this.#amount(m, amount);
     if (this.scenarios.length >= 20) throw new HttpError(400, 'At most 20 scenarios at once');
-    const sc = { id: crypto.randomBytes(4).toString('hex'), key, mode: m, amount: m === 'count' ? Math.round(a) : a, seed: crypto.randomInt(1, 2 ** 31), startedAt: new Date().toISOString() };
+    const sc = { id: crypto.randomBytes(4).toString('hex'), key, mode: m, amount: a, seed: crypto.randomInt(1, 2 ** 31), startedAt: new Date().toISOString() };
     this.#choose(sc);
     this.scenarios.push(sc);
     return this.state();
@@ -367,10 +519,9 @@ export class LoadTest {
   updateScenario(id, { mode, amount }) {
     const sc = this.scenarios.find((s) => s.id === id);
     if (!sc) throw new HttpError(404, 'Scenario not found');
-    const m = mode === undefined ? sc.mode : mode === 'count' ? 'count' : 'percent';
-    const a = amount === undefined ? sc.amount : Number(amount);
-    if (!Number.isFinite(a) || a <= 0 || (m === 'percent' && a > 100)) throw new HttpError(400, 'Amount out of range');
-    sc.mode = m; sc.amount = m === 'count' ? Math.round(a) : a;
+    const m = mode === undefined ? sc.mode : mode;
+    const a = this.#amount(m, amount === undefined ? sc.amount : amount);
+    sc.mode = m; sc.amount = a;
     this.#choose(sc);
     return this.state();
   }
@@ -384,15 +535,28 @@ export class LoadTest {
 
   /** Records the simulator made: SIM-* (and older sim-*) ids that also say simulated = true. */
   #simWhere() {
-    return { sql: "((id >= ? AND id < ?) OR (id >= ? AND id < ?)) AND json_extract(data, '$.simulated') = 1",
+    return { sql: "((id >= ? AND id < ?) OR (id >= ? AND id < ?)) AND json_type(data, '$.simulated') = 'true'",
       args: [SIM_PREFIX, nextPrefix(SIM_PREFIX), LEGACY_PREFIX, nextPrefix(LEGACY_PREFIX)] };
   }
-  /** Delete every simulated record (the simulation must be stopped). */
-  removeDevices() {
+  /** Delete every simulated record (the simulation must be stopped). Waits for in-flight check-ins first. */
+  async removeDevices() {
     if (this.running) throw new HttpError(409, 'Stop the load test first');
-    const w = this.#simWhere();
-    const ids = this.db().prepare(`SELECT id FROM records WHERE ${w.sql}`).all(...w.args).map((r) => r.id);
-    return { deleted: ids.length ? this.store.deleteMany(ids).length : 0 };
+    if (this.removing) throw new HttpError(409, 'Simulated devices are already being removed');
+    // While removing, nothing new may be sent (a Burst or Start would bring records back).
+    this.removing = true;
+    try {
+      this.stop(); // drops anything still queued (a burst while stopped)
+      this.urgent.clear();
+      this.bursting = false;
+      await this.drain();
+      this.store.flush();
+      this.claims.clear();
+      const w = this.#simWhere();
+      const ids = this.db().prepare(`SELECT id FROM records WHERE ${w.sql}`).all(...w.args).map((r) => r.id);
+      return { deleted: ids.length ? this.store.deleteMany(ids).length : 0 };
+    } finally {
+      this.removing = false;
+    }
   }
 
   // ------------------------------------------------------------ measuring
@@ -423,6 +587,7 @@ export class LoadTest {
   }
 
   state() {
+    const taken = this.takenIds();
     const recent = this.history.slice(-10);
     const sum = (k) => recent.reduce((a, p) => a + p[k], 0);
     const mem = process.memoryUsage();
@@ -430,8 +595,14 @@ export class LoadTest {
       running: this.running,
       devices: this.devices,
       interval: this.interval,
-      target: Math.round(this.devices / this.interval * 10) / 10,   // check-ins per second when running
+      target: Math.round(this.devices / this.interval * 100) / 100,   // check-ins per second when running
       inflight: this.inflight,
+      maxInflight: MAX_INFLIGHT,
+      bursting: this.bursting,
+      queued: this.urgent.size,
+      lastBurst: this.lastBurst,
+      taken: taken.length,           // devices skipped because a real device has that name
+      takenIds: taken.slice(0, 20),
       stats: { ...this.stats },
       rate: recent.length ? Math.round(sum('ok') / recent.length) : 0,
       scenarios: this.scenarios.map((s) => ({ id: s.id, key: s.key, label: SCENARIOS[s.key].label, desc: SCENARIOS[s.key].desc, mode: s.mode, amount: s.amount, affected: s.set.size, startedAt: s.startedAt })),
@@ -449,8 +620,9 @@ export function registerLoadTest(app, { loadTest, store, issues }) {
   const full = () => ({ ...loadTest.state(), simDevices: loadTest.simCount(), records: store.summary().records, queue: store.queue.length, issues: issues?.enabled ? issues.summary() : null });
   app.get('/api/admin/loadtest', cap, async () => full());
   app.post('/api/admin/loadtest/start', cap, async (req) => { loadTest.start(req.body || {}); return full(); });
-  app.post('/api/admin/loadtest/stop', cap, async () => { loadTest.stop(); return full(); });
-  app.post('/api/admin/loadtest/burst', cap, async () => { loadTest.burst(); return full(); });
+  // Stop answers once the check-ins already in flight have landed, so a Remove right after deletes them too.
+  app.post('/api/admin/loadtest/stop', cap, async () => { loadTest.stop(); await loadTest.drain(); return full(); });
+  app.post('/api/admin/loadtest/burst', cap, async () => { loadTest.burst(); return { ...full(), burst: loadTest.lastBurst }; });
   app.put('/api/admin/loadtest', cap, async (req) => { loadTest.configure(req.body || {}); return full(); });
   app.post('/api/admin/loadtest/scenarios', cap, async (req) => { loadTest.addScenario(req.body || {}); return full(); });
   app.put('/api/admin/loadtest/scenarios/:id', cap, async (req) => { loadTest.updateScenario(req.params.id, req.body || {}); return full(); });
@@ -460,6 +632,7 @@ export function registerLoadTest(app, { loadTest, store, issues }) {
   app.delete('/api/admin/loadtest/sims', cap, async () => { loadTest.healAllDevices(); return full(); });
   app.delete('/api/admin/loadtest/devices', cap, async (req) => {
     if (String(req.query.confirm) !== 'true') throw new HttpError(400, 'Add ?confirm=true to delete every simulated device');
-    return { ...loadTest.removeDevices(), ...full() };
+    const r = await loadTest.removeDevices();
+    return { ...r, ...full() };
   });
 }

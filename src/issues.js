@@ -26,6 +26,11 @@ import { csvRow } from './csv.js';
 export const RULE_KINDS = ['field', 'skew', 'stale'];
 export const SEVERITIES = ['critical', 'warning', 'info'];
 const SEV_RANK = { critical: 3, warning: 2, info: 1 };
+// Every lookup keyed by user input uses own properties only ("constructor", "__proto__"… are not ops).
+const has = (obj, k) => typeof k === 'string' && Object.hasOwn(obj, k);
+const isOp = (op) => has(BOX_OPS, op);
+const opText = (op) => (isOp(op) ? BOX_OPS[op] : String(op));
+const sevRank = (s) => (has(SEV_RANK, s) ? SEV_RANK[s] : 0);
 const NO_VALUE = new Set(['empty', 'nempty']);
 const MAX_RULES = 50;
 const MAX_MINUTES = 7 * 24 * 60;
@@ -67,11 +72,13 @@ export function cleanRule(r, i) {
   if (!r || typeof r !== 'object') throw new HttpError(400, `${where} is not valid`);
   const name = cleanText(r.name, 60, `${where}: the name`);
   if (!name) throw new HttpError(400, `${where} needs a name`);
-  const kind = RULE_KINDS.includes(r.kind) ? r.kind : 'field';
+  if (!isBlank(r.kind) && !(typeof r.kind === 'string' && RULE_KINDS.includes(r.kind))) throw new HttpError(400, `${where}: unknown type (use ${RULE_KINDS.join(', ')})`);
+  if (!isBlank(r.severity) && !(typeof r.severity === 'string' && SEVERITIES.includes(r.severity))) throw new HttpError(400, `${where}: unknown severity (use ${SEVERITIES.join(', ')})`);
+  const kind = isBlank(r.kind) ? 'field' : r.kind;
   const id = typeof r.id === 'string' && /^[0-9a-f]{8}$/.test(r.id) ? r.id : crypto.randomBytes(4).toString('hex');
   const out = {
     id, name, kind,
-    severity: SEVERITIES.includes(r.severity) ? r.severity : 'warning',
+    severity: isBlank(r.severity) ? 'warning' : r.severity,
     enabled: r.enabled !== false,
     field: '', op: '', value: '', count: 1,
     clear: { mode: 'auto', field: '', op: '', value: '', count: DEFAULT_CLEAR_COUNT },
@@ -104,8 +111,8 @@ export function cleanRule(r, i) {
   const cond = (src, label) => {
     const field = cleanText(src.field, 200, `“${name}”: the ${label} field`);
     if (!field) throw new HttpError(400, `“${name}” needs a ${label} field`);
-    const op = String(src.op ?? '');
-    if (!BOX_OPS[op]) throw new HttpError(400, `“${name}”: unknown ${label} condition`);
+    const op = typeof src.op === 'string' ? src.op : '';
+    if (!isOp(op)) throw new HttpError(400, `“${name}”: unknown ${label} condition`);
     const value = NO_VALUE.has(op) ? '' : String(src.value ?? '').trim();
     if (!NO_VALUE.has(op) && value === '') throw new HttpError(400, `“${name}” needs a ${label} value to compare with`);
     if (value.length > 200) throw new HttpError(400, `“${name}”: the ${label} value is too long`);
@@ -155,13 +162,13 @@ const inARow = (n) => (n > 1 ? ` on ${n} check-ins in a row` : '');
 export function describeRule(r) {
   if (r.kind === 'stale') return `No check-in for ${r.value} min`;
   if (r.kind === 'skew') return `${r.field} more than ${r.value} min from the check-in time${inARow(r.count)}`;
-  return `${r.field} ${BOX_OPS[r.op]}${NO_VALUE.has(r.op) ? '' : ' ' + r.value}${inARow(r.count)}`;
+  return `${r.field} ${opText(r.op)}${NO_VALUE.has(r.op) ? '' : ' ' + r.value}${inARow(r.count)}`;
 }
 export function describeClear(r) {
   const after = inARow(r.clear.count);
   if (r.kind === 'stale') return r.clear.count > 1 ? `Checks in ${r.clear.count} times in a row` : 'Checks in again';
   if (r.kind === 'skew') return `Within ${r.clear.mode === 'custom' ? r.clear.value : r.value} min${after}`;
-  if (r.clear.mode === 'custom') return `${r.clear.field} ${BOX_OPS[r.clear.op]}${NO_VALUE.has(r.clear.op) ? '' : ' ' + r.clear.value}${after}`;
+  if (r.clear.mode === 'custom') return `${r.clear.field} ${opText(r.clear.op)}${NO_VALUE.has(r.clear.op) ? '' : ' ' + r.clear.value}${after}`;
   return `Condition no longer true${after}`;
 }
 
@@ -320,21 +327,35 @@ export class Issues {
     return this.settings();
   }
 
-  updateSettings(body) {
+  #cleanSettings(body) {
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'Body must be { "reassignMinutes": 60 }');
     const next = { ...this.settings() };
-    if ('reassignMinutes' in body) next.reassignMinutes = cleanMinutes(body.reassignMinutes, 'Reassign window', 30 * 24 * 60);
+    if (Object.hasOwn(body, 'reassignMinutes')) {
+      const v = body.reassignMinutes;
+      if (typeof v !== 'number' && !(typeof v === 'string' && v.trim() !== '')) throw new HttpError(400, 'Reassign window: minutes must be a number');
+      next.reassignMinutes = cleanMinutes(v, 'Reassign window', 30 * 24 * 60);
+    }
+    return next;
+  }
+
+  updateSettings(body) {
+    const next = this.#cleanSettings(body);
     this.accounts.setSetting('issues', next);
     return next;
   }
 
-  saveRules(list, version, by) {
+  /**
+   * Replace every rule. `settings` (optional, e.g. { reassignMinutes }) is saved in the same step,
+   * and only if the rules are valid, so the editor never half-saves.
+   */
+  saveRules(list, version, by, settings) {
     if (!Array.isArray(list)) throw new HttpError(400, 'rules must be a list');
     if (version !== undefined && Number(version) !== this.version) {
       throw new HttpError(409, 'Someone else changed the issue rules while you were editing. Close this and open it again to see their changes.');
     }
     if (list.length > MAX_RULES) throw new HttpError(400, `At most ${MAX_RULES} rules`);
     const next = list.map(cleanRule);
+    const nextSettings = settings === undefined ? null : this.#cleanSettings(settings);
     const seen = new Set();
     for (const r of next) { if (seen.has(r.id)) r.id = crypto.randomBytes(4).toString('hex'); seen.add(r.id); }
     const def = (r) => JSON.stringify([r.kind, r.field, r.op, r.value, r.count, r.clear]);
@@ -342,6 +363,7 @@ export class Issues {
     const gone = this.rules.filter((r) => { const n = next.find((x) => x.id === r.id); return !n || !n.enabled; });
     const changed = next.filter((r) => before.has(r.id) && def(before.get(r.id)) !== def(r));
     this.store.flush();
+    if (nextSettings) this.accounts.setSetting('issues', nextSettings);
     this.accounts.setSetting('issueRules', next);
     this.accounts.setSetting('issueRulesVersion', this.version + 1);
     this.rules = next;
@@ -354,6 +376,13 @@ export class Issues {
           if (o.active.has(r.id)) this.#clearProblem(rid, r, { how: 'rule', text: `${r.name} removed: its rule was ${before.has(r.id) && next.some((x) => x.id === r.id) ? 'turned off' : 'deleted'} by ${by.name}` });
         }
         this.s.watchDelRule.run(r.id);
+      }
+      // Problems still open take the rule's new name, severity and wording (closed history keeps the old ones).
+      const upd = this.db.prepare('UPDATE issue_problems SET name = ?, severity = ?, rule_text = ? WHERE rule_id = ? AND cleared_at IS NULL AND (name != ? OR severity != ? OR rule_text != ?)');
+      for (const r of next) {
+        if (!before.has(r.id) || goneIds.has(r.id)) continue;
+        const text = describeRule(r);
+        upd.run(r.name, r.severity, text, r.id, r.name, r.severity, text);
       }
       // Changed definitions start measuring again from the current readings (holds are kept).
       for (const id of changedIds) this.db.prepare('UPDATE issue_watch SET trig_since = NULL, clear_since = NULL, trig_count = 0, clear_count = 0, last_version = NULL WHERE rule_id = ?').run(id);
@@ -628,8 +657,9 @@ export class Issues {
     this.#mustBeOn();
     const row = this.#row(id);
     let u = null;
-    if (assignee !== null && assignee !== undefined && assignee !== '') {
-      u = this.accounts.get(Number(assignee));
+    if (assignee !== null && assignee !== undefined) {
+      if (!Number.isSafeInteger(assignee) || assignee < 1) throw new HttpError(400, 'assignee must be a user id (a whole number) or null to unassign');
+      u = this.accounts.get(assignee);
       if (!u) throw new HttpError(400, 'That user no longer exists');
       if (u.disabled) throw new HttpError(400, `${u.name || u.username} is disabled`);
     }
@@ -679,6 +709,7 @@ export class Issues {
     this.#mustBeOn();
     const row = this.#row(id);
     this.#openFor(row);
+    if (note !== undefined && note !== null && typeof note !== 'string') throw new HttpError(400, 'The reason must be text');
     const reason = cleanText(note, 500, 'The reason');
     this.db.transaction(() => this.#closeIssue(row.record_id, user, reason))();
     this.onChange();
@@ -688,6 +719,7 @@ export class Issues {
   addNote(id, text, user) {
     this.#mustBeOn();
     const row = this.#row(id);
+    if (text !== undefined && text !== null && typeof text !== 'string') throw new HttpError(400, 'The note must be text');
     const t = String(text ?? '').trim();
     if (!t) throw new HttpError(400, 'Write a note first');
     if (t.length > 4000) throw new HttpError(400, 'Notes must be 4000 characters or fewer');
@@ -724,7 +756,7 @@ export class Issues {
   // ------------------------------------------------------------ reading
   #shape(row, problems) {
     const active = problems.filter((p) => !p.cleared_at);
-    const sevOf = (list) => list.reduce((best, p) => (SEV_RANK[p.severity] > SEV_RANK[best] ? p.severity : best), 'info');
+    const sevOf = (list) => list.reduce((best, p) => (sevRank(p.severity) > sevRank(best) ? p.severity : best), 'info');
     return {
       id: row.id,
       recordId: row.record_id,
@@ -786,11 +818,12 @@ export class Issues {
 
   list(q = {}, me = null) {
     const { sql, args } = this.#where(q, me);
-    const limit = Math.min(1000, Math.max(1, Number(q.limit) || 200));
-    const offset = Math.max(0, Number(q.offset) || 0);
-    const order = q.sort === 'updated' ? 'updated DESC' : q.sort === 'opened_asc' ? 'opened_at ASC' : 'opened_at DESC';
+    const limit = Math.min(1000, Math.max(1, wholeNumber(q.limit, 200, 'limit')));
+    const offset = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, wholeNumber(q.offset, 0, 'offset')));
+    // Ties (same opened time) go the same way as the sort, by issue number.
+    const order = q.sort === 'updated' ? 'updated DESC, id DESC' : q.sort === 'opened_asc' ? 'opened_at ASC, id ASC' : 'opened_at DESC, id DESC';
     const total = this.db.prepare(`SELECT COUNT(*) AS n FROM issues ${sql}`).get(...args).n;
-    const rows = this.db.prepare(`SELECT * FROM issues ${sql} ORDER BY ${order}, id DESC LIMIT ? OFFSET ?`).all(...args, limit, offset);
+    const rows = this.db.prepare(`SELECT * FROM issues ${sql} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...args, limit, offset);
     const probs = new Map();
     if (rows.length) {
       const ids = rows.map((r) => r.id);
@@ -850,6 +883,14 @@ export class Issues {
   }
 }
 
+/** A query-string number: blank = fallback; anything that isn't a finite number is a 400. */
+function wholeNumber(v, fallback, what) {
+  if (v === undefined || v === null || v === '') return fallback;
+  const n = typeof v === 'string' ? Number(v) : NaN;
+  if (!Number.isFinite(n)) throw new HttpError(400, `${what} must be a number`);
+  return Math.trunc(n);
+}
+
 export function fmtMinutes(m) {
   if (m % 1440 === 0) return `${m / 1440} day${m === 1440 ? '' : 's'}`;
   if (m % 60 === 0) return `${m / 60} hour${m === 60 ? '' : 's'}`;
@@ -867,15 +908,27 @@ export function registerIssues(app, { issues, can }) {
   app.get('/api/issues/config', view, async () => ({ ...issues.settings(), rules: issues.publicRules(), version: issues.version, severities: SEVERITIES }));
   app.put('/api/admin/issues', { config: { cap: 'issuesEnable' } }, async (req) => {
     const b = req.body && typeof req.body === 'object' ? req.body : {};
-    if (!('enabled' in b) && !('autoClose' in b)) throw new HttpError(400, 'Body must be { "enabled": true } and/or { "autoClose": false }');
-    if ('autoClose' in b) issues.setAutoClose(b.autoClose === true, who(req));
-    if ('enabled' in b) issues.setEnabled(b.enabled === true);
+    const hasEnabled = Object.hasOwn(b, 'enabled');
+    const hasAutoClose = Object.hasOwn(b, 'autoClose');
+    if (!hasEnabled && !hasAutoClose) throw new HttpError(400, 'Body must be { "enabled": true } and/or { "autoClose": false }');
+    if (hasEnabled && typeof b.enabled !== 'boolean') throw new HttpError(400, '"enabled" must be true or false');
+    if (hasAutoClose && typeof b.autoClose !== 'boolean') throw new HttpError(400, '"autoClose" must be true or false');
+    if (hasAutoClose) issues.setAutoClose(b.autoClose, who(req));
+    if (hasEnabled) issues.setEnabled(b.enabled);
     return issues.settings();
   });
   app.put('/api/issues/settings', rules, async (req) => issues.updateSettings(req.body || {}));
-  app.put('/api/issues/rules', rules, async (req) => issues.saveRules(req.body?.rules, req.body?.version, who(req)));
+  app.put('/api/issues/rules', rules, async (req) => {
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    const settings = Object.hasOwn(b, 'reassignMinutes') ? { reassignMinutes: b.reassignMinutes } : undefined;
+    const out = issues.saveRules(b.rules, b.version, who(req), settings);
+    return settings ? { ...out, reassignMinutes: issues.settings().reassignMinutes } : out;
+  });
 
-  app.get('/api/issues', view, async (req) => { on(); return issues.list(req.query, req.auth.userId); });
+  // `?quiet=1` (the Issues page's live reloads): when the list has just been turned off, answer
+  // { enabled: false } with 200 rather than 409, so a reload racing the switch doesn't log an error.
+  const off = (req) => (String(req.query.quiet) === '1' && !issues.enabled ? { enabled: false } : null);
+  app.get('/api/issues', view, async (req) => off(req) || (on(), issues.list(req.query, req.auth.userId)));
   app.get('/api/issues/summary', view, async (req) => ({ enabled: issues.enabled, ...issues.summary(req.auth.userId) }));
   app.get('/api/issues/assignees', work, async () => { on(); return { users: issues.assignees() }; });
   app.get('/api/issues/export.csv', { config: { cap: 'export' } }, async (req, reply) => {
@@ -890,7 +943,7 @@ export function registerIssues(app, { issues, can }) {
     if (String(req.query.confirm) !== 'true') return reply.code(400).send({ ok: false, error: 'Add ?confirm=true to delete every issue, open and closed, with their notes and logs' });
     return { ok: true, deleted: issues.clearAll() };
   });
-  app.get('/api/issues/:id', view, async (req) => { on(); return issues.get(req.params.id); });
+  app.get('/api/issues/:id', view, async (req) => off(req) || (on(), issues.get(req.params.id)));
   app.put('/api/issues/:id/assign', work, async (req) => issues.assign(req.params.id, req.body?.assignee ?? null, who(req)));
   app.post('/api/issues/:id/ignore', work, async (req) => issues.ignore(req.params.id, req.body?.minutes, who(req)));
   app.post('/api/issues/:id/unignore', work, async (req) => issues.unignore(req.params.id, who(req)));

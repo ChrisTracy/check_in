@@ -263,17 +263,31 @@ export class Store extends EventEmitter {
       params.push(Number(sinceRev) || 0);
     }
     if (q) {
-      const like = `%${String(q).replace(/[%_\\]/g, (m) => '\\' + m)}%`;
-      where.push("(id LIKE ? ESCAPE '\\' OR data LIKE ? ESCAPE '\\')");
-      params.push(like, like);
+      // Search the id and the field values (not the field names or JSON escaping), the way the
+      // dashboard does: text as-is, true/false, numbers, and objects/arrays as JSON text.
+      const text = String(q);
+      const like = `%${text.replace(/[%_\\]/g, (m) => '\\' + m)}%`;
+      const inValues = `EXISTS (SELECT 1 FROM json_each(data) j WHERE (CASE j.type WHEN 'text' THEN j.value
+        WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' WHEN 'null' THEN '' WHEN 'object' THEN j.value WHEN 'array' THEN j.value
+        ELSE CAST(j.value AS TEXT) END) LIKE ? ESCAPE '\\')`;
+      // Text JSON doesn't escape also appears in the raw JSON: a cheap pre-check before json_each.
+      if (/^[^"\\\u0000-\u001f\u007f-\uffff]*$/.test(text)) {
+        where.push(`(id LIKE ? ESCAPE '\\' OR (data LIKE ? ESCAPE '\\' AND ${inValues}))`);
+        params.push(like, like, like);
+      } else {
+        where.push(`(id LIKE ? ESCAPE '\\' OR ${inValues})`);
+        params.push(like, like);
+      }
     }
     // Field filters combine with AND (match=all, default) or OR (match=any).
     const fw = [];
     for (const [field, value] of Object.entries(filters)) {
       if (field.toLowerCase() === 'id') { fw.push('id = ?'); params.push(String(value)); continue; }
-      if (field === 'created' || field === 'modified') { fw.push(`${field} >= ?`); params.push(String(value)); continue; }
-      fw.push('CAST(json_extract(data, ?) AS TEXT) = ?');
-      params.push(jsonPath(field), String(value));
+      // Exact match, like every other field (time ranges: createdAfter, modifiedBefore...).
+      if (field === 'created' || field === 'modified') { fw.push(`${field} = ?`); params.push(String(value)); continue; }
+      // JSON true/false compare as "true"/"false" (json_extract alone gives 1/0).
+      fw.push(`(CASE json_type(data, ?) WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' ELSE CAST(json_extract(data, ?) AS TEXT) END) = ?`);
+      params.push(jsonPath(field), jsonPath(field), String(value));
     }
     if (fw.length) where.push('(' + fw.join(String(match).toLowerCase() === 'any' ? ' OR ' : ' AND ') + ')');
     // Time ranges / status: always ANDed. Each entry is a group of OR'd
@@ -303,9 +317,17 @@ export class Store extends EventEmitter {
     else if (['id', 'created', 'modified'].includes(sort)) sql += ` ORDER BY ${sort} ${dir}`;
     else { sql += ` ORDER BY json_extract(data, ?) ${dir}, id`; sortParams.push(jsonPath(sort)); }
     const pageParams = [];
-    if (limit !== undefined && limit !== null && limit !== '') {
+    const whole = (v, name) => {
+      if (v === undefined || v === null || v === '') return null;
+      const n = Number(v);
+      if (!Number.isSafeInteger(n) || n < 0) throw new HttpError(400, `${name} must be a whole number of 0 or more`);
+      return n;
+    };
+    const lim = whole(limit, 'limit');
+    const off = whole(offset, 'offset');
+    if (lim !== null || off) {
       sql += ' LIMIT ? OFFSET ?';
-      pageParams.push(Math.max(0, Number(limit) || 0), Math.max(0, Number(offset) || 0));
+      pageParams.push(lim === null ? -1 : lim, off || 0);
     }
     const rows = this.db.prepare(sql).all(...params, ...sortParams, ...pageParams);
     const total = this.db.prepare(countSql).get(...params).n;
