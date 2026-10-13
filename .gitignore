@@ -24,3 +24,4 @@ npm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+Claude outputs/
