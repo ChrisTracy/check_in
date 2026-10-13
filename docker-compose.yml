@@ -20,6 +20,7 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
       HTTPS_PORT: 3443
+      APPRISE_URL: ${APPRISE_URL:-http://apprise:8000}
       DB_PATH: /app/data/checkin.db
     volumes:
       # Use a named volume (not a Windows folder bind mount): SQLite's WAL locking
@@ -29,13 +30,11 @@ services:
     # deploy:
     #   replicas: 1
 
-  # Optional: alerts for new issues (Settings -> Alerts). Start it with:  docker compose --profile alerts up -d
-  # Then set the Apprise address in Settings to http://apprise:8000 (or put APPRISE_URL=http://apprise:8000 in .env).
-  # Check-In works the same without it.
+  # Optional: alerts for new issues. Idle until you turn on Settings -> Alerts (address http://apprise:8000).
+  # Check-In works the same without it: delete this service to remove it.
   apprise:
     image: caronc/apprise:latest
     container_name: apprise
-    profiles: ["alerts"]
     restart: unless-stopped
     # Not published: only Check-In needs to reach it. Uncomment to open its own web UI on this machine.
     # ports: ["127.0.0.1:8000:8000"]

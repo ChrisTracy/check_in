@@ -541,7 +541,7 @@ Everything updates live: the list, the open issue and the dashboard button follo
 
 Optional. Check-In can tell people when a **new issue opens**, through an [Apprise API](https://github.com/caronc/apprise-api) server, which reaches Teams, Slack, Discord, email, ntfy, Telegram and about a hundred other services. Without Apprise nothing changes: no alerts are sent and nothing else depends on it.
 
-1. **Run Apprise.** With Docker Compose: `docker compose --profile alerts up -d` starts the `apprise` service next to Check-In (on Komodo, add the same `apprise` service to the stack). It is not published to the network; Check-In reaches it at `http://apprise:8000`.
+1. **Run Apprise.** The compose files in the README and the repository include an `apprise` service that starts with the stack (on Komodo it comes up with the stack too) and sits idle until alerts are turned on; delete the service if you don't want it. It is not published to the network; Check-In reaches it at `http://apprise:8000`, which is also the default `APPRISE_URL` in the compose file.
 2. **Settings → Alerts** (admins): enter the Apprise address (or set `APPRISE_URL`), then either paste one or more Apprise URLs (for Teams use a Power Automate Workflows webhook, `workflow://…`; see Apprise's documentation for each service) or the name of a configuration saved inside Apprise. Pasted URLs are stored encrypted and are not shown again. **Send test alert** checks the whole path.
 3. **Issue rules** (power users and admins): tick **Alert** on each rule whose issues should be announced. Only the issue a rule *opens* is announced; further problems added to an open issue, clears and closings are not.
 4. Turn on **Send alerts for new issues**.

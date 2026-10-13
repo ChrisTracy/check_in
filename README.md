@@ -51,11 +51,22 @@ A self-hosted dashboard that keeps track of your devices. Each device checks in 
        environment:
          HISTORY_LIMIT: 100     # check-ins kept per device (for History and Graph)
          # TRUST_PROXY: 1       # uncomment behind a reverse proxy (Caddy, Nginx, Traefik)
+         APPRISE_URL: http://apprise:8000   # only used if you turn on Settings → Alerts
        volumes:
          - checkin-data:/app/data
 
+     # Optional: lets Check-In send alerts for new issues to Teams, Slack, email, ntfy and more.
+     # Idle until you turn on Settings → Alerts; delete this service (and APPRISE_URL) if you don't want it.
+     apprise:
+       image: caronc/apprise:latest
+       container_name: apprise
+       restart: unless-stopped
+       volumes:
+         - apprise-config:/config
+
    volumes:
      checkin-data:
+     apprise-config:
    ```
 
 2. Start it:

@@ -1122,7 +1122,7 @@ checkin-agent.ps1 -PortCheck 3389                (Windows: ask once)
       <div class="admin-section">
         <h4>Apprise server</h4>
         <label class="field" style="max-width:520px">Apprise address<input class="input" id="alUrl" placeholder="http://apprise:8000" value="${esc(a.appriseUrl)}" autocomplete="off"></label>
-        <p class="muted" style="margin:4px 0 10px;font-size:12px">${a.fromEnv ? 'Taken from the <code>APPRISE_URL</code> setting; type here to override it. ' : ''}With the supplied Docker Compose file the address is <code>http://apprise:8000</code>.</p>
+        <p class="muted" style="margin:4px 0 10px;font-size:12px">${a.fromEnv ? 'Taken from the <code>APPRISE_URL</code> setting; type here to override it. ' : ''}With the supplied Docker Compose files the address is <code>http://apprise:8000</code>.</p>
         <label class="field" style="max-width:520px">Where to send (Apprise URLs, one per line)<textarea class="input" id="alUrls" rows="3" placeholder="${dest.length ? 'Type here to replace the saved destinations' : 'workflow://… or slack://… or ntfy://…'}" autocomplete="off" spellcheck="false"></textarea></label>
         <p class="muted" style="margin:4px 0 6px;font-size:12px">${dest.length ? `Saved (encrypted, not shown again): ${dest.map((d) => `<code>${esc(d)}</code>`).join(' ')}. ` : 'None saved yet. '}Saving this box with text replaces them; saving it empty keeps them.</p>
         <label class="field" style="max-width:320px">…or the name of a configuration saved inside Apprise (optional)<input class="input" id="alKey" value="${esc(a.configKey)}" placeholder="e.g. checkin" autocomplete="off"></label>
@@ -1147,8 +1147,8 @@ checkin-agent.ps1 -PortCheck 3389                (Windows: ask once)
       </div>
       <div class="admin-section">
         <h4>Running Apprise</h4>
-        <pre class="key-reveal" style="border-style:solid;border-color:var(--border);white-space:pre-wrap"># Docker Compose: start Check-In together with Apprise
-docker compose --profile alerts up -d
+        <pre class="key-reveal" style="border-style:solid;border-color:var(--border);white-space:pre-wrap"># Docker Compose: the supplied compose file already starts it with Check-In
+docker compose up -d
 
 # Or on its own
 docker run -d --name apprise -p 8000:8000 caronc/apprise:latest</pre>
