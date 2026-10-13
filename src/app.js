@@ -19,6 +19,7 @@ import { TlsManager } from './tls.js';
 import { CertDeployKeys } from './certdeploy.js';
 import { AcmeManager, registerAcme } from './acme.js';
 import { Issues, registerIssues } from './issues.js';
+import { Alerts, registerAlerts } from './alerts.js';
 import { LoadTest, registerLoadTest } from './loadtest.js';
 import { can } from './auth/accounts.js';
 
@@ -188,8 +189,12 @@ export function buildApp({ config, store, accounts, oidc }) {
 
   // ---- issues (turned on by an admin; rules set by power users) ---------
   let issuesTimer = null;
+  const alerts = new Alerts({ accounts, log: app.log, defaultUrl: config.appriseUrl, graceOverride: config.alertsGraceSeconds });
+  app.decorate('alerts', alerts);
+  registerAlerts(app, { alerts });
   const issues = new Issues({
     db: store.db, store, accounts, tickMs: config.issuesTickMs ?? 30_000,
+    onOpened: (e) => alerts.notifyOpened(e),
     // Coalesce bursts (a fleet checking in) into at most two notifications per second.
     onChange: () => { if (!issuesTimer) issuesTimer = setTimeout(() => { issuesTimer = null; broadcast('issues', {}); }, 500); },
   });
@@ -520,6 +525,7 @@ export function buildApp({ config, store, accounts, oidc }) {
   });
   app.addHook('onClose', async () => {
     issues.close();
+    alerts.close();
     loadTest.close();
     clearTimeout(issuesTimer);
     acme.close();

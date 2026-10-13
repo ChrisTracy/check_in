@@ -3,7 +3,7 @@
 services:
   checkin:
     build: .
-    image: check-in:latest
+    image: check-in-api:latest
     container_name: check-in
     restart: unless-stopped
     init: true                 # forwards SIGTERM so pending writes are flushed on stop
@@ -29,5 +29,19 @@ services:
     # deploy:
     #   replicas: 1
 
+  # Optional: alerts for new issues (Settings -> Alerts). Start it with:  docker compose --profile alerts up -d
+  # Then set the Apprise address in Settings to http://apprise:8000 (or put APPRISE_URL=http://apprise:8000 in .env).
+  # Check-In works the same without it.
+  apprise:
+    image: caronc/apprise:latest
+    container_name: apprise
+    profiles: ["alerts"]
+    restart: unless-stopped
+    # Not published: only Check-In needs to reach it. Uncomment to open its own web UI on this machine.
+    # ports: ["127.0.0.1:8000:8000"]
+    volumes:
+      - apprise-config:/config
+
 volumes:
   checkin-data:
+  apprise-config:

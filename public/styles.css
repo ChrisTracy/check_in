@@ -1233,3 +1233,7 @@ a.locked { pointer-events: none; }
 .load-banner { background: var(--danger-soft); color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, transparent); }
 .load-banner b { color: var(--danger); }
 .pause-banner:not([hidden]) + .load-banner { margin-top: 8px; }
+
+/* Issue rules: the per-rule "Alert" tick */
+.bx-row .ir-alert, .ir-alert { display: inline-flex; flex-direction: row; flex: 0 0 auto; align-items: center; gap: 6px; font-size: 13px; align-self: flex-end; padding-bottom: 8px; cursor: pointer; white-space: nowrap; }
+.ir-alert input { margin: 0; }

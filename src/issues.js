@@ -80,6 +80,7 @@ export function cleanRule(r, i) {
     id, name, kind,
     severity: isBlank(r.severity) ? 'warning' : r.severity,
     enabled: r.enabled !== false,
+    alert: r.alert === true,   // announce issues this rule opens (Settings → Alerts)
     field: '', op: '', value: '', count: 1,
     clear: { mode: 'auto', field: '', op: '', value: '', count: DEFAULT_CLEAR_COUNT },
   };
@@ -177,11 +178,12 @@ const isEmpty = (w) => !w.t && !w.n && !w.c && !w.m && !w.s;
 function resetCounts(w) { w.t = null; w.n = 0; w.c = null; w.m = 0; w.v = null; }
 
 export class Issues {
-  constructor({ db, store, accounts, tickMs = 30_000, onChange = () => {} }) {
+  constructor({ db, store, accounts, tickMs = 30_000, onChange = () => {}, onOpened = () => {} }) {
     this.db = db;
     this.store = store;
     this.accounts = accounts;
     this.onChange = onChange;
+    this.onOpened = onOpened;
     this.startedAt = nowIso();
     db.exec(`
       CREATE TABLE IF NOT EXISTS issues (
@@ -567,6 +569,8 @@ export class Issues {
       o = { id: Number(info.lastInsertRowid), status: 'open', active: new Map(), seen: new Set() };
       this.open.set(rec.id, o);
       this.#event(o.id, 'opened', null, `Issue opened for ${rec.id} (last check-in ${rec.modified})`, at);
+      // Announce it (alerts) when the rule that opened it has "Alert" ticked. Must never throw into the write.
+      if (rule.alert) { try { this.onOpened({ issueId: o.id, deviceId: rec.id, rule, value, at }); } catch { /* alerts are best effort */ } }
       if (assignee) this.#event(o.id, 'assigned', null, `Assigned to ${assignee.name}: the problem came back within ${win} min of issue #${assignee.from} closing`, at);
     } else if (o.status === 'ignored' && !o.seen.has(rule.id)) {
       this.s.setStatus.run('open', null, null, at, o.id);

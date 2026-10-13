@@ -32,8 +32,8 @@
   };
 
   // The capability each tab needs to change anything on it. Controls inside can override with data-cap="...".
-  const TAB_CAP = { prefs: null, checkins: null, users: 'users', sso: 'sso', apikey: 'apiKey', ports: 'portCheckPolicy', issues: 'issuesEnable', tls: 'tls', reset: 'clearAll', loadtest: 'loadTest' };
-  const ADMIN_CAPS = new Set(['users', 'sso', 'tls', 'portCheckPolicy', 'apiKeyPolicy', 'issuesEnable', 'loadTest']);
+  const TAB_CAP = { prefs: null, checkins: null, users: 'users', sso: 'sso', apikey: 'apiKey', ports: 'portCheckPolicy', issues: 'issuesEnable', alerts: 'alerts', tls: 'tls', reset: 'clearAll', loadtest: 'loadTest' };
+  const ADMIN_CAPS = new Set(['users', 'sso', 'tls', 'portCheckPolicy', 'apiKeyPolicy', 'issuesEnable', 'alerts', 'loadTest']);
   const needRole = (cap) => (ADMIN_CAPS.has(cap) ? 'an Admin' : 'a Power user or Admin');
 
   let tab = 'users';
@@ -222,7 +222,7 @@
     $$('.admin-nav [data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
     $('#aBody').innerHTML = '<div class="muted">Loading…</div>';
     foot('');
-    ({ prefs: loadPrefs, checkins: loadCheckins, users: loadUsers, sso: loadSso, apikey: loadApiKey, tls: loadTls, ports: loadPorts, issues: loadIssuesAdmin, reset: loadReset, loadtest: loadLoadtest })[t]();
+    ({ prefs: loadPrefs, checkins: loadCheckins, users: loadUsers, sso: loadSso, apikey: loadApiKey, tls: loadTls, ports: loadPorts, issues: loadIssuesAdmin, alerts: loadAlerts, reset: loadReset, loadtest: loadLoadtest })[t]();
     startLocking();
   }
 
@@ -1101,6 +1101,77 @@ checkin-agent.ps1 -PortCheck 3389                (Windows: ask once)
       try {
         renderPorts(await apiJson('/api/admin/portcheck', json('PUT', { timeoutMs: Number($('#pcTimeout').value), maxPorts: Number($('#pcMax').value), perIpPerMinute: Number($('#pcRate').value) })));
         toast('Port check limits saved');
+      } catch (err) { toast(err.message, 'error'); }
+    });
+  }
+
+  async function loadAlerts() {
+    try { renderAlerts(await apiJson('/api/admin/alerts')); } catch (e) { $('#aBody').innerHTML = `<div class="warn-box">${esc(e.message)}</div>`; }
+  }
+
+  function renderAlerts(a) {
+    head('Alerts', 'Tell people when a new issue opens, through an Apprise server');
+    const st = a.stats || {};
+    const dest = a.destinations || [];
+    $('#aBody').innerHTML = `
+      <div class="admin-section">
+        <label class="switch"><input type="checkbox" id="alEnabled" ${a.enabled ? 'checked' : ''}><span class="track"></span><b>Send alerts for new issues</b></label>
+        <p class="muted" style="margin:0;font-size:12px">Off by default and optional: nothing is sent unless this is on, an Apprise address is set, and a rule has <b>Alert</b> ticked in Issue rules. Apprise (<a href="https://github.com/caronc/apprise-api" target="_blank" rel="noopener">apprise-api</a>) can post to Teams, Slack, Discord, email, ntfy, Telegram and many more.</p>
+        ${a.enabled && !a.ready ? '<div class="warn-box" style="margin-top:8px">Alerts are on but incomplete: add the Apprise address and at least one destination (or an Apprise key).</div>' : ''}
+      </div>
+      <div class="admin-section">
+        <h4>Apprise server</h4>
+        <label class="field" style="max-width:520px">Apprise address<input class="input" id="alUrl" placeholder="http://apprise:8000" value="${esc(a.appriseUrl)}" autocomplete="off"></label>
+        <p class="muted" style="margin:4px 0 10px;font-size:12px">${a.fromEnv ? 'Taken from the <code>APPRISE_URL</code> setting; type here to override it. ' : ''}With the supplied Docker Compose file the address is <code>http://apprise:8000</code>.</p>
+        <label class="field" style="max-width:520px">Where to send (Apprise URLs, one per line)<textarea class="input" id="alUrls" rows="3" placeholder="${dest.length ? 'Type here to replace the saved destinations' : 'workflow://… or slack://… or ntfy://…'}" autocomplete="off" spellcheck="false"></textarea></label>
+        <p class="muted" style="margin:4px 0 6px;font-size:12px">${dest.length ? `Saved (encrypted, not shown again): ${dest.map((d) => `<code>${esc(d)}</code>`).join(' ')}. ` : 'None saved yet. '}Saving this box with text replaces them; saving it empty keeps them.</p>
+        <label class="field" style="max-width:320px">…or the name of a configuration saved inside Apprise (optional)<input class="input" id="alKey" value="${esc(a.configKey)}" placeholder="e.g. checkin" autocomplete="off"></label>
+        <label class="field" style="max-width:520px;margin-top:10px">Address of this site, for links in alerts (optional)<input class="input" id="alLink" value="${esc(a.linkUrl)}" placeholder="https://checkin.example.com" autocomplete="off"></label>
+      </div>
+      <div class="admin-section">
+        <h4>Flood protection</h4>
+        <div class="row" style="display:flex;gap:12px;flex-wrap:wrap;max-width:720px">
+          <label class="field" style="flex:1;min-width:150px">At most this many alerts<input class="input" id="alMax" type="number" min="1" max="1000" value="${esc(a.max)}"></label>
+          <label class="field" style="flex:1;min-width:150px">in this many seconds<input class="input" id="alSecs" type="number" min="5" max="86400" value="${esc(a.perSeconds)}"></label>
+          <label class="field" style="flex:1;min-width:150px">Quiet for this long after start-up (s)<input class="input" id="alGrace" type="number" min="0" max="3600" value="${esc(a.graceSeconds)}"></label>
+        </div>
+        <p class="muted" style="margin:6px 0 10px;font-size:12px">Past the limit, alerts stop going out one by one and a single summary ("N more issues opened") is sent when the time is up. The issues are all still on the Issues page. The quiet time covers a restart, when every device is checked again.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn primary" id="alSave">Save</button>
+          <button class="btn" id="alTest" ${a.appriseUrl && (dest.length || a.configKey) ? '' : 'disabled'}>Send test alert</button>
+        </div>
+      </div>
+      <div class="admin-section">
+        <h4>Since the server started</h4>
+        <p class="muted" style="margin:0">${nf.format(st.sent || 0)} sent, ${nf.format(st.held || 0)} held back by the limit${st.summaries ? ` (${nf.format(st.summaries)} summaries)` : ''}, ${nf.format(st.failed || 0)} failed${a.queued ? `, ${nf.format(a.queued)} waiting` : ''}.${st.lastError ? `<br>Last error ${esc(relTime(st.lastErrorAt))}: ${esc(st.lastError)}` : ''}</p>
+      </div>
+      <div class="admin-section">
+        <h4>Running Apprise</h4>
+        <pre class="key-reveal" style="border-style:solid;border-color:var(--border);white-space:pre-wrap"># Docker Compose: start Check-In together with Apprise
+docker compose --profile alerts up -d
+
+# Or on its own
+docker run -d --name apprise -p 8000:8000 caronc/apprise:latest</pre>
+      </div>`;
+    const body = () => {
+      const b = { appriseUrl: $('#alUrl').value, configKey: $('#alKey').value, linkUrl: $('#alLink').value, max: Number($('#alMax').value), perSeconds: Number($('#alSecs').value), graceSeconds: Number($('#alGrace').value) };
+      if ($('#alUrls').value.trim()) b.urls = $('#alUrls').value;
+      return b;
+    };
+    $('#alEnabled').addEventListener('change', async (e) => {
+      try {
+        renderAlerts(await apiJson('/api/admin/alerts', json('PUT', { ...body(), enabled: e.target.checked })));
+        toast(e.target.checked ? 'Alerts turned on' : 'Alerts turned off');
+      } catch (err) { toast(err.message, 'error'); e.target.checked = !e.target.checked; }
+    });
+    $('#alSave').addEventListener('click', async () => {
+      try { renderAlerts(await apiJson('/api/admin/alerts', json('PUT', body()))); toast('Alert settings saved'); } catch (err) { toast(err.message, 'error'); }
+    });
+    $('#alTest').addEventListener('click', async () => {
+      try {
+        renderAlerts(await apiJson('/api/admin/alerts', json('PUT', body())));
+        await apiJson('/api/admin/alerts/test', json('POST', {}));
+        toast('Test alert sent');
       } catch (err) { toast(err.message, 'error'); }
     });
   }

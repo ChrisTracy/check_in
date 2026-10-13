@@ -30,6 +30,7 @@ export const CAPS = {
   issueWork: 'user',      // assign, ignore, close and add notes to issues
   issueRules: 'power',    // define what an issue is, the reassign window, clear all issues
   issuesEnable: 'admin',  // turn the issues list on or off
+  alerts: 'admin',        // send new-issue alerts through an Apprise server
   loadTest: 'admin',      // the load test page: a simulated fleet inside the server
   sso: 'admin',
   users: 'admin',

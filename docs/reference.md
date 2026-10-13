@@ -12,6 +12,7 @@ Everything beyond the basics: configuration, Docker details, HTTPS, users and si
 - [API](#api)
 - [Dashboard](#dashboard)
 - [Issues](#issues)
+- [Alerts](#alerts)
 - [Load test page](#load-test-page)
 - [Performance](#performance)
 - [Agents (Windows and Linux)](#agents-windows-and-linux)
@@ -55,6 +56,8 @@ To load some sample data, run `API_KEY=<key> npm run seed` (PowerShell: `$env:AP
 | `MAX_FIELDS` | `500` | Maximum fields per record |
 | `BODY_LIMIT_MB` | `10` | Maximum size of a JSON or form body |
 | `IMPORT_LIMIT_MB` | `200` | Maximum size of an uploaded CSV |
+| `APPRISE_URL` | *(empty)* | Address of an [Apprise API](https://github.com/caronc/apprise-api) server for [alerts](#alerts) (e.g. `http://apprise:8000`). Optional; can also be set in Settings → Alerts |
+| `ALERTS_GRACE_SECONDS` | *(setting)* | Overrides the quiet time after start-up (normally set in Settings → Alerts) |
 | `LOG_LEVEL` | `warn` | `silent`, `error`, `warn`, `info` or `debug` |
 
 ## Running in Docker
@@ -534,6 +537,19 @@ Rule changes apply right away. Problems from a deleted or turned-off rule leave 
 
 Everything updates live: the list, the open issue and the dashboard button follow changes from other people and from check-ins without a refresh; a note you're typing and the sections you've opened stay as they are. **Show more** loads the next 200 issues, as many times as you like.
 
+## Alerts
+
+Optional. Check-In can tell people when a **new issue opens**, through an [Apprise API](https://github.com/caronc/apprise-api) server, which reaches Teams, Slack, Discord, email, ntfy, Telegram and about a hundred other services. Without Apprise nothing changes: no alerts are sent and nothing else depends on it.
+
+1. **Run Apprise.** With Docker Compose: `docker compose --profile alerts up -d` starts the `apprise` service next to Check-In (on Komodo, add the same `apprise` service to the stack). It is not published to the network; Check-In reaches it at `http://apprise:8000`.
+2. **Settings → Alerts** (admins): enter the Apprise address (or set `APPRISE_URL`), then either paste one or more Apprise URLs (for Teams use a Power Automate Workflows webhook, `workflow://…`; see Apprise's documentation for each service) or the name of a configuration saved inside Apprise. Pasted URLs are stored encrypted and are not shown again. **Send test alert** checks the whole path.
+3. **Issue rules** (power users and admins): tick **Alert** on each rule whose issues should be announced. Only the issue a rule *opens* is announced; further problems added to an open issue, clears and closings are not.
+4. Turn on **Send alerts for new issues**.
+
+**Flood protection.** At most *N* alerts per *S* seconds (default 5 per 60). Past that, alerts stop going out one by one and a single summary ("7 more issues opened") is sent when the time is up, naming the first few devices. For a quiet time after start-up (default 120 s) alerts are held the same way, because a restart re-checks every device. Held alerts are never lost from the Issues page; only the notification is skipped. Settings → Alerts shows counts for sent, held and failed alerts and the last error.
+
+Sending never delays check-ins: alerts wait in a short queue and are posted one at a time with a 10-second timeout. API: `GET/PUT /api/admin/alerts`, `POST /api/admin/alerts/test` (admin to change, power users can read).
+
 ## Load test page
 
 Admins can open **Load test** from **Settings → Load test** (`/loadtest`). The Issues and Load test pages have the same account menu, top right, as the dashboard. It runs a simulated fleet inside the server, so you can watch the dashboard, status boxes and issues under load without installing anything.
@@ -788,6 +804,7 @@ src/
   tls.js      built-in HTTPS: certificate storage, validation, hot reload, redirects
   acme.js     automatic certificates (ACME HTTP-01): issue, renew, backoff, routes
   certdeploy.js deploy keys: certificate pushes from automation, safety checks
+  alerts.js   new-issue alerts through an Apprise server, with a flood limit
   views.js    saved views (personal and team)
   issues.js   issues: rules, one open issue per device, clearing, ignore, assign, notes, CSV, routes
   loadtest.js the admin load test: a simulated fleet checking in through the real API, problems on demand

@@ -623,6 +623,7 @@
           <label class="bx-name">Name<input class="input" data-k="name" maxlength="60" value="${esc(r.name)}" placeholder="e.g. High CPU"></label>
           <label class="ir-kind">Type<select class="select" data-k="kind">${Object.entries(KINDS).map(([k, l]) => `<option value="${k}" ${r.kind === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
           <label class="bx-tone">Severity<select class="select" data-k="severity">${Object.entries(SEV).map(([k, l]) => `<option value="${k}" ${r.severity === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+          <label class="ir-alert" title="Send an alert when this rule opens a new issue (needs Settings → Alerts)"><input type="checkbox" data-k="alert" ${r.alert ? 'checked' : ''}> Alert</label>
           <div class="bx-tools">
             <label class="switch" title="Rule is on"><input type="checkbox" data-k="enabled" ${r.enabled !== false ? 'checked' : ''}><span class="track"></span></label>
             <button class="icon-btn sm" data-move="-1" title="Move up" ${i === 0 ? 'disabled' : ''}>${ICON.up}</button>

@@ -61,6 +61,8 @@ export const config = {
   tlsDir: path.resolve(ROOT, process.env.TLS_DIR || path.join(path.dirname(process.env.DB_PATH || 'data/checkin.db'), 'tls')),
   // Break-glass: force HTTP only, ignoring the saved HTTPS settings.
   tlsDisable: process.env.TLS_DISABLE === 'true',
+  appriseUrl: (process.env.APPRISE_URL || '').trim().replace(/\/+$/, ''),
+  alertsGraceSeconds: process.env.ALERTS_GRACE_SECONDS === undefined ? undefined : int(process.env.ALERTS_GRACE_SECONDS, 120),
   maxBatch: int(process.env.MAX_BATCH, 5000),
   maxFieldsPerRecord: int(process.env.MAX_FIELDS, 500),
   bodyLimitMb: int(process.env.BODY_LIMIT_MB, 10),
