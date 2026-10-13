@@ -144,6 +144,39 @@ export class Store extends EventEmitter {
       WHERE rn > ?)`).run(this.historyLimit);
   }
 
+  /** How big the history is, and how much of it a new limit would delete (nothing is changed). */
+  historyImpact(limit) {
+    const t = this.db.prepare('SELECT COUNT(*) AS rows, COALESCE(SUM(LENGTH(data) + LENGTH(changes)), 0) AS bytes, COUNT(DISTINCT record_id) AS devices FROM history').get();
+    let remove = 0;
+    if (limit === 0) remove = t.rows;
+    else if (limit > 0) remove = this.db.prepare('SELECT COALESCE(SUM(c - ?), 0) AS n FROM (SELECT COUNT(*) AS c FROM history GROUP BY record_id) WHERE c > ?').get(limit, limit).n;
+    return { rows: t.rows, bytes: t.bytes, devices: t.devices, records: this.s.count.get().n, remove };
+  }
+
+  /**
+   * Change the history limit while running. Lowering it deletes the older entries now, one device at a
+   * time, giving check-ins a turn between devices so a big trim does not stall the server.
+   * Resolves with the number of entries deleted.
+   */
+  setHistoryLimit(limit) {
+    if (!Number.isInteger(limit) || limit < -1) throw new Error('History limit must be a whole number, 0 or more, or -1 for unlimited');
+    this.historyLimit = limit;
+    const run = async () => {
+      if (limit < 0) return 0;
+      const ids = this.db.prepare('SELECT record_id AS id FROM history GROUP BY record_id HAVING COUNT(*) > ?').all(limit).map((r) => r.id);
+      let removed = 0;
+      for (let i = 0; i < ids.length; i++) {
+        if (this.historyLimit !== limit) break; // changed again while trimming: the newer call takes over
+        const r = limit === 0 ? this.s.pruneAll.run(ids[i]) : this.s.prune.run(ids[i], ids[i], limit - 1);
+        removed += Number(r.changes);
+        if (i % 100 === 99) await new Promise((res) => setImmediate(res));
+      }
+      return removed;
+    };
+    this.trimming = (this.trimming || Promise.resolve()).then(run, run);
+    return this.trimming;
+  }
+
   /** Queue one upsert; resolves with { action, record, changed } once committed. */
   upsert(input, opts) {
     const { id, fields } = normalizeInput(input, { maxFields: this.maxFields, ...opts });
@@ -359,6 +392,30 @@ export class Store extends EventEmitter {
     return this.db.prepare(
       'SELECT hid, record_id AS id, version, action, changes, data, at FROM history WHERE record_id = ? ORDER BY hid DESC LIMIT ?'
     ).all(id, Math.min(Number(limit) || 500, 100000)).map(parseHist);
+  }
+
+  /**
+   * Just the named fields from one record's history, newest first, for the Graph tab. `sinceIso` keeps
+   * only entries at or after that time. Returns { rows: [{ at, data }], earliest, truncated }.
+   */
+  metrics(id, { fields, sinceIso, limit = 50000 }) {
+    const names = fields.slice(0, 40);
+    const cols = names.map((_, i) => `json_extract(data, ?) AS f${i}`).join(', ');
+    const rows = this.db.prepare(
+      `SELECT at${cols ? ', ' + cols : ''} FROM history WHERE record_id = ?${sinceIso ? ' AND at >= ?' : ''} ORDER BY hid DESC LIMIT ?`
+    ).all(...names.map((n) => `$."${n}"`), id, ...(sinceIso ? [sinceIso] : []), limit + 1);
+    const truncated = rows.length > limit;
+    if (truncated) rows.length = limit;
+    const earliest = this.db.prepare('SELECT at FROM history WHERE record_id = ? ORDER BY hid ASC LIMIT 1').get(id)?.at || null;
+    return {
+      earliest,
+      truncated,
+      rows: rows.map((r) => {
+        const data = {};
+        names.forEach((n, i) => { const v = r[`f${i}`]; if (v !== null && v !== undefined) data[n] = v; });
+        return { at: r.at, data };
+      }),
+    };
   }
 
   /**

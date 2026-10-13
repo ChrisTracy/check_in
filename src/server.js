@@ -7,14 +7,17 @@ import { loadAppSecret } from './auth/security.js';
 import { buildApp } from './app.js';
 
 const db = openDb(config.dbPath);
-const store = new Store(db, {
-  historyLimit: config.historyLimit,
-  maxBatch: config.maxBatch,
-  maxFields: config.maxFieldsPerRecord,
-});
 const accounts = new Accounts(db, {
   secret: loadAppSecret(config.appSecret, config.dbPath),
   sessionTtlHours: config.sessionTtlHours,
+});
+// A history limit saved in Settings wins over the HISTORY_LIMIT variable.
+const savedHistoryLimit = accounts.historyLimit;
+const historyLimit = savedHistoryLimit ?? config.historyLimit;
+const store = new Store(db, {
+  historyLimit,
+  maxBatch: config.maxBatch,
+  maxFields: config.maxFieldsPerRecord,
 });
 
 // First-run bootstrap from environment variables.
@@ -47,7 +50,7 @@ try {
   console.log(`Check-in API listening on http://localhost:${config.port}`);
   console.log(`  Dashboard:     http://localhost:${config.port}/`);
   console.log(`  Database:      ${config.dbPath} (${s.records} records, ${s.history} history rows)`);
-  console.log(`  History limit: ${config.historyLimit < 0 ? 'unlimited' : config.historyLimit} per record`);
+  console.log(`  History limit: ${historyLimit < 0 ? 'unlimited' : historyLimit} per record (${savedHistoryLimit === null ? 'HISTORY_LIMIT' : 'set in Settings'})`);
   console.log(`  Users:         ${accounts.count() || 'none yet: open the dashboard to create the first admin'}`);
   console.log(`  API key:       ${accounts.apiKeyRequired ? 'required for check-ins (see Add Device)' : 'not required (check-ins are open to anyone who can reach the server)'}`);
   console.log(`  Entra SSO:     ${accounts.ssoReady() ? 'enabled' : 'off'}`);

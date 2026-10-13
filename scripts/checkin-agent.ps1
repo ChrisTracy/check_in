@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Check-In agent for Windows (Windows PowerShell 5.1 or PowerShell 7+).            version 2.1.0
+  Check-In agent for Windows (Windows PowerShell 5.1 or PowerShell 7+).            version 2.2.0
 
 .DESCRIPTION
   1. Asks the server whether it is accepting check-ins   (GET  /api/status)
@@ -27,6 +27,10 @@
     updates   pending_updates, security_updates, last_update, last_hotfix                         (slower)
     security  firewall_enabled, firewall_profiles, av_product, av_enabled, av_realtime,
               av_signature_age_days, secure_boot, disk_encrypted
+    topprocs  top_cpu, top_ram, top_disk: the 3 busiest process NAMES, each only while that metric is
+              over 85% (cpu_pct, ram_pct, disk_busy_pct; set $DefaultTopThreshold). Off unless asked for
+              ("all" or -Fields default,topprocs); needs the cpu, ram and disk groups. Disk is the
+              process's total I/O (disk, network and pipes) in MB/s, and needs an elevated run
 
   EXIT CODES   0 sent (or dry run)   2 server paused, nothing sent   1 error
 
@@ -120,6 +124,7 @@ $DefaultFields = 'default'       # field groups to send: default, all, or e.g. c
 $DefaultExclude = ''             # field groups to skip
 $DefaultExtra = ''               # extra fields, e.g. 'site=Dallas,owner=%OWNER%' (see -Extra)
 $DefaultEvery = 5                # minutes between runs when installing (1-1439)
+$DefaultTopThreshold = 85       # topprocs group: list the top processes while CPU, RAM or disk busy % is above this
 $DefaultCheckPorts = ''          # ports the server tests on each check-in, e.g. '3389' (needs Admin > Port checks)
 # What "default" means (the groups sent when nothing else is chosen):
 $DefaultGroups = @('system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 'domain', 'users', 'health')
@@ -128,12 +133,12 @@ $DefaultGroups = @('system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 if (-not $PSBoundParameters.ContainsKey('Every')) { $Every = $DefaultEvery }
-$Version = '2.1.0'
+$Version = '2.2.0'
 $TaskName = 'Check-In Agent'
 $HomeDir = Join-Path $env:ProgramData 'CheckIn'
 $InstalledScript = Join-Path $HomeDir 'checkin-agent.ps1'
 $DefaultConfig = Join-Path $HomeDir 'agent.json'
-$AllGroups = @('system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 'domain', 'users', 'health', 'updates', 'security')
+$AllGroups = @('system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 'domain', 'users', 'health', 'updates', 'security', 'topprocs')
 
 function Write-Log([string]$Message) {
   Write-Host $Message
@@ -194,6 +199,8 @@ $managed = { param($name) if ($ReplaceSettings) { "__none_$name" } else { $name 
 $Exclude = Get-Setting ($Exclude -join ',') 'CHECKIN_EXCLUDE' (& $managed 'Exclude') $DefaultExclude
 $Proxy = Get-Setting $Proxy 'CHECKIN_PROXY' 'Proxy'
 $Extra = Get-Setting $Extra 'CHECKIN_EXTRA' (& $managed 'Extra') $DefaultExtra
+$TopThreshold = 0
+if (-not [int]::TryParse((Get-Setting '' 'CHECKIN_TOP_THRESHOLD' 'TopThreshold' $DefaultTopThreshold), [ref]$TopThreshold) -or $TopThreshold -lt 1 -or $TopThreshold -gt 100) { $TopThreshold = 85 }
 # -CheckPorts 3389,443 (a list) and -CheckPorts "3389,443" (text) both work.
 # (New names: the parameters are string arrays, and a plain string is what gets sent and saved.)
 $PortsEachRun = [string]((Get-Setting ($CheckPorts -join ',') 'CHECKIN_CHECK_PORTS' (& $managed 'CheckPorts') $DefaultCheckPorts) -replace '\s', '')
@@ -414,18 +421,72 @@ if (Want 'system') { Try-Group 'system' {
   Add-Field 'virtualization' $virt
 } }
 
+# ---- topprocs helpers: the busiest process names ------------------------------------------
+# One row per process NAME (processes sharing a name are added up): CPU time (100 ns units), working set
+# (bytes) and I/O bytes read + written, from a single Win32_Process query. Only names are used.
+function Get-ProcSnapshot {
+  $t0 = [DateTime]::UtcNow
+  $rows = @{}
+  $q = 'SELECT Name, ProcessId, KernelModeTime, UserModeTime, WorkingSetSize, ReadTransferCount, WriteTransferCount FROM Win32_Process'
+  foreach ($p in @(Get-CimInstance -Query $q -ErrorAction Stop)) {
+    if ([int]$p.ProcessId -eq 0) { continue }   # System Idle Process: its "CPU time" is idle time
+    $n = ([IO.Path]::GetFileNameWithoutExtension([string]$p.Name) -replace '[,\r\n]', ' ').Trim()
+    if (-not $n) { continue }
+    if (-not $rows.ContainsKey($n)) { $rows[$n] = @{ cpu = [double]0; ws = [double]0; io = [double]0 } }
+    $rows[$n].cpu += [double]$p.KernelModeTime + [double]$p.UserModeTime
+    $rows[$n].ws += [double]$p.WorkingSetSize
+    $rows[$n].io += [double]$p.ReadTransferCount + [double]$p.WriteTransferCount
+  }
+  $t1 = [DateTime]::UtcNow
+  # The reading is spread over the query, so its time is the middle of it.
+  return [pscustomobject]@{ Mid = $t0.AddTicks([long](($t1 - $t0).Ticks / 2)); Rows = $rows }
+}
+# "name 38%, other 21%": the top three of cpu | ram | disk. $Before is only needed for cpu and disk.
+# (PowerShell variable names ignore case, so the snapshots are not called $A / $B next to $a / $b.)
+function Format-TopProcs([string]$Mode, $Before, $After, [double]$Cores, [double]$TotalKb) {
+  $secs = if ($Before) { ($After.Mid - $Before.Mid).TotalSeconds } else { 0 }
+  if ($Mode -ne 'ram' -and $secs -le 0) { return '' }
+  $vals = foreach ($name in $After.Rows.Keys) {
+    $now = $After.Rows[$name]
+    $was = if ($Before -and $Before.Rows.ContainsKey($name)) { $Before.Rows[$name] } else { @{ cpu = 0; io = 0 } }
+    $v = switch ($Mode) {
+      'cpu' { [Math]::Max(0, $now.cpu - $was.cpu) / 1e7 / $secs / [Math]::Max(1, $Cores) * 100 }
+      'ram' { $now.ws }
+      default { [Math]::Max(0, $now.io - $was.io) / $secs }
+    }
+    [pscustomobject]@{ Name = $name; V = [double]$v }
+  }
+  $inv = [Globalization.CultureInfo]::InvariantCulture
+  $out = foreach ($t in ($vals | Sort-Object V -Descending | Select-Object -First 3)) {
+    switch ($Mode) {
+      'cpu' { if ($t.V -ge 0.5) { '{0} {1}%' -f $t.Name, [Math]::Round($t.V) } }
+      'ram' {
+        if ($t.V -ge 1MB) {
+          $size = if ($t.V -ge 1GB) { ($t.V / 1GB).ToString('0.0', $inv) + ' GB' } else { [Math]::Round($t.V / 1MB).ToString($inv) + ' MB' }
+          if ($TotalKb -gt 0) { '{0} {1} ({2}%)' -f $t.Name, $size, [Math]::Round($t.V / 1024 * 100 / $TotalKb) } else { '{0} {1}' -f $t.Name, $size }
+        }
+      }
+      default { if ($t.V -ge 100000) { '{0} {1} MB/s' -f $t.Name, ($t.V / 1e6).ToString('0.0', $inv) } }
+    }
+  }
+  return (@($out) -join ', ')
+}
+
 # ---- one-second samples: CPU busy % and disk busy % ------------------------------------
 # Raw performance counters read twice, one second apart (locale-independent, unlike counter
 # names; same idea as /proc/stat and /proc/diskstats on Linux). One wait covers both.
 $cpuQuery = "SELECT PercentProcessorTime, Timestamp_Sys100NS FROM Win32_PerfRawData_PerfOS_Processor WHERE Name='_Total'"
 $diskQuery = "SELECT Name, PercentIdleTime, Timestamp_Sys100NS FROM Win32_PerfRawData_PerfDisk_PhysicalDisk WHERE Name<>'_Total'"
 $sampleA = @{}; $sampleB = @{}
+$procA = $null
 if ((Want 'cpu') -or (Want 'disk')) {
   $takeSample = {
     param($into)
     if (Want 'cpu') { try { $into.cpu = Get-CimInstance -Query $cpuQuery -ErrorAction Stop } catch { } }
     if (Want 'disk') { try { $into.disk = @(Get-CimInstance -Query $diskQuery -ErrorAction Stop) } catch { } }
   }
+  # topprocs: the "before" process snapshot is always taken (it can't be known yet whether anything will be busy).
+  if (Want 'topprocs') { try { $procA = Get-ProcSnapshot } catch { $script:groupErrors += "topprocs : $($_.Exception.Message)" } }
   & $takeSample $sampleA; Start-Sleep -Seconds 1; & $takeSample $sampleB
 }
 
@@ -437,15 +498,18 @@ if (Want 'cpu') { Try-Group 'cpu' {
   $dt = if ($a -and $b) { [double]$b.Timestamp_Sys100NS - [double]$a.Timestamp_Sys100NS } else { 0 }
   if ($dt -gt 0) {
     $busy = 100.0 * (1.0 - (([double]$b.PercentProcessorTime - [double]$a.PercentProcessorTime) / $dt))
-    Add-Field 'cpu_pct' ([Math]::Round([Math]::Max(0, [Math]::Min(100, $busy)), 1))
+    $script:cpuV = [Math]::Round([Math]::Max(0, [Math]::Min(100, $busy)), 1)
+    Add-Field 'cpu_pct' $script:cpuV
   } else {
-    Add-Field 'cpu_pct' ([Math]::Round(($procs | Measure-Object -Property LoadPercentage -Average).Average, 1))
+    $script:cpuV = [Math]::Round(($procs | Measure-Object -Property LoadPercentage -Average).Average, 1)
+    Add-Field 'cpu_pct' $script:cpuV
   }
 } }
 
 if (Want 'ram') { Try-Group 'ram' {
   $totalKb = [double]$os.TotalVisibleMemorySize; $freeKb = [double]$os.FreePhysicalMemory
-  Add-Field 'ram_pct' (Pct ($totalKb - $freeKb) $totalKb)
+  $script:ramV = Pct ($totalKb - $freeKb) $totalKb
+  Add-Field 'ram_pct' $script:ramV
   Add-Field 'ram_used_mb' ([int](($totalKb - $freeKb) / 1024))
   Add-Field 'ram_total_mb' ([int]($totalKb / 1024))
   $pf = @(Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue)
@@ -466,7 +530,7 @@ if (Want 'disk') { Try-Group 'disk' {
     $busy = [Math]::Max(0, [Math]::Min(100, $busy))
     if ($null -eq $busiest -or $busy -gt $busiest) { $busiest = $busy }
   }
-  if ($null -ne $busiest) { Add-Field 'disk_busy_pct' ([Math]::Round($busiest, 1)) }
+  if ($null -ne $busiest) { $script:diskV = [Math]::Round($busiest, 1); Add-Field 'disk_busy_pct' $script:diskV }
   $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Where-Object { $_.Size -gt 0 })
   $sys = $disks | Where-Object { $_.DeviceID -eq $env:SystemDrive } | Select-Object -First 1
   if ($sys) {
@@ -479,6 +543,27 @@ if (Want 'disk') { Try-Group 'disk' {
     Add-Field 'disk_max_pct' ([int][Math]::Round(100.0 * ($full.Size - $full.FreeSpace) / $full.Size))
     Add-Field 'disk_max_mount' $full.DeviceID
   }
+} }
+
+# ---- topprocs: only while a metric is over the threshold (otherwise the field is cleared with null) ----
+if (Want 'topprocs') { Try-Group 'topprocs' {
+  $over = { param($v) ($null -ne $v) -and ([double]$v -gt $TopThreshold) }
+  $procB = $null
+  if ((& $over $script:cpuV) -or (& $over $script:ramV) -or (& $over $script:diskV)) { $procB = Get-ProcSnapshot }
+  $totalKb = [double]$os.TotalVisibleMemorySize
+  $coreCount = [double]([int](@(Get-CimInstance Win32_Processor) | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)
+  $setTop = {
+    param($field, $value, $mode, $needsAdmin)
+    $line = ''
+    if ($procB -and (& $over $value)) {
+      $line = Format-TopProcs $mode $procA $procB $coreCount $totalKb
+      if ($needsAdmin -and -not $isAdmin) { $line = '' }   # other users' I/O counts are only readable elevated
+    }
+    if ($line) { $data[$field] = $line } else { $data[$field] = $null }
+  }
+  if (Want 'cpu') { & $setTop 'top_cpu' $script:cpuV 'cpu' $false }
+  if (Want 'ram') { & $setTop 'top_ram' $script:ramV 'ram' $false }
+  if (Want 'disk') { & $setTop 'top_disk' $script:diskV 'disk' $true }
 } }
 
 if (Want 'time') { Try-Group 'time' {

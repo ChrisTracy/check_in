@@ -22,6 +22,9 @@ import { Issues, registerIssues } from './issues.js';
 import { Alerts, registerAlerts } from './alerts.js';
 import { LoadTest, registerLoadTest } from './loadtest.js';
 import { can } from './auth/accounts.js';
+import { aboutInfo } from './version.js';
+
+const MAX_HISTORY_LIMIT = 1_000_000;
 
 const AUTH_QUERY_KEYS = new Set(['api_key', 'apikey']);
 const MAX_BULK_DELETE = 100_000;
@@ -243,6 +246,8 @@ export function buildApp({ config, store, accounts, oidc }) {
   // ---- agent downloads and one-line installers (see src/agents.js) -------
   registerAgentRoutes(app);
 
+  app.get('/api/about', { config: { cap: 'view' } }, async () => aboutInfo());
+
   app.get('/health', async () => ({ ok: true, accepting: !accounts.ingest().paused }));
 
   // Reject new data while a power user has paused check-ins.
@@ -259,7 +264,35 @@ export function buildApp({ config, store, accounts, oidc }) {
     let site = null;
     try { site = siteUrl(req); } catch { /* unusual Host header */ }
     const k = accounts.apiKeyInfo();
-    return { historyLimit: config.historyLimit, apiKeySet: k.set, apiKeyRequired: k.required, siteUrl: site, portCheck: { enabled: portChecker.enabled, maxPorts: portChecker.settings.maxPorts, perIpPerMinute: portChecker.settings.perIpPerMinute } };
+    return { historyLimit: store.historyLimit, apiKeySet: k.set, apiKeyRequired: k.required, siteUrl: site, portCheck: { enabled: portChecker.enabled, maxPorts: portChecker.settings.maxPorts, perIpPerMinute: portChecker.settings.perIpPerMinute } };
+  });
+
+  // ---- history limit (power users) ---------------------------------------
+  const histCap = { config: { cap: 'historyLimit' } };
+  const histState = () => ({ limit: store.historyLimit, source: accounts.historyLimit === null ? 'environment' : 'settings', environmentLimit: config.historyLimit, ...store.historyImpact(-1) });
+  app.get('/api/history-limit', histCap, async (req) => {
+    const state = histState();
+    if (req.query?.limit === undefined) return state;
+    const n = Number(req.query.limit);
+    if (!Number.isInteger(n) || n < -1 || n > MAX_HISTORY_LIMIT) throw new HttpError(400, `Limit must be a whole number from -1 to ${MAX_HISTORY_LIMIT}`);
+    return { ...state, ...store.historyImpact(n), proposed: n };
+  });
+  app.put('/api/history-limit', histCap, async (req) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    let next;
+    if (body.reset === true) next = null;
+    else {
+      next = body.limit;
+      if (!Number.isInteger(next) || next < -1 || next > MAX_HISTORY_LIMIT) throw new HttpError(400, `Limit must be a whole number from -1 (unlimited) to ${MAX_HISTORY_LIMIT}`);
+    }
+    const target = next === null ? config.historyLimit : next;
+    const before = store.historyLimit;
+    accounts.setSetting('historyLimit', next);
+    const removed = await store.setHistoryLimit(target);
+    if (target !== before) app.log.info({ before, after: target, removed, by: req.auth.user?.username || req.auth.name }, 'history limit changed');
+    const state = { ...histState(), removed };
+    broadcast('settings', { staleMinutes: accounts.staleMinutes, passwordLogin: accounts.passwordLogin, historyLimit: store.historyLimit });
+    return state;
   });
 
   // ---- check-in (create or update) --------------------------------------
@@ -342,6 +375,24 @@ export function buildApp({ config, store, accounts, oidc }) {
     const history = store.history(req.params.id, { limit: req.query.limit });
     if (!rec && !history.length) return reply.code(404).send({ ok: false, error: 'Not found' });
     return { id: req.params.id, record: rec, history };
+  });
+
+  // Graph data: only the requested fields, optionally only the last `minutes` (or `minutes=all`).
+  app.get('/api/records/:id/metrics', view, async (req, reply) => {
+    const q = req.query || {};
+    const fields = String(q.fields || '').split(',').map((f) => f.trim()).filter(Boolean);
+    if (!fields.length || fields.length > 40 || fields.some((f) => !/^[A-Za-z0-9_.-]{1,64}$/.test(f))) throw new HttpError(400, 'fields must list 1 to 40 field names');
+    let sinceIso = null;
+    const now = Date.now();
+    if (q.minutes !== undefined && q.minutes !== 'all') {
+      const m = Number(q.minutes);
+      if (!Number.isFinite(m) || m < 1 || m > 5_256_000) throw new HttpError(400, 'minutes must be a number from 1 up, or "all"');
+      sinceIso = new Date(now - m * 60_000).toISOString();
+    }
+    const rec = store.get(req.params.id);
+    const m = store.metrics(req.params.id, { fields, sinceIso });
+    if (!rec && !m.earliest) return reply.code(404).send({ ok: false, error: 'Not found' });
+    return { id: req.params.id, now: new Date(now).toISOString(), record: rec, history: m.rows, earliest: m.earliest, truncated: m.truncated };
   });
 
   app.get('/api/history', view, async (req) => {

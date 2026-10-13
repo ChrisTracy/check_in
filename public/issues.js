@@ -324,7 +324,7 @@
     // One chip per problem name: a problem that started and cleared several times counts once.
     const byName = (list) => { const seen = new Set(); return list.filter((p) => !seen.has(p.name) && seen.add(p.name)); };
     const uniq = byName(done ? i.problems : active);
-    const chips = uniq.slice(0, max).map((p) => `<span class="iss-chip ${esc(p.severity)}${p.clearedAt ? ' done' : ''}">${esc(p.name)}</span>`).join('');
+    const chips = uniq.slice(0, max).map((p) => `<span class="iss-chip ${esc(p.severity)}${p.clearedAt ? ' done' : ''}${p.ignoredUntil && !p.clearedAt ? ' ign' : ''}">${esc(p.name)}</span>`).join('');
     const more = uniq.length - Math.min(max, uniq.length);
     const activeNames = new Set(active.map((p) => p.name));
     const cleared = done ? 0 : new Set(i.problems.filter((p) => p.clearedAt && !activeNames.has(p.name)).map((p) => p.name)).size;
@@ -462,7 +462,7 @@
     const problems = d.problems.map((p) => `<div class="iss-prob${p.clearedAt ? ' done' : ''}">
         <div class="iss-prob-head"><span class="iss-chip ${esc(p.severity)}${p.clearedAt ? ' done' : ''}">${esc(p.name)}</span>
           <span class="muted">${esc(p.rule)}</span>
-          <span class="iss-prob-state">${p.clearedAt ? `<span class="tag">${p.clearedHow === 'cleared' ? 'Cleared' : p.clearedHow === 'closed' ? 'Closed by hand' : p.clearedHow === 'rule' ? 'Rule removed' : 'Device deleted'}</span>` : '<span class="tag off">Active</span>'}</span></div>
+          <span class="iss-prob-state">${p.clearedAt ? `<span class="tag">${p.clearedHow === 'cleared' ? 'Cleared' : p.clearedHow === 'closed' ? 'Closed by hand' : p.clearedHow === 'rule' ? 'Rule removed' : 'Device deleted'}</span>` : (p.ignoredUntil ? `<span class="tag" title="Ignored by ${esc(p.ignoredBy || '')}">Ignored until ${esc(absTime(p.ignoredUntil))}</span>${work && open ? ` <button class="btn sm" data-unmute="${esc(p.ruleId)}">Stop ignoring</button>` : ''}` : '<span class="tag off">Active</span>')}</span></div>
         <div class="iss-prob-times">
           <span>Started <b title="${esc(absTime(p.startedAt))}">${esc(absTime(p.startedAt))}</b>${p.startValue ? ` · <code>${esc(p.startValue)}</code>` : ''}</span>
           ${p.clearedAt ? `<span>Ended <b>${esc(absTime(p.clearedAt))}</b> after ${esc(duration(p.startedAt, p.clearedAt))}${p.clearValue ? ` · <code>${esc(p.clearValue)}</code>` : ''}</span>` : `<span>Ongoing for ${esc(duration(p.startedAt))}</span>`}
@@ -551,18 +551,34 @@
 
   function ignoreDialog() {
     const d = S.detail;
+    const live = [];
+    for (const p of d.problems) if (!p.clearedAt && !live.some((x) => x.ruleId === p.ruleId)) live.push(p);
+    const free = live.filter((p) => !p.ignoredUntil);
     modal({
       title: `Ignore issue #${d.id}`,
-      body: `<p>Hides it from the Open list for a while. It stays on the device's record and keeps tracking problems: if they all clear it closes, and a <b>new kind of problem</b> on this device brings it back to Open straight away.</p>
+      body: `<p>Hides it from the Open list for a while. It keeps tracking problems on the device's record.</p>
+        <div class="iss-scope">
+          <label class="radio-card"><input type="radio" name="scope" value="device" checked><span><b>Entire device</b><small class="muted">Everything on this device. If all problems clear it closes; a <b>new kind of problem</b> brings it back to Open.</small></span></label>
+          <label class="radio-card"><input type="radio" name="scope" value="problems"><span><b>Only these problems</b><small class="muted">Just the ones you tick. They stay ignored on this device, even after the issue closes, until the time is up.</small>
+            <span class="iss-scope-list">${free.map((p) => `<label class="iss-scope-item"><input type="checkbox" name="prob" value="${esc(p.ruleId)}"><span class="iss-chip ${esc(p.severity)}">${esc(p.name)}</span></label>`).join('')}</span></span></label>
+        </div>
+        <p class="muted" style="margin:12px 0 6px">For how long?</p>
         <div class="iss-ign">${IGNORE_PRESETS.map(([m, l], i) => `<label class="radio-card"><input type="radio" name="ign" value="${m}" ${i === 1 ? 'checked' : ''}><span><b>${l}</b></span></label>`).join('')}
           <label class="radio-card"><input type="radio" name="ign" value="custom"><span><b>Custom</b><span class="iss-ign-custom"><input class="input" type="number" id="ignN" min="1" value="2"><select class="select" id="ignU"><option value="60">hours</option><option value="1440">days</option><option value="1">minutes</option></select></span></span></label></div>`,
       actions: [{ label: 'Cancel' }, { label: 'Ignore', cls: 'primary', onClick: async () => {
         const v = $('input[name=ign]:checked').value;
         const minutes = v === 'custom' ? Math.round(Number($('#ignN').value) * Number($('#ignU').value)) : Number(v);
-        return (await act('/ignore', { minutes }, 'Ignored')) ? undefined : false;
+        const body = { minutes };
+        if ($('input[name=scope]:checked').value === 'problems') {
+          body.problems = [...document.querySelectorAll('input[name=prob]:checked')].map((c) => c.value);
+          if (!body.problems.length) { toast('Tick at least one problem, or choose Entire device', 'error'); return false; }
+        }
+        return (await act('/ignore', body, 'Ignored')) ? undefined : false;
       } }],
     });
     $('#ignN').addEventListener('focus', () => { $('input[name=ign][value=custom]').checked = true; });
+    document.querySelectorAll('input[name=prob]').forEach((c) => c.addEventListener('change', () => { $('input[name=scope][value=problems]').checked = true; }));
+    if (!free.length) { const r = $('input[name=scope][value=problems]'); r.disabled = true; r.closest('label').classList.add('disabled'); }
   }
 
   function closeDialog() {
@@ -773,6 +789,8 @@
       if (a === 'close') closeDialog();
     });
     $('#dBody').addEventListener('click', (e) => {
+      const m = e.target.closest('[data-unmute]');
+      if (m) { act('/unignore', { problems: [m.dataset.unmute] }, 'No longer ignoring that problem'); return; }
       const b = e.target.closest('[data-del-note]');
       if (!b) return;
       modal({ title: 'Delete this note?', body: '<p>It is removed from the issue for everyone.</p>', actions: [{ label: 'Cancel' }, { label: 'Delete', cls: 'danger solid', onClick: async () => {

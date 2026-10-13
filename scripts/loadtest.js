@@ -1,6 +1,7 @@
 // Load test with no dependencies: fires many concurrent check-ins at the API.
 // Usage: node scripts/loadtest.js [url] [connections] [seconds] [distinctIds]
 // Set API_KEY in the environment if the server requires one.
+// Set TOP_PROCS=1 to also send top_cpu (a text line when cpu is over 85, otherwise null), like the agent's topprocs group.
 // Set CHECK_PORTS=45389 (for example) to add check_ports to every check-in, so the server also tests
 // that port on this machine each time (port checks must be on in Admin > Port checks, and the
 // per-address limit raised there, since every request comes from this one address).
@@ -22,6 +23,7 @@ let total = 0;
 let ok = 0;
 let non2xx = 0;
 let errors = 0;
+const topProcs = !!process.env.TOP_PROCS;
 const checkPorts = process.env.CHECK_PORTS || '';
 const portResults = {};
 const latencies = [];
@@ -30,11 +32,13 @@ const end = Date.now() + duration * 1000;
 function once() {
   return new Promise((resolve) => {
     const n = Math.floor(Math.random() * ids);
+    const cpu = Math.round(Math.random() * 100);
     const body = JSON.stringify({
       id: `device-${n}`,
       status: statuses[n % 4 === 0 ? Math.floor(Math.random() * 4) : 0],
       site: sites[n % sites.length],
-      cpu: Math.round(Math.random() * 100),
+      cpu,
+      ...(topProcs ? { top_cpu: cpu > 85 ? `java ${Math.round(cpu * 0.5)}%, chrome ${Math.round(cpu * 0.25)}%, nginx ${Math.round(cpu * 0.1)}%` : null } : {}),
       version: `1.${n % 7}.0`,
       ...(checkPorts ? { check_ports: checkPorts } : {}),
     });

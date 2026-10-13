@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Check-In agent for Linux                                         version 2.1.0
+# Check-In agent for Linux                                         version 2.2.0
 #
 # 1. Asks the server whether it is accepting check-ins   (GET  /api/status)
 # 2. Only if it is: gathers the selected details        (CPU sample takes 1s)
@@ -56,7 +56,10 @@
 #   health    processes, failed_services, failed_service_names, reboot_required
 #   updates   pending_updates, security_updates, package_manager, last_update   (slower)
 #   security  firewall_enabled, firewall, selinux, apparmor, secure_boot, disk_encrypted
-#   Lists are comma-separated. "all" = every group; "default" can be combined: "default,security".
+#   topprocs  top_cpu, top_ram, top_disk: the 3 busiest process NAMES, each only while that metric is
+#             over 85% (cpu_pct, ram_pct, disk_busy_pct; set DEFAULT_TOP_THRESHOLD). Off unless asked for
+#             ("all" or --fields default,topprocs); needs the cpu, ram and disk groups; disk needs root
+#   Lists are comma-separated. "all" = every group; "default" can be combined: "default,security,topprocs".
 #
 # EXIT CODES   0 sent (or dry run)   2 server paused, nothing sent   1 error
 #
@@ -82,15 +85,16 @@ DEFAULT_FIELDS="default"        # field groups to send: default, all, or e.g. cp
 DEFAULT_EXCLUDE=""              # field groups to skip
 DEFAULT_EXTRA=""                # extra fields, e.g. 'site=Dallas,owner=${OWNER:-it}' (see --extra)
 DEFAULT_EVERY=5                 # minutes between runs when installing (1-59)
+DEFAULT_TOP_THRESHOLD=85       # topprocs group: list the top processes while CPU, RAM or disk busy % is above this
 DEFAULT_CHECK_PORTS=""          # ports the server tests on each check-in, e.g. "22" (needs Admin > Port checks)
 # What "default" means (the groups sent when nothing else is chosen):
 DEFAULT_GROUPS="system cpu ram disk time uptime network domain users health"
 # ----------------------------------------------------------------------------------------------
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 INSTALL_PATH="/usr/local/bin/checkin-agent"
 DEFAULT_CONFIG="/etc/check-in/agent.conf"
-ALL_GROUPS="system cpu ram disk time uptime network domain users health updates security"
+ALL_GROUPS="system cpu ram disk time uptime network domain users health updates security topprocs"
 
 LOG_TO_SYSLOG=0
 [ -t 2 ] || { command -v logger >/dev/null 2>&1 && LOG_TO_SYSLOG=1; }
@@ -142,6 +146,8 @@ if [ -r "$CONFIG" ]; then
   # shellcheck disable=SC1090
   . "$CONFIG"
 fi
+TOP_THRESHOLD="${CHECKIN_TOP_THRESHOLD:-$DEFAULT_TOP_THRESHOLD}"
+case "$TOP_THRESHOLD" in ''|*[!0-9]*) TOP_THRESHOLD=85 ;; esac
 pick() { local v; for v in "$@"; do [ -n "$v" ] && { printf '%s' "$v"; return; }; done; }
 # A saved value from the config file, or nothing with --replace-settings (for the options the
 # installer manages, so re-running it leaves exactly what was chosen).
@@ -380,21 +386,53 @@ read_cpu() { awk '/^cpu /{idle=$5+$6; t=0; for(i=2;i<=NF;i++) t+=$i; print t, id
 # name and milliseconds spent doing I/O (field 13), the number iostat's %util is based on.
 DISK_LIST=$(ls /sys/block 2>/dev/null | grep -vE '^(loop|ram|zram|dm-|md|sr|fd|nbd)')
 read_disks() { awk -v list="$DISK_LIST" 'BEGIN{n=split(list, a, "\n"); for (i = 1; i <= n; i++) ok[a[i]] = 1} ($3 in ok){print $3, $13}' /proc/diskstats 2>/dev/null; }
+# Per-process snapshot for the topprocs group, one line per process NAME (processes sharing a name are
+# added up): name, CPU ticks (user + system), resident pages, bytes read, bytes written.
+# /proc/<pid>/io is only readable as root; without it the byte counts are left out.
+snap_procs() {
+  # grep -H keeps going past processes that exit meanwhile or whose files can't be read (awk would stop).
+  grep -H '' /proc/[0-9]*/stat $( [ "$IS_ROOT" = 1 ] && echo /proc/[0-9]*/io ) 2>/dev/null | awk '
+    {
+      c = index($0, ":"); if (!c) next
+      path = substr($0, 1, c - 1); line = substr($0, c + 1)
+    }
+    path ~ /\/stat$/ {
+      i = index(line, "("); j = 0
+      for (k = length(line); k > 0; k--) if (substr(line, k, 1) == ")") { j = k; break }
+      if (!i || !j) next
+      name = substr(line, i + 1, j - i - 1); gsub(/[ ,]/, "_", name)
+      split(substr(line, j + 2), f, " ")
+      pn[path] = name; cpu[name] += f[12] + f[13]; rss[name] += f[22]; seen[name] = 1
+      next
+    }
+    path ~ /\/io$/ {
+      p2 = path; sub(/\/io$/, "/stat", p2); name = pn[p2]
+      if (name == "") next
+      split(line, kv, " ")
+      if (kv[1] == "read_bytes:") rd[name] += kv[2]
+      if (kv[1] == "write_bytes:") wr[name] += kv[2]
+    }
+    END { for (n in seen) print n, cpu[n] + 0, rss[n] + 0, rd[n] + 0, wr[n] + 0 }'
+}
 now_ms() { local n; n=$(date +%s%N 2>/dev/null); case "$n" in ''|*N*) echo "";; *) echo $((n / 1000000));; esac; }
+P1="" PMS1="" PMS2=""
 if want cpu || want disk; then
   T1=0 I1=0 T2=0 I2=0 D1="" D2=""
   want cpu && read -r T1 I1 <<<"$(read_cpu)"
   want disk && D1=$(read_disks)
+  # The "before" process snapshot is always taken (it can't be known yet whether anything will be busy).
+  if want topprocs; then P1=$(snap_procs); PMS1=$(now_ms); fi
   MS1=$(now_ms); sleep 1; MS2=$(now_ms)
   want cpu && read -r T2 I2 <<<"$(read_cpu)"
   want disk && D2=$(read_disks)
   DT_MS=1000; [ -n "$MS1" ] && [ -n "$MS2" ] && [ $((MS2 - MS1)) -gt 0 ] && DT_MS=$((MS2 - MS1))
 fi
 
+CPU_PCT_V="" RAM_PCT_V="" DISK_PCT_V=""
 if want cpu; then
   add_str cpu_model "$(grep -m1 -E '^(model name|Hardware|Model)' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//; s/  */ /g')"
   add_num cpu_cores "$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo)"
-  [ $((T2 - T1)) -gt 0 ] && add_num cpu_pct "$(awk -v dt=$((T2 - T1)) -v di=$((I2 - I1)) 'BEGIN{printf "%.1f", (dt-di)*100/dt}')"
+  [ $((T2 - T1)) -gt 0 ] && { CPU_PCT_V=$(awk -v dt=$((T2 - T1)) -v di=$((I2 - I1)) 'BEGIN{printf "%.1f", (dt-di)*100/dt}'); add_num cpu_pct "$CPU_PCT_V"; }
   read -r L1 L5 L15 _ < /proc/loadavg
   add_num load_1m "$L1"; add_num load_5m "$L5"; add_num load_15m "$L15"
 fi
@@ -403,7 +441,7 @@ if want ram; then
   eval "$(awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{gsub(":","",$1); printf "%s=%s\n", $1, $2}' /proc/meminfo)"
   if [ -n "${MemTotal:-}" ]; then
     MEM_USED=$((MemTotal - ${MemAvailable:-0}))   # MemAvailable counts reclaimable cache as free
-    add_num ram_pct "$(pct $MEM_USED $MemTotal)"
+    RAM_PCT_V=$(pct $MEM_USED $MemTotal); add_num ram_pct "$RAM_PCT_V"
     add_num ram_used_mb $((MEM_USED / 1024))
     add_num ram_total_mb $((MemTotal / 1024))
   fi
@@ -417,7 +455,7 @@ if want disk; then
       !second {a[$1] = $2; next}
       ($1 in a) {u = ($2 - a[$1]) * 100 / dt; if (u > 100) u = 100; if (u < 0) u = 0; if (!f || u > m) m = u; f = 1}
       END {if (f) printf "%.1f", m}')
-    add_num disk_busy_pct "$DISK_BUSY"
+    DISK_PCT_V="$DISK_BUSY"; add_num disk_busy_pct "$DISK_BUSY"
   fi
   read -r D_SIZE D_AVAIL D_PCT <<<"$(df -P -k / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $2, $4, $5}')"
   add_num disk_pct "${D_PCT:-}"
@@ -426,6 +464,61 @@ if want disk; then
   FULLEST=$(df -P -k -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null \
     | awk 'NR>1 && $2>0 {gsub("%","",$5); if ($5+0 > max) {max=$5+0; m=$6}} END{if (m!="") print max, m}')
   if [ -n "$FULLEST" ]; then add_num disk_max_pct "${FULLEST%% *}"; add_str disk_max_mount "${FULLEST#* }"; fi
+fi
+
+# ---- topprocs: the 3 busiest process names, only while a metric is over the threshold ----
+# top_cpu / top_ram / top_disk are text lines such as "sqlservr 38%, chrome 21%, bash 3%". A list is
+# sent only while its metric is above TOP_THRESHOLD (default 85); otherwise the field is cleared with
+# null so an old list never lingers. Only process names are read, never command lines or arguments.
+if want topprocs; then
+  over() { [ -n "${1:-}" ] && awk -v v="$1" -v t="$TOP_THRESHOLD" 'BEGIN{exit !(v + 0 > t + 0)}'; }
+  P2=""
+  if over "$CPU_PCT_V" || over "$RAM_PCT_V" || over "$DISK_PCT_V"; then P2=$(snap_procs); PMS2=$(now_ms); fi
+  PEL_MS=1100; [ -n "$PMS1" ] && [ -n "$PMS2" ] && [ $((PMS2 - PMS1)) -gt 0 ] && PEL_MS=$((PMS2 - PMS1))
+  HZ=$(getconf CLK_TCK 2>/dev/null); HZ=${HZ:-100}
+  PAGE=$(getconf PAGESIZE 2>/dev/null); PAGE=${PAGE:-4096}
+  NCPU=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo); NCPU=${NCPU:-1}
+  top3() {   # $1 = cpu | ram | disk
+    printf '%s\n--\n%s\n' "$P1" "$P2" | awk -v mode="$1" -v ms="$PEL_MS" -v hz="$HZ" -v ncpu="$NCPU" -v page="$PAGE" -v memkb="${MemTotal:-0}" '
+      $1 == "--" {second = 1; next}
+      !second {c1[$1] = $2; r1[$1] = $4; w1[$1] = $5; next}
+      {
+        n = $1; dc = $2 - c1[n]; dr = $4 - r1[n]; dw = $5 - w1[n]
+        if (dc < 0) dc = 0; if (dr < 0) dr = 0; if (dw < 0) dw = 0
+        if (mode == "cpu") v[n] = dc / hz / (ms / 1000) / ncpu * 100
+        else if (mode == "ram") v[n] = $3 * page
+        else v[n] = (dr + dw) / (ms / 1000)
+      }
+      END {
+        out = ""
+        for (k = 0; k < 3; k++) {
+          best = ""; bv = -1
+          for (n in v) if (!(n in used) && v[n] > bv) { bv = v[n]; best = n }
+          if (best == "") break
+          used[best] = 1
+          if (mode == "cpu") { if (bv < 0.5) break; t = sprintf("%s %d%%", best, bv + 0.5) }
+          else if (mode == "ram") {
+            if (bv < 1048576) break
+            sz = bv >= 1073741824 ? sprintf("%.1f GB", bv / 1073741824) : sprintf("%d MB", bv / 1048576 + 0.5)
+            t = memkb > 0 ? sprintf("%s %s (%d%%)", best, sz, bv / 1024 * 100 / memkb + 0.5) : sprintf("%s %s", best, sz)
+          } else { if (bv < 100000) break; t = sprintf("%s %.1f MB/s", best, bv / 1000000) }
+          out = out (out == "" ? "" : ", ") t
+        }
+        print out
+      }'
+  }
+  add_top() {   # name, metric value, mode
+    local line=""
+    if [ -n "$P2" ] && over "$2"; then
+      line=$(top3 "$3")
+      # Disk activity per process needs root; without it nothing honest can be said.
+      [ "$3" = disk ] && [ "$IS_ROOT" != 1 ] && line=""
+    fi
+    if [ -n "$line" ]; then add_str "$1" "$line"; else FIELDS_JSON+=("$(json_str "$1"):null"); fi
+  }
+  want cpu && add_top top_cpu "$CPU_PCT_V" cpu
+  want ram && add_top top_ram "$RAM_PCT_V" ram
+  want disk && add_top top_disk "$DISK_PCT_V" disk
 fi
 
 if want time; then

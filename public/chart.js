@@ -21,13 +21,14 @@
   const fmt = (v) => (v === null || v === undefined ? '—' : (Math.round(v * 10) / 10).toLocaleString() + '%');
 
   /** Turn a record + its history into chart series. Returns null when there is nothing to plot. */
-  function extract(record, history) {
+  function extract(record, history, { since = null } = {}) {
     const snaps = [...history].sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
       .map((h) => ({ t: Date.parse(h.at), data: h.data || {} }));
-    // The current record is the newest point (covers HISTORY_LIMIT=0 and fresh changes).
+    // The current record is the newest point (covers HISTORY_LIMIT=0 and fresh changes),
+    // unless it is older than the time window being shown.
     if (record) {
       const t = Date.parse(record.modified);
-      if (!snaps.length || snaps[snaps.length - 1].t < t) snaps.push({ t, data: record });
+      if ((!snaps.length || snaps[snaps.length - 1].t < t) && (since === null || t >= since)) snaps.push({ t, data: record });
     }
     const series = [];
     for (const m of METRICS) {
@@ -37,7 +38,7 @@
       if (pts.some((p) => p.v !== null)) series.push({ ...m, field, pts });
     }
     if (!series.length) return null;
-    return { series, times: snaps.map((s) => s.t) };
+    return { series, times: snaps.map((s) => s.t), domain: null };
   }
 
   function timeFmt(spanMs) {
@@ -55,12 +56,14 @@
     const iw = W - m.l - m.r;
     const ih = H - m.t - m.b;
     const visible = series.filter((s) => !hidden.has(s.key));
-    const t0 = times[0];
-    const t1 = times[times.length - 1];
+    // A fixed time window (model.domain) keeps the axis the same length even when check-ins only cover part of it.
+    const t0 = model.domain ? model.domain[0] : times[0];
+    const t1 = model.domain ? model.domain[1] : times[times.length - 1];
     const span = Math.max(1, t1 - t0);
+    const single = !model.domain && times.length === 1;
     let vmax = 100;
     for (const s of visible) for (const p of s.pts) if (p.v !== null && p.v > vmax) vmax = Math.ceil(p.v / 25) * 25;
-    const x = (t) => (times.length === 1 ? m.l + iw / 2 : m.l + ((t - t0) / span) * iw);
+    const x = (t) => (single ? m.l + iw / 2 : m.l + ((t - t0) / span) * iw);
     const y = (v) => m.t + ih - (Math.max(0, v) / vmax) * ih;
 
     // Gridlines and y labels every 25%.
@@ -80,7 +83,7 @@
     }
     // X ticks: up to 5, evenly spaced in time.
     const tf = new Intl.DateTimeFormat(undefined, timeFmt(span));
-    const nt = times.length === 1 ? 1 : Math.min(5, Math.max(2, Math.floor(iw / 110)));
+    const nt = single ? 1 : Math.min(5, Math.max(2, Math.floor(iw / 110)));
     let xt = '';
     for (let i = 0; i < nt; i++) {
       const t = nt === 1 ? t0 : t0 + (span * i) / (nt - 1);

@@ -159,6 +159,13 @@ function reading(rule, rec) {
   if (rule.clear.mode === 'custom' && rule.clear.field !== f) parts.push(`${rule.clear.field} = ${show(rec[rule.clear.field]) || '(empty)'}`);
   return parts.join(', ');
 }
+/** Opt-in "top processes" text the agent sent for the metric this rule watches (cpu_pct -> top_cpu, ...). */
+const TOP_FOR = { cpu_pct: 'top_cpu', load_1m: 'top_cpu', ram_pct: 'top_ram', swap_pct: 'top_ram', disk_busy_pct: 'top_disk' };
+function topLine(rule, rec) {
+  const k = TOP_FOR[rule.field];
+  const v = k && rec && rec[k];
+  return typeof v === 'string' && v.trim() ? `top: ${v.trim()}` : '';
+}
 const inARow = (n) => (n > 1 ? ` on ${n} check-ins in a row` : '');
 export function describeRule(r) {
   if (r.kind === 'stale') return `No check-in for ${r.value} min`;
@@ -240,7 +247,18 @@ export class Issues {
         PRIMARY KEY (rule_id, record_id)
       );
       CREATE INDEX IF NOT EXISTS idx_issue_watch_record ON issue_watch(record_id);
+      -- "Ignore these problems on this device": per device and rule, so it outlives the issue it was set on.
+      CREATE TABLE IF NOT EXISTS issue_mutes (
+        record_id TEXT NOT NULL,
+        rule_id   TEXT NOT NULL,
+        until     TEXT NOT NULL,
+        by        TEXT,
+        at        TEXT NOT NULL,
+        PRIMARY KEY (record_id, rule_id)
+      );
     `);
+    const icols = new Set(db.prepare('PRAGMA table_info(issues)').all().map((c) => c.name));
+    if (!icols.has('ignore_scope')) db.exec('ALTER TABLE issues ADD COLUMN ignore_scope TEXT');   // device | problems
     // Databases from before check-in counts: add the columns.
     const cols = new Set(db.prepare('PRAGMA table_info(issue_watch)').all().map((c) => c.name));
     for (const [c, def] of [['trig_count', 'INTEGER NOT NULL DEFAULT 0'], ['clear_count', 'INTEGER NOT NULL DEFAULT 0'], ['last_version', 'INTEGER']]) {
@@ -255,8 +273,10 @@ export class Issues {
       watchDelRule: db.prepare('DELETE FROM issue_watch WHERE rule_id = ?'),
       insIssue: db.prepare('INSERT INTO issues (record_id, status, opened_at, assigned_to, assigned_name, snapshot, updated) VALUES (?, ?, ?, ?, ?, ?, ?)'),
       getIssue: db.prepare('SELECT * FROM issues WHERE id = ?'),
-      setStatus: db.prepare('UPDATE issues SET status = ?, ignored_until = ?, ignored_by = ?, updated = ? WHERE id = ?'),
-      close: db.prepare("UPDATE issues SET status = 'closed', closed_at = ?, closed_by = ?, close_reason = ?, ignored_until = NULL, updated = ? WHERE id = ?"),
+      setStatus: db.prepare('UPDATE issues SET status = ?, ignored_until = ?, ignored_by = ?, ignore_scope = ?, updated = ? WHERE id = ?'),
+      muteSet: db.prepare('INSERT INTO issue_mutes (record_id, rule_id, until, by, at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(record_id, rule_id) DO UPDATE SET until = excluded.until, by = excluded.by, at = excluded.at'),
+      muteDel: db.prepare('DELETE FROM issue_mutes WHERE record_id = ? AND rule_id = ?'),
+      close: db.prepare("UPDATE issues SET status = 'closed', closed_at = ?, closed_by = ?, close_reason = ?, ignored_until = NULL, ignore_scope = NULL, updated = ? WHERE id = ?"),
       assign: db.prepare('UPDATE issues SET assigned_to = ?, assigned_name = ?, updated = ? WHERE id = ?'),
       touch: db.prepare('UPDATE issues SET updated = ? WHERE id = ?'),
       insProblem: db.prepare('INSERT INTO issue_problems (issue_id, rule_id, name, severity, rule_text, started_at, added_at, start_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
@@ -271,6 +291,12 @@ export class Issues {
     this.watch = new Map();
     for (const w of db.prepare('SELECT * FROM issue_watch').all()) {
       this.watch.set(this.#key(w.rule_id, w.record_id), { t: w.trig_since, n: w.trig_count || 0, c: w.clear_since, m: w.clear_count || 0, s: Boolean(w.suppressed), v: w.last_version ?? null });
+    }
+    /** recordId -> Map ruleId -> { until, by }: problems ignored on a device (see ignore()) */
+    this.mutes = new Map();
+    for (const m of db.prepare('SELECT * FROM issue_mutes').all()) {
+      if (!this.mutes.has(m.record_id)) this.mutes.set(m.record_id, new Map());
+      this.mutes.get(m.record_id).set(m.rule_id, { until: m.until, by: m.by });
     }
     /** recordId -> { id, status, active: Map ruleId -> problem row id, seen: Set ruleId } for open/ignored issues */
     this.open = new Map();
@@ -378,6 +404,8 @@ export class Issues {
           if (o.active.has(r.id)) this.#clearProblem(rid, r, { how: 'rule', text: `${r.name} removed: its rule was ${before.has(r.id) && next.some((x) => x.id === r.id) ? 'turned off' : 'deleted'} by ${by.name}` });
         }
         this.s.watchDelRule.run(r.id);
+        this.db.prepare('DELETE FROM issue_mutes WHERE rule_id = ?').run(r.id);
+        for (const [rec, byRule] of [...this.mutes]) { byRule.delete(r.id); if (!byRule.size) this.mutes.delete(rec); }
       }
       // Problems still open take the rule's new name, severity and wording (closed history keeps the old ones).
       const upd = this.db.prepare('UPDATE issue_problems SET name = ?, severity = ?, rule_text = ? WHERE rule_id = ? AND cleared_at IS NULL AND (name != ? OR severity != ? OR rule_text != ?)');
@@ -460,8 +488,7 @@ export class Issues {
       } else {
         w.c = null; w.m = 0;
         if (trig && !w.s && w.n >= rule.count) {
-          this.#addProblem(rec, rule, { since: w.t, value: reading(rule, rec) + (rule.count > 1 ? ` (${w.n} check-ins in a row)` : ''), at: now });
-          changed = true;
+          if (this.#addProblem(rec, rule, { since: w.t, value: reading(rule, rec) + (rule.count > 1 ? ` (${w.n} check-ins in a row)` : ''), at: now })) changed = true;
         }
       }
       if (JSON.stringify(w) !== before) this.#saveWatch(k, w);
@@ -470,6 +497,7 @@ export class Issues {
     // Close only after every rule has had its say, so one check-in that ends one problem and
     // starts another keeps a single issue (whatever order the rules are in).
     const o = this.open.get(rec.id);
+    if (o) { if (this.#syncIgnore(rec.id, now)) changed = true; }
     if (o && !o.active.size) this.#allCleared(rec.id, now);
     return changed;
   }
@@ -490,11 +518,25 @@ export class Issues {
     let changed = false;
     const at = new Date(now).toISOString();
     this.db.transaction(() => {
+      // Problems ignored on a device whose time has run out.
+      for (const [recordId, byRule] of [...this.mutes]) {
+        for (const [ruleId, m] of [...byRule]) {
+          if (m.until > at) continue;
+          byRule.delete(ruleId);
+          this.s.muteDel.run(recordId, ruleId);
+          const o = this.open.get(recordId);
+          if (o?.active.has(ruleId)) this.#event(o.id, 'unignored', null, `Ignore ended for ${this.#ruleName(ruleId)} (it was ignored until ${m.until})`, at);
+          changed = true;
+        }
+        if (!byRule.size) this.mutes.delete(recordId);
+      }
+      for (const recordId of [...this.open.keys()]) if (this.#syncIgnore(recordId, at)) changed = true;
       for (const [rid, o] of this.open) {
         if (o.status !== 'ignored') continue;
         const row = this.s.getIssue.get(o.id);
+        if (row.ignore_scope === 'problems') continue; // follows its problems' ignores (above)
         if (row.ignored_until && row.ignored_until <= at) {
-          this.s.setStatus.run('open', null, null, at, o.id);
+          this.s.setStatus.run('open', null, null, null, at, o.id);
           o.status = 'open';
           this.#event(o.id, 'unignored', null, `Ignore ended (it was ignored until ${row.ignored_until})`, at);
           changed = true;
@@ -525,8 +567,7 @@ export class Issues {
           const since = new Date(Date.parse([rec.modified, floor].sort().pop()) + ms).toISOString();
           w.t = since; w.c = null; w.m = 0;
           this.#saveWatch(k, w);
-          this.#addProblem(rec, rule, { since, value: reading(rule, rec), at });
-          changed = true;
+          if (this.#addProblem(rec, rule, { since, value: reading(rule, rec), at })) changed = true;
         }
       }
     })();
@@ -550,8 +591,47 @@ export class Issues {
     this.s.touch.run(at, issueId);
   }
 
+  #ruleName(ruleId) { return this.rules.find((r) => r.id === ruleId)?.name || 'that problem'; }
+  /** Is this rule ignored on this device right now? */
+  #muted(recordId, ruleId, at = nowIso()) {
+    const m = this.mutes.get(recordId)?.get(ruleId);
+    return Boolean(m && m.until > at);
+  }
+
+  /**
+   * An issue whose every active problem is ignored is itself shown as Ignored (it comes back to Open
+   * as soon as one of them isn't). A whole-device ignore ("device" scope) is left alone. Returns true
+   * if the issue's status changed.
+   */
+  #syncIgnore(recordId, at = nowIso()) {
+    const o = this.open.get(recordId);
+    if (!o) return false;
+    const row = this.s.getIssue.get(o.id);
+    if (!row || row.status === 'closed') return false;
+    if (row.status === 'ignored' && row.ignore_scope !== 'problems') return false;
+    const live = [...o.active.keys()].filter((r) => !this.#muted(recordId, r, at));
+    const mutes = [...o.active.keys()].map((r) => this.mutes.get(recordId)?.get(r)).filter(Boolean);
+    if (row.status === 'open' && o.active.size && !live.length && mutes.length) {
+      const first = mutes.reduce((a, b) => (a.until <= b.until ? a : b));
+      this.s.setStatus.run('ignored', first.until, first.by, 'problems', at, o.id);
+      o.status = 'ignored';
+      return true;
+    }
+    if (row.status === 'ignored' && (live.length || !o.active.size)) {
+      this.s.setStatus.run('open', null, null, null, at, o.id);
+      o.status = 'open';
+      return true;
+    }
+    return false;
+  }
+
+  /** Returns true if it added a problem (false: that problem is being ignored on this device). */
   #addProblem(rec, rule, { since, value, at }) {
+    const top = topLine(rule, rec);
+    if (top) value = (value ? value + '; ' : '') + top;
+    const muted = this.#muted(rec.id, rule.id, at);
     let o = this.open.get(rec.id);
+    if (!o && muted) return false;
     if (!o) {
       // Back within the reassign window of the last issue closing: give it to the same person.
       let assignee = null;
@@ -572,8 +652,8 @@ export class Issues {
       // Announce it (alerts) when the rule that opened it has "Alert" ticked. Must never throw into the write.
       if (rule.alert) { try { this.onOpened({ issueId: o.id, deviceId: rec.id, rule, value, at }); } catch { /* alerts are best effort */ } }
       if (assignee) this.#event(o.id, 'assigned', null, `Assigned to ${assignee.name}: the problem came back within ${win} min of issue #${assignee.from} closing`, at);
-    } else if (o.status === 'ignored' && !o.seen.has(rule.id)) {
-      this.s.setStatus.run('open', null, null, at, o.id);
+    } else if (o.status === 'ignored' && !o.seen.has(rule.id) && !muted) {
+      this.s.setStatus.run('open', null, null, null, at, o.id);
       o.status = 'open';
       this.#event(o.id, 'unignored', null, `Ignore ended: a new problem started (${rule.name})`, at);
     }
@@ -582,6 +662,8 @@ export class Issues {
     o.active.set(rule.id, Number(info.lastInsertRowid));
     o.seen.add(rule.id);
     this.#event(o.id, 'problem', null, `${rule.name} started ${since && since !== at ? since : ''}`.trim() + (value ? ` — ${value}` : '') + ` [${describeRule(rule)}]`, at);
+    this.#syncIgnore(rec.id, at);
+    return true;
   }
 
   #clearProblem(recordId, rule, { how, value = '', text, at = nowIso(), deferClose = false }) {
@@ -591,6 +673,7 @@ export class Issues {
     this.s.clearProblem.run(at, value, how, pid);
     o.active.delete(rule.id);
     this.#event(o.id, 'cleared', null, text || `${rule.name} cleared${value ? ` — ${value}` : ''} [${describeClear(rule)}]`, at);
+    this.#syncIgnore(recordId, at);
     if (!o.active.size && !deferClose) this.#allCleared(recordId, at);
   }
 
@@ -631,9 +714,9 @@ export class Issues {
           this.#closeIssue(id, null, reason);
           dirty = true;
         }
-        if (!all) this.s.watchDelRecord.run(id);
+        if (!all) { this.s.watchDelRecord.run(id); this.db.prepare('DELETE FROM issue_mutes WHERE record_id = ?').run(id); this.mutes.delete(id); }
       }
-      if (all) { this.db.exec('DELETE FROM issue_watch'); this.watch.clear(); }
+      if (all) { this.db.exec('DELETE FROM issue_watch; DELETE FROM issue_mutes'); this.watch.clear(); this.mutes.clear(); }
       else if (ids.length) {
         const gone = new Set(ids);
         for (const k of [...this.watch.keys()]) if (gone.has(k.slice(k.indexOf('\0') + 1))) this.watch.delete(k);
@@ -677,7 +760,13 @@ export class Issues {
     return this.get(id);
   }
 
-  ignore(id, minutes, user) {
+  /**
+   * Ignore an issue for a while. With no `problems` it is the whole device (the issue leaves the Open
+   * list; a new kind of problem brings it back). With `problems` (rule ids from its active problems) only
+   * those are ignored, on this device, for that long: the others still count, and the ignore keeps
+   * applying if the issue closes and the problem comes back inside the time.
+   */
+  ignore(id, minutes, user, problems) {
     this.#mustBeOn();
     const row = this.#row(id);
     const o = this.#openFor(row);
@@ -685,25 +774,50 @@ export class Issues {
     if (!Number.isFinite(m) || m < 1 || m > MAX_IGNORE_MIN) throw new HttpError(400, `Ignore for between 1 minute and ${MAX_IGNORE_MIN / 1440} days`);
     const at = nowIso();
     const until = new Date(Date.now() + m * 60000).toISOString();
-    this.db.transaction(() => {
-      this.s.setStatus.run('ignored', until, user.name, at, row.id);
-      o.status = 'ignored';
-      this.#event(row.id, 'ignored', user, `Ignored by ${user.name} until ${until} (${fmtMinutes(m)})`, at);
-    })();
+    if (problems === undefined || problems === null || problems === 'all') {
+      this.db.transaction(() => {
+        this.s.setStatus.run('ignored', until, user.name, 'device', at, row.id);
+        o.status = 'ignored';
+        this.#event(row.id, 'ignored', user, `Ignored by ${user.name} until ${until} (${fmtMinutes(m)})`, at);
+      })();
+    } else {
+      if (!Array.isArray(problems) || !problems.length || problems.some((r) => typeof r !== 'string')) throw new HttpError(400, 'problems must be "all" or a list of the problems to ignore');
+      const rules = [...new Set(problems)];
+      const bad = rules.filter((r) => !o.active.has(r));
+      if (bad.length) throw new HttpError(400, 'Only problems that are happening now can be ignored');
+      this.db.transaction(() => {
+        let byRule = this.mutes.get(row.record_id);
+        if (!byRule) this.mutes.set(row.record_id, byRule = new Map());
+        for (const r of rules) { byRule.set(r, { until, by: user.name }); this.s.muteSet.run(row.record_id, r, until, user.name, at); }
+        this.#event(row.id, 'ignored', user, `${rules.map((r) => this.#ruleName(r)).join(', ')} ignored on this device by ${user.name} until ${until} (${fmtMinutes(m)})`, at);
+        this.#syncIgnore(row.record_id, at);
+      })();
+    }
     this.onChange();
     return this.get(id);
   }
 
-  unignore(id, user) {
+  /** Stop ignoring: the whole device (and every ignored problem), or just the listed problems (rule ids). */
+  unignore(id, user, problems) {
     this.#mustBeOn();
     const row = this.#row(id);
     const o = this.#openFor(row);
-    if (o.status !== 'ignored') return this.get(id);
     const at = nowIso();
+    const list = Array.isArray(problems) && problems.length ? [...new Set(problems.filter((r) => typeof r === 'string'))] : null;
+    const byRule = this.mutes.get(row.record_id);
+    const mutedHere = byRule ? [...byRule.keys()] : [];
+    const fresh = list ? list.filter((r) => mutedHere.includes(r)) : mutedHere;
+    if (!list && o.status !== 'ignored' && !fresh.length) return this.get(id);
+    if (list && !fresh.length) return this.get(id);
     this.db.transaction(() => {
-      this.s.setStatus.run('open', null, null, at, row.id);
-      o.status = 'open';
-      this.#event(row.id, 'unignored', user, `No longer ignored (${user.name})`, at);
+      for (const r of fresh) { byRule.delete(r); this.s.muteDel.run(row.record_id, r); }
+      if (byRule && !byRule.size) this.mutes.delete(row.record_id);
+      if (!list && o.status === 'ignored') {
+        this.s.setStatus.run('open', null, null, null, at, row.id);
+        o.status = 'open';
+      }
+      this.#event(row.id, 'unignored', user, list || fresh.length ? `No longer ignoring ${fresh.map((r) => this.#ruleName(r)).join(', ')} (${user.name})` : `No longer ignored (${user.name})`, at);
+      this.#syncIgnore(row.record_id, at);
     })();
     this.onChange();
     return this.get(id);
@@ -747,7 +861,8 @@ export class Issues {
   clearAll() {
     const n = this.db.prepare('SELECT COUNT(*) AS n FROM issues').get().n;
     this.db.transaction(() => {
-      this.db.exec('DELETE FROM issue_events; DELETE FROM issue_problems; DELETE FROM issues;');
+      this.db.exec('DELETE FROM issue_events; DELETE FROM issue_problems; DELETE FROM issues; DELETE FROM issue_mutes;');
+      this.mutes.clear();
       // Problems that are still happening open fresh issues; manual-close holds are forgotten too.
       for (const [k, w] of [...this.watch]) { w.s = false; w.c = null; w.m = 0; this.#saveWatch(k, w); }
     })();
@@ -760,13 +875,19 @@ export class Issues {
   // ------------------------------------------------------------ reading
   #shape(row, problems) {
     const active = problems.filter((p) => !p.cleared_at);
+    const now = nowIso();
+    const mute = (p) => (p.cleared_at ? null : this.mutes.get(row.record_id)?.get(p.rule_id) || null);
+    const muteNow = (p) => { const m = mute(p); return m && m.until > now ? m : null; };
+    // Severity and the title count the problems that still need attention (ignored ones don't), unless that is all there is.
+    const live = active.filter((p) => !muteNow(p));
+    const shown = live.length ? live : active;
     const sevOf = (list) => list.reduce((best, p) => (sevRank(p.severity) > sevRank(best) ? p.severity : best), 'info');
     return {
       id: row.id,
       recordId: row.record_id,
       status: row.status,
-      title: [...new Set((active.length ? active : problems).map((p) => p.name))].join(', ') || '(no problems)',
-      severity: problems.length ? sevOf(active.length ? active : problems) : 'info',
+      title: [...new Set((shown.length ? shown : problems).map((p) => p.name))].join(', ') || '(no problems)',
+      severity: problems.length ? sevOf(shown.length ? shown : problems) : 'info',
       openedAt: row.opened_at,
       closedAt: row.closed_at,
       closedBy: row.closed_by,
@@ -775,6 +896,7 @@ export class Issues {
       assignedName: row.assigned_name,
       ignoredUntil: row.ignored_until,
       ignoredBy: row.ignored_by,
+      ignoreScope: row.status === 'ignored' ? (row.ignore_scope || 'device') : null,
       updated: row.updated,
       activeCount: active.length,
       // Still open with nothing left (only when automatic closing is off).
@@ -782,6 +904,7 @@ export class Issues {
       clearedAt: row.status !== 'closed' && problems.length && !active.length ? problems.map((p) => p.cleared_at).sort().pop() : null,
       problems: problems.map((p) => ({
         id: p.id, ruleId: p.rule_id, name: p.name, severity: p.severity, rule: p.rule_text,
+        ignoredUntil: muteNow(p)?.until || null, ignoredBy: muteNow(p)?.by || null,
         startedAt: p.started_at, addedAt: p.added_at, startValue: p.start_value,
         clearedAt: p.cleared_at, clearValue: p.clear_value, clearedHow: p.cleared_how,
       })),
@@ -949,8 +1072,8 @@ export function registerIssues(app, { issues, can }) {
   });
   app.get('/api/issues/:id', view, async (req) => off(req) || (on(), issues.get(req.params.id)));
   app.put('/api/issues/:id/assign', work, async (req) => issues.assign(req.params.id, req.body?.assignee ?? null, who(req)));
-  app.post('/api/issues/:id/ignore', work, async (req) => issues.ignore(req.params.id, req.body?.minutes, who(req)));
-  app.post('/api/issues/:id/unignore', work, async (req) => issues.unignore(req.params.id, who(req)));
+  app.post('/api/issues/:id/ignore', work, async (req) => issues.ignore(req.params.id, req.body?.minutes, who(req), req.body?.problems));
+  app.post('/api/issues/:id/unignore', work, async (req) => issues.unignore(req.params.id, who(req), req.body?.problems));
   app.post('/api/issues/:id/close', work, async (req) => issues.closeByUser(req.params.id, req.body?.reason, who(req)));
   app.post('/api/issues/:id/notes', work, async (req) => issues.addNote(req.params.id, req.body?.text, who(req)));
   app.delete('/api/issues/:id/notes/:noteId', work, async (req) => issues.deleteNote(req.params.id, req.params.noteId, who(req), can(req.auth.role, 'issueRules')));

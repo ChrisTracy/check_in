@@ -360,6 +360,7 @@
     es.addEventListener('settings', (e) => {
       const st = JSON.parse(e.data);
       S.settings.staleMinutes = st.staleMinutes;
+      if (Number.isInteger(st.historyLimit)) S.config.historyLimit = st.historyLimit;
       scheduleRender(true);
     });
     es.addEventListener('clear', () => {
@@ -1061,6 +1062,28 @@
   let drawerTab = 'fields';
   let drawerData = null;
   const graphHidden = new Set(); // metrics switched off in the Graph tab
+  // Graph time window, in minutes (null = everything stored). It starts at the last 15 minutes.
+  const GRAPH_RANGES = [[15, '15 min'], [60, '1 hour'], [360, '6 hours'], [1440, '24 hours'], [4320, '3 days'], [10080, '7 days'], [43200, '30 days']];
+  let graphRange = 15;
+  let graphData = null;     // { id, range, now, history, earliest, truncated, stale }
+  let graphLoading = false;
+  const spanLabel = (ms) => { const m = Math.round(ms / 60000); return m < 90 ? `${m} min` : m < 2880 ? `${Math.round(m / 60)} hours` : `${Math.round(m / 1440)} days`; };
+  async function loadGraph() {
+    if (graphLoading || !S.selected) return;
+    graphLoading = true;
+    const id = S.selected;
+    const range = graphRange;
+    try {
+      const fields = [...new Set(window.CheckinChart.METRICS.flatMap((m) => m.fields))].join(',');
+      const r = await apiJson(`/api/records/${encodeURIComponent(id)}/metrics?fields=${fields}&minutes=${range === null ? 'all' : range}`);
+      if (S.selected === id) graphData = { id, range, now: Date.parse(r.now), history: r.history, earliest: r.earliest ? Date.parse(r.earliest) : null, truncated: r.truncated, stale: false };
+    } catch (e) {
+      if (S.selected === id) graphData = { id, range, error: e.message, stale: false, history: [], earliest: null };
+    } finally { graphLoading = false; }
+    if (S.selected === id && drawerTab === 'graph') {
+      if (graphRange !== range) loadGraph(); else renderDrawer();
+    }
+  }
   async function openDrawer(id) {
     S.selected = id;
     $('#drawer').classList.add('open');
@@ -1078,6 +1101,7 @@
       const data = await apiJson('/api/records/' + encodeURIComponent(id) + '/history?limit=1000');
       if (S.selected !== id) return;
       drawerData = data;
+      if (graphData && drawerTab === 'graph') graphData.stale = true; // pick up new check-ins
       renderDrawer();
     } catch (e) {
       $('#dBody').innerHTML = `<div class="muted">${esc(e.message)}</div>`;
@@ -1106,12 +1130,32 @@
         <tr class="sys"><td>modified</td><td>${esc(absTime(record.modified))} <span class="muted">(${esc(relTime(record.modified, now))})</span></td></tr>
         <tr class="sys"><td>version</td><td>${record._version}</td></tr></table>`;
     } else if (drawerTab === 'graph') {
-      const n = chart.times.length;
+      const g = graphData && graphData.id === S.selected && graphData.range === graphRange ? graphData : null;
+      const shown = g || (graphData && graphData.id === S.selected ? graphData : null); // keep the old picture while a new range loads
+      if (!g || g.stale) loadGraph();
+      if (!shown) { $('#dBody').innerHTML = '<div class="muted">Loading…</div>'; return; }
+      const R = shown.range;
+      const winStart = R === null ? null : shown.now - R * 60000;
+      const model = window.CheckinChart.extract(record, shown.history, { since: winStart });
+      if (model && R !== null) model.domain = [winStart, shown.now];
+      // Offer the ranges there is data for: those that fit in what is stored, and "All" when it is more than 15 minutes.
+      const span = shown.earliest === null ? 0 : shown.now - shown.earliest;
+      const opts = GRAPH_RANGES.filter(([m]) => m === 15 || m * 60000 <= span).map(([m, l]) => `<button class="mc-range${R === m ? ' on' : ''}" data-range="${m}" aria-pressed="${R === m}">${l}</button>`);
+      if (span > 15 * 60000 && !GRAPH_RANGES.some(([m]) => m * 60000 === Math.round(span))) opts.push(`<button class="mc-range${R === null ? ' on' : ''}" data-range="all" aria-pressed="${R === null}" title="Everything stored for this device">All (${esc(spanLabel(span))})</button>`);
+      const n = model ? model.times.length : 0;
+      const win = R === null ? 'all stored history' : `the last ${(GRAPH_RANGES.find(([m]) => m === R) || [0, R + ' min'])[1]}`;
       const df = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-      $('#dBody').innerHTML = `<div class="muted mc-caption">${n === 1 ? 'Only one check-in so far: the graph fills in as more arrive.' : `${nf.format(n)} check-ins, ${esc(df.format(chart.times[0]))} – ${esc(df.format(chart.times[n - 1]))}.`}
-        ${S.config.historyLimit > 0 ? ` History keeps the last ${nf.format(S.config.historyLimit)} per record (HISTORY_LIMIT).` : S.config.historyLimit === 0 ? ' History is off (HISTORY_LIMIT=0), so only the latest values are shown.' : ''}</div>
+      const note = shown.error ? `Could not load the graph: ${esc(shown.error)}`
+        : !model ? `No check-ins in ${win}. This device last checked in ${esc(relTime(record.modified, now))}: pick a longer range.`
+        : n === 1 ? `One check-in in ${win}${R === 15 ? '. Pick a longer range to see more.' : '.'}`
+        : `${nf.format(n)} check-ins in ${win}${R === null ? ` (${esc(df.format(model.times[0]))} – ${esc(df.format(model.times[n - 1]))})` : ''}.`;
+      const keeps = S.config.historyLimit > 0 ? ` History keeps the last ${nf.format(S.config.historyLimit)} check-ins per device.` : S.config.historyLimit === 0 ? ' History is off, so only the latest values are shown.' : '';
+      $('#dBody').innerHTML = `<div class="mc-ranges" role="group" aria-label="Time range">${opts.join('')}</div>
+        <div class="muted mc-caption">${note}${R === null || (shown.truncated) ? keeps : ''}${shown.truncated ? ' Showing the newest 50,000 points.' : ''}</div>
         <div class="mc" id="dChart"></div>`;
-      const draw = () => window.CheckinChart.render($('#dChart'), chart, {
+      if (!model) { $('#dChart').innerHTML = ''; return; }
+      const chart2 = model;
+      const draw = () => window.CheckinChart.render($('#dChart'), chart2, {
         hidden: graphHidden,
         onToggle: (k) => { if (graphHidden.has(k)) graphHidden.delete(k); else graphHidden.add(k); draw(); },
       });
@@ -1127,9 +1171,16 @@
           ${changesHtml(h.changes, 50)}</li>`).join('')}</ol>`;
     }
   }
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest?.('.mc-range');
+    if (!b || !$('#dBody')?.contains(b)) return;
+    graphRange = b.dataset.range === 'all' ? null : Number(b.dataset.range);
+    loadGraph();
+  });
   function closeDrawer() {
     S.selected = null;
     drawerData = null;
+    graphData = null;
     $('#drawer').classList.remove('open');
     $('#scrim').classList.remove('open');
     $('#drawer').setAttribute('aria-hidden', 'true');

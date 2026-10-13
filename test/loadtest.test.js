@@ -544,3 +544,22 @@ test('load test: Burst and Start are refused while Remove is running, and nothin
   assert.equal((await admin({ method: 'POST', url: '/api/admin/loadtest/burst' })).statusCode, 200);
   await until(() => sims(store).length === 3000, 20000);
 });
+
+test('load test: top processes are opt in; text only when a metric is over 85, else null', async (t) => {
+  const { admin, app, store } = await setup(t);
+  const { LoadTest } = await import('../src/loadtest.js');
+  const lt = new LoadTest({ app, store, log: { info() {}, warn() {}, error() {} } });
+  assert.equal(lt.fields(0).top_cpu, undefined);
+  lt.topProcs = true;
+  const healthy = lt.fields(0);
+  assert.deepEqual([healthy.top_cpu, healthy.top_ram, healthy.top_disk], [null, null, null]);
+  for (const key of ['high_cpu', 'high_memory', 'disk_busy']) lt.scenarios.push({ id: key, key, mode: 'count', amount: 1, set: new Set([0]) });
+  const hot = lt.fields(0);
+  assert.match(hot.top_cpu, /^\S+ \d+%, \S+ \d+%, \S+ \d+%$/);
+  assert.match(hot.top_ram, /^\S+ [\d.]+ GB \(\d+%\), /);
+  assert.match(hot.top_disk, /^\S+ [\d.]+ MB\/s, /);
+  assert.equal((await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { topProcs: 'yes' } })).statusCode, 400);
+  const ok = await admin({ method: 'PUT', url: '/api/admin/loadtest', payload: { topProcs: true } });
+  assert.equal(ok.statusCode, 200);
+  assert.equal((await admin({ url: '/api/admin/loadtest' })).j().topProcs, true);
+});

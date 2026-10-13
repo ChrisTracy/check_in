@@ -36,7 +36,7 @@ export const INSTALL_DEFAULTS = {
   ports: '',
 };
 
-export const AGENT_GROUPS = ['system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 'domain', 'users', 'health', 'updates', 'security'];
+export const AGENT_GROUPS = ['system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 'domain', 'users', 'health', 'updates', 'security', 'topprocs'];
 export const DEFAULT_GROUPS = ['system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 'domain', 'users', 'health'];
 
 const AGENTS = {

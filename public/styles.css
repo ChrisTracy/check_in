@@ -996,7 +996,7 @@ a.btn { text-decoration: none; color: inherit; }
 .iss-snap tr.hl td { background: var(--accent-soft); }
 .iss-snap tr.hl td:first-child { padding-left: 6px; }
 
-.iss-psearch { width: 100%; margin-bottom: 8px; }
+.iss-psearch, .modal label.iss-psearch { width: 100%; margin-bottom: 8px; flex-direction: row; align-items: center; gap: 8px; font-size: 14px; font-weight: 400; }
 .iss-people { max-height: 320px; overflow: auto; display: flex; flex-direction: column; gap: 2px; }
 .iss-person { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border: 0; background: transparent; border-radius: 8px; cursor: pointer; text-align: left; font: inherit; color: inherit; }
 .iss-person:hover, .iss-person:focus-visible { background: var(--hover); outline: none; }
@@ -1237,3 +1237,30 @@ a.locked { pointer-events: none; }
 /* Issue rules: the per-rule "Alert" tick */
 .bx-row .ir-alert, .ir-alert { display: inline-flex; flex-direction: row; flex: 0 0 auto; align-items: center; gap: 6px; font-size: 13px; align-self: flex-end; padding-bottom: 8px; cursor: pointer; white-space: nowrap; }
 .ir-alert input { margin: 0; }
+
+/* Ignore dialog: device vs. individual problems */
+.iss-scope { display: grid; gap: 8px; }
+.iss-scope .radio-card > span { display: block; }
+.iss-scope .radio-card small { display: block; margin: 2px 0 0; line-height: 1.4; }
+.iss-scope .radio-card small b { display: inline; }
+.iss-scope-item input { margin: 0; position: static; }
+.iss-scope-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.iss-scope-item { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.iss-chip.ign { opacity: .55; text-decoration: line-through; }
+.iss-scope .radio-card { display: flex; flex-direction: row; margin: 0; }
+.iss-scope .radio-card > span { flex: 1; min-width: 0; }
+.iss-scope .iss-scope-item { display: inline-flex; flex-direction: row; align-items: center; margin: 0; }
+.iss-scope .radio-card b { display: block; }
+.iss-scope .radio-card small b { display: inline; }
+.iss-scope .radio-card.disabled { opacity: .5; }
+
+.about-ver { font-size: 20px; display: flex; align-items: center; gap: 10px; }
+.admin-section p a { color: var(--accent); }
+
+.mc-ranges { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.mc-range { height: 28px; padding: 0 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text-2); font-size: 12px; font-weight: 550; cursor: pointer; }
+.mc-range:hover { border-color: var(--border-strong); color: var(--text); }
+.mc-range.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+
+.lt-checkrow { display: inline-flex; align-items: center; gap: 6px; height: 34px; font-size: 14px; color: var(--text); cursor: pointer; }
+.lt-check input { accent-color: var(--accent); }

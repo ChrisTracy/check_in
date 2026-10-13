@@ -20,6 +20,7 @@ export const CAPS = {
   delete: 'user',
   clearAll: 'power',
   pause: 'power',
+  historyLimit: 'power',  // how much history each device keeps (lowering it deletes data)
   threshold: 'power',
   teamViews: 'power',
   boxes: 'power',         // set up the status boxes everyone sees
@@ -150,6 +151,8 @@ export class Accounts extends EventEmitter {
     try { this.emit('access', info); } catch { /* a listener's problem must not fail the change */ }
   }
 
+  /** The history limit saved in Settings, or null when none is saved (the HISTORY_LIMIT variable applies). */
+  get historyLimit() { const v = this.getSetting('historyLimit', null); return Number.isInteger(v) ? v : null; }
   get staleMinutes() { return this.getSetting('staleMinutes', 15); }
   get passwordLogin() { return this.getSetting('passwordLogin', true); }
 

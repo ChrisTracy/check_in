@@ -1,7 +1,9 @@
 {
   "name": "check-in-api",
-  "version": "1.0.0",
+  "version": "1.0.27",
   "private": true,
+  "license": "Apache-2.0",
+  "author": "Chris Tracy",
   "description": "High-throughput check-in API with dynamic fields, history, CSV import/export and a live dashboard",
   "type": "module",
   "main": "src/server.js",
@@ -21,10 +23,8 @@
     "acme-client": "^5.4.0",
     "csv-parse": "^7.0.3",
     "fastify": "^5.12.5",
+    "node-forge": "^1.3.1",
     "openid-client": "^6.8.8",
     "selfsigned": "^5.5.0"
-  },
-  "devDependencies": {
-    "node-forge": "^1.3.1"
   }
 }

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import https from 'node:https';
+import forge from 'node-forge';
 import tls from 'node:tls';
 import crypto from 'node:crypto';
 import net from 'node:net';
@@ -73,6 +74,32 @@ function derToPem(der) {
   const b64 = Buffer.from(der).toString('base64').match(/.{1,64}/g).join('\n');
   return `-----BEGIN CERTIFICATE-----\n${b64}\n-----END CERTIFICATE-----\n`;
 }
+
+/**
+ * Old .pfx files (Windows before 2019, old exports using RC2-40 or other legacy encryption) are refused
+ * by OpenSSL 3 ("Unsupported PKCS12 PFX data"). Open them in JavaScript instead and return the
+ * certificate chain (leaf first) and the private key as PEM. RSA keys only.
+ */
+export function pfxToPem(pfx, passphrase = '') {
+  let p12;
+  try {
+    p12 = forge.pkcs12.pkcs12FromAsn1(forge.asn1.fromDer(forge.util.createBuffer(pfx.toString('binary'))), String(passphrase || ''));
+  } catch (e) {
+    const m = String(e.message || e);
+    if (/mac could not be verified|invalid password/i.test(m)) throw new HttpError(400, 'Wrong password for the certificate file');
+    throw new HttpError(400, 'Could not read that .pfx file: ' + m.slice(0, 160));
+  }
+  const bags = (type) => (p12.getBags({ bagType: type })[type] || []);
+  const keyBag = [...bags(forge.pki.oids.pkcs8ShroudedKeyBag), ...bags(forge.pki.oids.keyBag)].find((b) => b.key);
+  if (!keyBag) throw new HttpError(400, 'No RSA private key found in that .pfx file. Export the certificate with its private key, or upload PEM files.');
+  const certs = bags(forge.pki.oids.certBag).map((b) => b.cert).filter(Boolean);
+  if (!certs.length) throw new HttpError(400, 'No certificate found in that .pfx file');
+  const n = keyBag.key.n?.toString(16);
+  const leaf = certs.find((c) => c.publicKey?.n?.toString(16) === n) || certs[0];
+  const chain = [leaf, ...certs.filter((c) => c !== leaf)];
+  return { cert: chain.map((c) => forge.pki.certificateToPem(c)).join(''), key: forge.pki.privateKeyToPem(keyBag.key) };
+}
+const isUnsupportedPfx = (e) => /Unsupported PKCS12|unsupported/i.test(String(e?.message || e));
 
 /** Validate TLS material and describe the leaf certificate. Throws HttpError(400) if unusable. */
 export function inspectMaterial(opts) {
@@ -269,6 +296,11 @@ export class TlsManager {
   async installPfx({ pfx, passphrase, source, by }) {
     if (!pfx?.length) throw new HttpError(400, 'Empty .pfx file');
     if (pfx.length > MAX_PFX) throw new HttpError(400, 'PFX file is too large');
+    try { inspectMaterial({ pfx, passphrase }); } catch (e) {
+      if (!isUnsupportedPfx(e)) throw e;
+      const conv = pfxToPem(pfx, passphrase); // legacy encryption: store as PEM
+      return this.installPem({ cert: conv.cert, key: conv.key, source, by });
+    }
     const info = inspectMaterial({ pfx, passphrase });
     assertCurrent(info);
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
@@ -365,6 +397,13 @@ export class TlsManager {
       pfxPass = String(body.passphrase || '');
       mat = { pfx: buf, passphrase: pfxPass };
       files = { pfx: buf };
+      try { inspectMaterial(mat); } catch (e) {
+        if (!isUnsupportedPfx(e)) throw e;
+        // Legacy encryption OpenSSL 3 refuses: convert once and keep it as PEM (no password needed after).
+        const conv = pfxToPem(buf, pfxPass);
+        mat = files = { cert: conv.cert, key: crypto.createPrivateKey(conv.key).export({ type: 'pkcs8', format: 'pem' }) };
+        pfxPass = '';
+      }
     } else if (type === 'self-signed') {
       const names = parseCertNames(body.hostnames);
       const days = body.days === undefined || body.days === null || body.days === '' ? 365 : Number(body.days);
@@ -409,7 +448,7 @@ export class TlsManager {
     }
     this.#save({
       source: type,
-      pfxSource: type === 'pfx',
+      pfxSource: !!files.pfx,
       pfxPass: pfxPass ? encrypt(this.accounts.secret, pfxPass) : '',
       uploadedAt: new Date().toISOString(),
       uploadedBy: by || null,

@@ -31,6 +31,7 @@
       <div class="lt-control-row">
         <label class="field">Simulated devices<input class="input" type="number" id="devices" min="1" max="20000" step="1"></label>
         <label class="field">Each checks in every<span class="lt-unit"><input class="input" type="number" id="interval" min="1" max="3600" step="1"><span>seconds</span></span></label>
+        <label class="field lt-check" title="Also send top_cpu, top_ram and top_disk (the busiest process names) the way an agent with the topprocs group does, while a device is over 85%"><span>Top processes</span><span class="lt-checkrow"><input type="checkbox" id="topProcs"> include</span></label>
         <div class="field lt-target"><span>Target</span><b id="target">–</b></div>
         <div class="lt-buttons">
           <button class="btn primary" id="startBtn">Start</button>

@@ -69,7 +69,7 @@
     $('#startBtn').textContent = s.running ? 'Stop' : 'Start';
     $('#startBtn').className = 'btn ' + (s.running ? 'danger' : 'primary');
     $('#applyBtn').hidden = !(s.running && dirty);
-    if (!dirty) { $('#devices').value = s.devices; $('#interval').value = s.interval; }
+    if (!dirty) { $('#devices').value = s.devices; $('#interval').value = s.interval; $('#topProcs').checked = Boolean(s.topProcs); }
     updateTarget();
     const last = s.history.at(-1) || {};
     $('#tRate').textContent = nf.format(s.running ? s.rate : last.ok || 0);
@@ -351,7 +351,7 @@
   async function run(path, opts, msg) {
     try { st = await api(path, opts); render(); if (msg) toast(msg); return true; } catch (e) { toast(e.message, 'error'); return false; }
   }
-  const settings = () => ({ devices: Number($('#devices').value), interval: Number($('#interval').value) });
+  const settings = () => ({ devices: Number($('#devices').value), interval: Number($('#interval').value), topProcs: $('#topProcs').checked });
 
   function bind() {
     $('#startBtn').addEventListener('click', async () => {
@@ -368,6 +368,7 @@
         toast(st.burst ? `Burst: ${nf.format(st.burst)} check-ins on their way, up to ${nf.format(st.maxInflight)} at a time${skipped ? ` (${nf.format(skipped)} offline skipped)` : ''}` : 'Nothing to burst: every device is offline');
       } catch (e) { toast(e.message, 'error'); }
     });
+    $('#topProcs').addEventListener('change', () => { dirty = true; $('#applyBtn').hidden = !st?.running; });
     for (const id of ['#devices', '#interval']) {
       $(id).addEventListener('input', () => { dirty = true; updateTarget(); $('#applyBtn').hidden = !st?.running; });
       $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') (st?.running ? $('#applyBtn') : $('#startBtn')).click(); });

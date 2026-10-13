@@ -20,6 +20,7 @@
     ['health', 'Health', 'failed services, reboot needed'],
     ['updates', 'Updates', 'pending updates (slower)'],
     ['security', 'Security', 'firewall, antivirus, encryption'],
+    ['topprocs', 'Top processes', 'busiest process names while CPU, memory or disk is over 85%'],
   ];
   const DEFAULT = ['system', 'cpu', 'ram', 'disk', 'time', 'uptime', 'network', 'domain', 'users', 'health'];
   const ICON = {

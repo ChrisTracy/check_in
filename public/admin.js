@@ -32,7 +32,7 @@
   };
 
   // The capability each tab needs to change anything on it. Controls inside can override with data-cap="...".
-  const TAB_CAP = { prefs: null, checkins: null, users: 'users', sso: 'sso', apikey: 'apiKey', ports: 'portCheckPolicy', issues: 'issuesEnable', alerts: 'alerts', tls: 'tls', reset: 'clearAll', loadtest: 'loadTest' };
+  const TAB_CAP = { prefs: null, checkins: null, about: null, users: 'users', sso: 'sso', apikey: 'apiKey', ports: 'portCheckPolicy', issues: 'issuesEnable', alerts: 'alerts', tls: 'tls', reset: 'clearAll', loadtest: 'loadTest' };
   const ADMIN_CAPS = new Set(['users', 'sso', 'tls', 'portCheckPolicy', 'apiKeyPolicy', 'issuesEnable', 'alerts', 'loadTest']);
   const needRole = (cap) => (ADMIN_CAPS.has(cap) ? 'an Admin' : 'a Power user or Admin');
 
@@ -195,17 +195,79 @@
           <button class="btn primary" id="ciSave">Save</button></div>
         <p class="muted" style="margin:0;font-size:12px">A record is <b>active</b> within the threshold, <b>aging</b> up to twice that, and <b>stale</b> after that. This applies to everyone.</p>
       </div>
-      <div class="admin-section">
+      <div class="admin-section" data-cap="historyLimit" id="ciHist">
         <h4>History</h4>
-        <p class="muted" style="margin:0" data-ro-ok>The server keeps <b>${S.config.historyLimit < 0 ? 'unlimited' : esc(S.config.historyLimit)}</b> history entries per record (<code>HISTORY_LIMIT</code>).</p>
+        <div id="ciHistBody"><div class="muted">Loading…</div></div>
       </div>`;
     wirePause();
+    loadHistoryLimit();
     $('#ciSave').addEventListener('click', async () => {
       const m = Math.floor(Number($('#ciStale').value));
       if (!Number.isFinite(m) || m < 1) { toast('Enter a whole number of minutes (1 or more)', 'error'); return; }
       try { $('#ciStale').value = await UI.saveThreshold(m); toast('Active threshold updated for everyone'); } catch (e) { toast(e.message, 'error'); }
     });
     $('#ciStale').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#ciSave').click(); });
+  }
+  // ---- history limit: how many check-ins each device keeps (power users) ----
+  const sizeText = (b) => (b >= 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b >= 1e6 ? (b / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1e3)) + ' KB');
+  const limitText = (n) => (n < 0 ? 'unlimited' : n === 0 ? 'off' : nf.format(n));
+  async function loadHistoryLimit() {
+    const box = $('#ciHistBody');
+    if (!box) return;
+    if (!UI.can('historyLimit')) {
+      box.innerHTML = `<p class="muted" style="margin:0" data-ro-ok>Each device keeps <b>${esc(limitText(UI.state.config.historyLimit))}</b> history entries.</p>`;
+      return;
+    }
+    let h;
+    try { h = await apiJson('/api/history-limit'); } catch (e) { box.innerHTML = `<div class="warn-box">${esc(e.message)}</div>`; return; }
+    if (!$('#ciHistBody')) return; // the tab changed while loading
+    const unlimited = h.limit < 0;
+    box.innerHTML = `
+      <p class="muted" style="margin:0 0 8px;font-size:13px" data-ro-ok>Check-ins kept for each device, used by History and Graph. Now: <b>${esc(limitText(h.limit))}</b> (${h.source === 'settings' ? 'set here' : `default from <code>HISTORY_LIMIT</code>`}). The database holds ${nf.format(h.rows)} entries, about ${esc(sizeText(h.bytes))}.</p>
+      <div class="copy-row"><input class="input" id="ciHL" type="number" min="0" max="1000000" step="1" value="${unlimited ? '' : esc(h.limit)}" ${unlimited ? 'disabled' : ''} style="width:120px;font-family:inherit;background:var(--surface)" aria-label="History entries per device"><span class="muted">entries per device</span>
+        <label class="switch" style="margin:0 0 0 8px"><input type="checkbox" id="ciHLinf" ${unlimited ? 'checked' : ''}><span class="track"></span><b>Unlimited</b></label>
+        <button class="btn primary" id="ciHLsave">Save</button>
+        ${h.source === 'settings' && h.environmentLimit !== h.limit ? `<button class="btn" id="ciHLreset" title="Go back to the HISTORY_LIMIT value (${esc(limitText(h.environmentLimit))})">Use default</button>` : ''}</div>
+      <p class="muted" style="margin:6px 0 0;font-size:12px">0 turns history off. <b>Lowering the limit deletes older entries straight away. Raising it makes the database, and the disk space it needs, grow.</b></p>`;
+    $('#ciHLinf').addEventListener('change', (e) => { $('#ciHL').disabled = e.target.checked; if (!e.target.checked && $('#ciHL').value === '') $('#ciHL').value = h.environmentLimit >= 0 ? h.environmentLimit : 100; });
+    const wanted = () => ($('#ciHLinf').checked ? -1 : Number($('#ciHL').value));
+    $('#ciHLsave').addEventListener('click', () => {
+      const n = wanted();
+      if ($('#ciHL').value === '' && n !== -1) { toast('Enter a number, or choose Unlimited', 'error'); return; }
+      if (!Number.isInteger(n) || n < -1 || n > 1000000) { toast('Enter a whole number from 0 to 1,000,000', 'error'); return; }
+      if (n === h.limit && h.source === 'settings') { toast('That is already the limit'); return; }
+      confirmHistoryLimit(n, h, false);
+    });
+    $('#ciHLreset')?.addEventListener('click', () => confirmHistoryLimit(h.environmentLimit, h, true));
+  }
+  // Show what the change does before doing it: lowering deletes data, raising needs more disk.
+  async function confirmHistoryLimit(n, h, reset) {
+    let imp;
+    try { imp = await apiJson(`/api/history-limit?limit=${n}`); } catch (e) { toast(e.message, 'error'); return; }
+    const lower = n >= 0 && (h.limit < 0 || n < h.limit);
+    const raise = n < 0 ? h.limit >= 0 : h.limit >= 0 && n > h.limit;
+    const avg = imp.rows ? imp.bytes / imp.rows : 2000;
+    let warn;
+    if (lower) {
+      warn = `<div class="warn-box"><b>This permanently deletes history.</b> ${imp.remove ? `${nf.format(imp.remove)} entries (about ${esc(sizeText(imp.remove * avg))}) older than the newest ${n === 0 ? '0' : nf.format(n)} per device will be removed${n === 0 ? ', which is all of it' : ''}.` : 'No device has more than that, so nothing is deleted right now, but older entries will no longer be kept.'} It cannot be undone. Export first if you might need it.</div>`;
+    } else if (raise) {
+      const est = imp.records * (n < 0 ? 0 : n) * avg;
+      warn = `<div class="warn-box"><b>This increases the disk space needed.</b> ${n < 0 ? 'With no limit the database grows with every check-in and never shrinks on its own.' : `If all ${nf.format(imp.records)} devices fill it, history could reach about ${esc(sizeText(est))} (now ${esc(sizeText(imp.bytes))}).`} Make sure the server has room, and expect larger backups and slower History and Graph for busy devices.</div>`;
+    } else {
+      warn = '<div class="muted">The limit stays the same.</div>';
+    }
+    modal({
+      title: reset ? 'Use the default history limit?' : `Set history to ${limitText(n)}?`,
+      body: `<p>Each device will keep <b>${esc(limitText(n))}</b> entries${reset ? ` (the <code>HISTORY_LIMIT</code> value)` : ''} instead of ${esc(limitText(h.limit))}. This applies to everyone.</p>${warn}`,
+      actions: [{ label: 'Cancel' }, { label: lower ? (imp.remove ? 'Delete entries and save' : 'Save') : 'Save', cls: lower && imp.remove ? 'danger solid' : 'primary', onClick: async () => {
+        try {
+          const r = await apiJson('/api/history-limit', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(reset ? { reset: true } : { limit: n }) });
+          UI.state.config.historyLimit = r.limit;
+          toast(r.removed ? `History limit saved; ${nf.format(r.removed)} entries deleted` : 'History limit saved');
+          loadHistoryLimit();
+        } catch (e) { toast(e.message, 'error'); return false; }
+      } }],
+    });
   }
   function wirePause() { $('#ciPause')?.addEventListener('click', () => UI.togglePause()); }
   // Called when the ingest state changes (pause/resume from here, another tab, or another user).
@@ -222,8 +284,37 @@
     $$('.admin-nav [data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
     $('#aBody').innerHTML = '<div class="muted">Loading…</div>';
     foot('');
-    ({ prefs: loadPrefs, checkins: loadCheckins, users: loadUsers, sso: loadSso, apikey: loadApiKey, tls: loadTls, ports: loadPorts, issues: loadIssuesAdmin, alerts: loadAlerts, reset: loadReset, loadtest: loadLoadtest })[t]();
+    ({ prefs: loadPrefs, checkins: loadCheckins, about: loadAbout, users: loadUsers, sso: loadSso, apikey: loadApiKey, tls: loadTls, ports: loadPorts, issues: loadIssuesAdmin, alerts: loadAlerts, reset: loadReset, loadtest: loadLoadtest })[t]();
     startLocking();
+  }
+
+  // ================================================================== About
+  async function loadAbout() {
+    head('About', 'Which version of Check-In is running');
+    let i;
+    try { i = await apiJson('/api/about'); } catch (e) { $('#aBody').innerHTML = `<div class="warn-box">${esc(e.message)}</div>`; return; }
+    const when = (v) => { const d = v ? new Date(v) : null; return d && !Number.isNaN(d.getTime()) ? d.toLocaleString() : null; };
+    const row = (k, v) => v ? `<tr><td>${k}</td><td>${v}</td></tr>` : '';
+    $('#aBody').innerHTML = `
+      <div class="admin-section">
+        <div class="about-ver"><b>${esc(i.name)}</b> <span class="tag">v${esc(i.version)}</span></div>
+        <table class="kv" style="margin-top:12px">
+          ${row('Version', esc(i.version))}
+          ${row('Build', i.commit ? (i.commitUrl ? `<a href="${esc(i.commitUrl)}" target="_blank" rel="noopener noreferrer"><code>${esc(i.commit)}</code></a>` : `<code>${esc(i.commit)}</code>`) : '')}
+          ${row('Built', esc(when(i.builtAt) || ''))}
+          ${row('Running since', esc(when(i.startedAt) || ''))}
+          ${row('Node.js', esc(i.node))}
+          ${row('Platform', esc(i.platform))}
+          ${row('License', esc(i.license))}
+        </table>
+      </div>
+      <div class="admin-section">
+        <h4>Links</h4>
+        <p><a href="${esc(i.repoUrl)}" target="_blank" rel="noopener noreferrer">Source code on GitHub</a> ·
+          <a href="${esc(i.releasesUrl)}" target="_blank" rel="noopener noreferrer">Releases and what changed</a> ·
+          <a href="${esc(i.issuesUrl)}" target="_blank" rel="noopener noreferrer">Report a problem</a></p>
+        <p class="muted" style="font-size:12px">To check for a newer version, open Releases. Check-In never contacts GitHub on its own.</p>
+      </div>`;
   }
 
   // ================================================================== Users

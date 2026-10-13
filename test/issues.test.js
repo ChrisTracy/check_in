@@ -776,3 +776,136 @@ test('issues: quiet=1 answers { enabled: false } instead of 409 when the list is
     assert.deepEqual(r.j(), { enabled: false });
   }
 });
+
+test('issues: ignore only some problems on a device (and the whole device stays the default)', async (t) => {
+  const { app, A, enable, setRules, checkin, list, one, at } = await setup(t);
+  await enable();
+  const rules = await setRules([
+    { ...CPU, count: 1 },
+    { ...MEM, name: 'High memory', count: 1, clear: { mode: 'auto', count: 1 } },
+  ]);
+  const cpuId = rules.find((r) => r.name === 'High CPU').id;
+  const memId = rules.find((r) => r.name === 'High memory').id;
+  await checkin(0, { cpu_pct: 97, mem_pct: 95 });
+  const id = (await list()).issues[0].id;
+  const ign = (payload) => A.user({ method: 'POST', url: `/api/issues/${id}/ignore`, payload });
+  const unign = (payload = {}) => A.user({ method: 'POST', url: `/api/issues/${id}/unignore`, payload });
+
+  // Bad requests.
+  assert.equal((await ign({ minutes: 60, problems: [] })).statusCode, 400);
+  assert.equal((await ign({ minutes: 60, problems: 'cpu' })).statusCode, 400);
+  assert.equal((await ign({ minutes: 60, problems: ['nope'] })).statusCode, 400, 'only problems happening now');
+  assert.equal((await ign({ minutes: 60, problems: [cpuId, 5] })).statusCode, 400);
+
+  // Ignore just High CPU: the issue stays Open, memory still counts, and the title and severity follow memory.
+  let r = await ign({ minutes: 60, problems: [cpuId] });
+  assert.equal(r.statusCode, 200, r.body);
+  let d = r.j();
+  assert.equal(d.status, 'open');
+  assert.equal(d.title, 'High memory');
+  assert.equal(d.severity, 'warning');
+  const cpu = d.problems.find((p) => p.name === 'High CPU');
+  assert.equal(cpu.ignoredUntil, new Date(T0 + 60 * MIN).toISOString());
+  assert.equal(d.problems.find((p) => p.name === 'High memory').ignoredUntil, null);
+  assert.ok(d.events.some((e) => e.type === 'ignored' && /High CPU ignored on this device/.test(e.text)));
+  assert.equal((await list()).summary.open, 1);
+
+  // Ignore the other one too: now everything left is ignored, so the issue is Ignored (by its problems).
+  d = (await ign({ minutes: 30, problems: [memId] })).j();
+  assert.equal(d.status, 'ignored');
+  assert.equal(d.ignoreScope, 'problems');
+  assert.equal(d.ignoredUntil, new Date(T0 + 30 * MIN).toISOString(), 'wakes up when the first one runs out');
+  assert.equal((await list()).summary.ignored, 1);
+
+  // Memory ends first, so only the ignored CPU problem is left: still Ignored. When its time runs out it is Open again.
+  await checkin(1, { cpu_pct: 97, mem_pct: 10 });
+  assert.equal((await one(id)).status, 'ignored');
+  at(61);
+  app.issues.tick(T0 + 61 * MIN);
+  d = await one(id);
+  assert.equal(d.status, 'open', 'ignore ran out');
+  assert.ok(d.events.some((e) => e.type === 'unignored' && /Ignore ended for High CPU/.test(e.text)));
+  assert.equal(d.problems.find((p) => p.name === 'High CPU').ignoredUntil, null);
+
+  // A new kind of problem brings an issue that was ignored by its problems back to Open straight away.
+  await ign({ minutes: 600, problems: [cpuId] });
+  assert.equal((await one(id)).status, 'ignored');
+  await checkin(62, { cpu_pct: 97, mem_pct: 96 });
+  assert.equal((await one(id)).status, 'open', 'memory (not ignored) is back');
+
+  // Stop ignoring one problem, then everything.
+  d = (await unign({ problems: [cpuId] })).j();
+  assert.equal(d.problems.find((p) => p.name === 'High CPU').ignoredUntil, null);
+  assert.ok(d.events.some((e) => e.type === 'unignored' && /No longer ignoring High CPU/.test(e.text)));
+  await ign({ minutes: 60, problems: [cpuId, memId] });
+  assert.equal((await one(id)).status, 'ignored');
+  d = (await unign()).j();
+  assert.equal(d.status, 'open');
+  assert.ok(d.problems.every((p) => !p.ignoredUntil));
+
+  // The default (no problems) is still the whole device.
+  d = (await ign({ minutes: 45 })).j();
+  assert.equal(d.status, 'ignored');
+  assert.equal(d.ignoreScope, 'device');
+  assert.ok(d.problems.every((p) => !p.ignoredUntil));
+});
+
+test('issues: an ignored problem stays ignored on that device after the issue closes, until its time runs out', async (t) => {
+  const { app, A, enable, setRules, checkin, list, one, at } = await setup(t);
+  await enable();
+  const rules = await setRules([{ ...CPU, count: 1 }, { ...MEM, count: 1, clear: { mode: 'auto', count: 1 } }]);
+  const cpuId = rules.find((r) => r.name === 'High CPU').id;
+  await checkin(0, { cpu_pct: 97, mem_pct: 10 });
+  const id = (await list()).issues[0].id;
+  assert.equal((await A.user({ method: 'POST', url: `/api/issues/${id}/ignore`, payload: { minutes: 120, problems: [cpuId] } })).statusCode, 200);
+
+  // CPU clears: the issue closes by itself; the ignore stays on the device.
+  await checkin(1, { cpu_pct: 20 });
+  await checkin(2, { cpu_pct: 20 });
+  assert.equal((await one(id)).status, 'closed');
+  // CPU spikes again inside the two hours: no new issue.
+  await checkin(10, { cpu_pct: 99 });
+  await checkin(11, { cpu_pct: 99 });
+  assert.equal((await list('?status=all')).total, 1, 'no new issue while High CPU is ignored here');
+  // Another device is not affected.
+  const other = await A.user({ method: 'POST', url: '/api/checkin', payload: { id: 'pc-2', cpu_pct: 99, mem_pct: 10 } });
+  assert.ok(other.statusCode < 300);
+  assert.equal((await list('?status=all')).total, 2, 'other devices still open issues');
+  // Past the two hours, the next check-in opens an issue.
+  at(125);
+  app.issues.tick(T0 + 125 * MIN);
+  await checkin(126, { cpu_pct: 99 });
+  const all = (await list('?status=all&q=pc-1')).issues;
+  assert.equal(all.length, 2);
+  assert.equal(all[0].status, 'open');
+  assert.equal(all[0].title, 'High CPU');
+});
+
+test('issues: ignored problems are forgotten when their rule is removed or the device is deleted', async (t) => {
+  const { app, A, enable, setRules, checkin, list } = await setup(t);
+  await enable();
+  const rules = await setRules([{ ...CPU, count: 1 }]);
+  await checkin(0, { cpu_pct: 97 });
+  const id = (await list()).issues[0].id;
+  await A.user({ method: 'POST', url: `/api/issues/${id}/ignore`, payload: { minutes: 60, problems: [rules[0].id] } });
+  assert.equal(app.issues.db.prepare('SELECT COUNT(*) AS n FROM issue_mutes').get().n, 1);
+  await setRules([]);
+  assert.equal(app.issues.db.prepare('SELECT COUNT(*) AS n FROM issue_mutes').get().n, 0, 'rule removed');
+  const r2 = await setRules([{ ...CPU, count: 1 }]);
+  await checkin(1, { cpu_pct: 97 });
+  const id2 = (await list()).issues.find((i) => i.status !== 'closed').id;
+  await A.user({ method: 'POST', url: `/api/issues/${id2}/ignore`, payload: { minutes: 60, problems: [r2[0].id] } });
+  assert.equal((await A.user({ method: 'DELETE', url: '/api/records/pc-1' })).statusCode, 200);
+  assert.equal(app.issues.db.prepare('SELECT COUNT(*) AS n FROM issue_mutes').get().n, 0, 'device deleted');
+});
+
+test('issues: the opt-in top processes for the metric are added to the problem start in the log', async (t) => {
+  const { checkin, enable, setRules, list, one } = await setup(t);
+  await enable();
+  await setRules([{ name: 'High CPU', kind: 'field', field: 'cpu_pct', op: 'gt', value: '90', count: 1, severity: 'critical', clear: { mode: 'auto', count: 1 } }]);
+  await checkin(0, { cpu_pct: 98, top_cpu: 'sqlservr 41%, chrome 22%, svchost 9%', top_ram: 'other 1 GB' });
+  const id = (await list()).issues[0].id;
+  const issue = await one(id);
+  assert.match(issue.problems[0].startValue, /^cpu_pct = 98; top: sqlservr 41%, chrome 22%, svchost 9%$/);
+  assert.ok(issue.events.some((e) => e.type === 'problem' && /High CPU started — cpu_pct = 98; top: sqlservr 41%, chrome 22%, svchost 9% \[cpu_pct > 90\]/.test(e.text)), JSON.stringify(issue.events));
+});

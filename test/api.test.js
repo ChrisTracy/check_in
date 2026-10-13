@@ -373,6 +373,19 @@ test('HTTPS: PEM and PFX uploads are validated', async (t) => {
   assert.ok(!fs.existsSync(path.join(app.tls.dir, 'key.pem')));
   const st = (await admin({ method: 'PUT', url: '/api/admin/tls', payload: { mode: 'both' } })).json();
   assert.equal((await httpsGet(st.listeningPort, '/health')).cert.subject.CN, 'b.local');
+
+  // Old Windows exports (RC2-40) are refused by OpenSSL 3; they are converted and stored as PEM.
+  try {
+    execFileSync('openssl', ['pkcs12', '-export', '-legacy', '-in', path.join(dir, 'c.pem'), '-inkey', path.join(dir, 'k.pem'),
+      '-out', path.join(dir, 'old.pfx'), '-passout', 'pass:old-pass'], { stdio: 'ignore' });
+  } catch { return t.diagnostic('openssl -legacy not available: skipping legacy PFX check'); }
+  const old = fs.readFileSync(path.join(dir, 'old.pfx')).toString('base64');
+  assert.match((await up({ type: 'pfx', pfx: old, passphrase: 'wrong' })).json().error, /Wrong password/);
+  const lr = await up({ type: 'pfx', pfx: old, passphrase: 'old-pass' });
+  assert.equal(lr.statusCode, 200, lr.body);
+  assert.equal(lr.json().installed.subject, 'b.local');
+  assert.ok(fs.existsSync(path.join(app.tls.dir, 'key.pem')) && !fs.existsSync(path.join(app.tls.dir, 'cert.pfx')));
+  assert.equal((await httpsGet((await admin({ url: '/api/admin/tls' })).json().listeningPort, '/health')).cert.subject.CN, 'b.local');
 });
 
 test('HTTPS: TLS_DISABLE forces HTTP only', async (t) => {
@@ -764,4 +777,125 @@ test('installers replace the machine settings and pass port checks through', asy
   assert.match(ps, /'-Install', '-ReplaceSettings'/);
   assert.match(ps, /else \{ '3389' \}/);
   assert.equal((await app.inject({ url: '/install.sh?ports=22;rm' })).statusCode, 400);
+});
+
+test('the About page data needs a login and matches package.json', async () => {
+  const { app, admin } = await setup();
+  assert.equal((await app.inject({ url: '/api/about' })).statusCode, 401);
+  const r = await admin({ url: '/api/about' });
+  assert.equal(r.statusCode, 200);
+  const i = r.json();
+  const pkg = JSON.parse((await import('node:fs')).readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(i.version, pkg.version);
+  assert.equal(i.license, 'Apache-2.0');
+  assert.match(i.node, /^\d+\./);
+  assert.ok(i.repoUrl.startsWith('https://github.com/'));
+});
+
+test('history limit: power users change it; lowering deletes, the saved value wins, and it can be reset', async () => {
+  const { call, store, accounts, as, admin } = await setup({ historyLimit: 10 });
+  for (let i = 0; i < 8; i++) { await call({ method: 'POST', url: `/api/checkin?id=a&n=${i}` }); await call({ method: 'POST', url: `/api/checkin?id=b&n=${i}` }); }
+  const hist = () => store.summary().history;
+  assert.equal(hist(), 16);
+  await accounts.create({ username: 'uma', password: 'uma-password-1', role: 'user' });
+  await accounts.create({ username: 'pat', password: 'pat-password-1', role: 'power' });
+  const user = as('uma', 'uma-password-1');
+  const power = as('pat', 'pat-password-1');
+  // only power users and up
+  assert.equal((await user({ method: 'PUT', url: '/api/history-limit', payload: { limit: 2 } })).statusCode, 403);
+  assert.equal((await user({ url: '/api/history-limit' })).statusCode, 403);
+  // bad values
+  for (const limit of [-2, 1.5, '5', null, 1_000_001]) assert.equal((await power({ method: 'PUT', url: '/api/history-limit', payload: { limit } })).statusCode, 400, String(limit));
+  // the preview reports what would go, and changes nothing
+  const prev = (await power({ url: '/api/history-limit?limit=3' })).json();
+  assert.equal(prev.remove, 10);
+  assert.equal(prev.limit, 10);
+  assert.equal((await power({ url: '/api/history-limit?limit=0' })).json().remove, 16);
+  assert.equal((await power({ url: '/api/history-limit?limit=20' })).json().remove, 0);
+  assert.equal(hist(), 16);
+  // lowering trims at once, keeping the newest entries
+  const r = await power({ method: 'PUT', url: '/api/history-limit', payload: { limit: 3 } });
+  assert.equal(r.statusCode, 200);
+  assert.equal(r.json().removed, 10);
+  assert.equal(r.json().source, 'settings');
+  assert.equal(hist(), 6);
+  assert.equal(store.historyLimit, 3);
+  assert.equal(accounts.historyLimit, 3);
+  assert.equal((await call({ url: '/api/config' })).json().historyLimit, 3);
+  assert.deepEqual((await call({ url: '/api/records/a/history' })).json().history.map((h) => h.version), [8, 7, 6]);
+  // new check-ins respect the new limit
+  await call({ method: 'POST', url: '/api/checkin?id=a&n=9' });
+  assert.equal(hist(), 6);
+  // raising keeps what there is
+  assert.equal((await power({ method: 'PUT', url: '/api/history-limit', payload: { limit: 50 } })).json().removed, 0);
+  assert.equal(hist(), 6);
+  // 0 turns history off, -1 is unlimited
+  assert.equal((await power({ method: 'PUT', url: '/api/history-limit', payload: { limit: 0 } })).json().removed, 6);
+  assert.equal(hist(), 0);
+  await admin({ method: 'PUT', url: '/api/history-limit', payload: { limit: -1 } });
+  assert.equal(store.historyLimit, -1);
+  await call({ method: 'POST', url: '/api/checkin?id=a&n=10' });
+  assert.equal(hist(), 1);
+  // reset goes back to the HISTORY_LIMIT value and removes the saved one
+  const reset = (await power({ method: 'PUT', url: '/api/history-limit', payload: { reset: true } })).json();
+  assert.equal(reset.limit, 10);
+  assert.equal(reset.source, 'environment');
+  assert.equal(accounts.historyLimit, null);
+});
+
+test('graph data: only the asked-for fields, an optional time window, and the oldest entry available', async () => {
+  const { app, call, store, admin } = await setup({ historyLimit: 100 });
+  // two entries from long ago (history rows can be old; the window is by their timestamp)
+  const old = new Date(Date.now() - 3 * 3600e3).toISOString();
+  store.db.prepare("INSERT INTO history (record_id, version, action, changes, data, at) VALUES ('g', 0, 'update', '{}', ?, ?)").run(JSON.stringify({ cpu_pct: 99, ram_pct: 1 }), old);
+  for (let i = 0; i < 4; i++) await call({ method: 'POST', url: `/api/checkin?id=g&cpu_pct=${10 * (i + 1)}&ram_pct=50&secret=hunter2` });
+  const get = (q) => admin({ url: `/api/records/g/metrics?${q}` });
+  let r = await get('fields=cpu_pct,ram_pct&minutes=15');
+  assert.equal(r.statusCode, 200);
+  let j = r.json();
+  assert.equal(j.history.length, 4);
+  assert.deepEqual(Object.keys(j.history[0].data).sort(), ['cpu_pct', 'ram_pct']);
+  assert.equal(Number(j.history[0].data.cpu_pct), 40); // newest first (check-in values arrive as text)
+  assert.equal(j.earliest, old);
+  assert.ok(Date.parse(j.now) <= Date.now());
+  j = (await get('fields=cpu_pct&minutes=all')).json();
+  assert.equal(j.history.length, 5);
+  assert.deepEqual(j.history.at(-1).data, { cpu_pct: 99 }); // the old entry
+  // fields that are not asked for never come back
+  assert.ok(j.history.every((h) => h.data.secret === undefined && h.data.ram_pct === undefined));
+  // a record with no history entry in the window still answers, with the oldest time
+  const none = (await get('fields=cpu_pct&minutes=1')).json();
+  assert.equal(none.history.length, 4);
+  // validation
+  for (const q of ['', 'fields=a;b', 'fields=' + 'x,'.repeat(41), 'fields=cpu_pct&minutes=0', 'fields=cpu_pct&minutes=abc']) assert.equal((await get(q)).statusCode, 400, q);
+  assert.equal((await admin({ url: '/api/records/nope/metrics?fields=cpu_pct' })).statusCode, 404);
+  assert.equal((await app.inject({ url: '/api/records/g/metrics?fields=cpu_pct' })).statusCode, 401);
+});
+
+test('the top-processes group: off by default, accepted by the installers, and the Linux agent clears or fills the lines', async (t) => {
+  const { app } = await setup({ trustProxy: true });
+  const { AGENT_GROUPS, DEFAULT_GROUPS } = await import('../src/agents.js');
+  assert.ok(AGENT_GROUPS.includes('topprocs'));
+  assert.ok(!DEFAULT_GROUPS.includes('topprocs'));
+  const r = await app.inject({ url: '/install.sh?fields=default,topprocs', headers: { host: 'checkin.example.com' } });
+  assert.equal(r.statusCode, 200);
+  assert.match(r.body, /FIELDS="\$\{CHECKIN_FIELDS:-default,topprocs\}"/);
+  // The Linux agent itself (needs bash and /proc).
+  const fs2 = await import('node:fs');
+  const { spawnSync } = await import('node:child_process');
+  if (process.platform !== 'linux' || !fs2.existsSync('/proc/stat') || spawnSync('bash', ['-c', 'exit 0']).status !== 0) return t.skip('needs Linux and bash');
+  const run = (extraEnv, fields) => {
+    const out = spawnSync('bash', [new URL('../scripts/checkin-agent.sh', import.meta.url).pathname, '--dry-run', '--fields', fields], { env: { ...process.env, ...extraEnv }, encoding: 'utf8' });
+    assert.equal(out.status, 0, out.stderr);
+    return JSON.parse(out.stdout);
+  };
+  // Nothing is ever over 100%, so every list is cleared (null) when the group is on...
+  const quiet = run({ CHECKIN_TOP_THRESHOLD: '100' }, 'cpu,ram,disk,topprocs');
+  for (const k of ['top_cpu', 'top_ram', 'top_disk']) assert.ok(k in quiet && quiet[k] === null, k);
+  // ...and the fields are absent when it is off.
+  const off = run({}, 'cpu,ram,disk');
+  assert.ok(!('top_cpu' in off) && !('top_ram' in off) && !('top_disk' in off));
+  // With the limit at 0, memory is always "over", so a list of process names with sizes appears.
+  const hot = run({ CHECKIN_TOP_THRESHOLD: '0' }, 'ram,topprocs');
+  assert.match(hot.top_ram, /^[^,]+ \d+(\.\d)? (MB|GB)( \(\d+%\))?(, [^,]+ \d+(\.\d)? (MB|GB)( \(\d+%\))?){0,2}$/);
 });

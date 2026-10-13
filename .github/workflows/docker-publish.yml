@@ -1,5 +1,5 @@
 name: Publish Docker image
- 
+
 # Builds a multi-architecture image (linux/amd64 + linux/arm64) and pushes it to Docker Hub.
 #
 # One-time setup in GitHub → Settings → Secrets and variables → Actions (repository level):
@@ -11,24 +11,38 @@ name: Publish Docker image
 #
 # Because the username is a secret, GitHub masks it as *** in the logs (including image names).
 #
-# Tags pushed:
-#   push to main      → latest, sha-<short>
-#   tag v1.2.3        → 1.2.3, 1.2, 1, sha-<short>
- 
+# Every push to main is a release. The patch number goes up by one automatically (1.0.27 → 1.0.28):
+#   1. scripts/next-version.mjs picks the version (see that file).
+#   2. The image is built with it and pushed as <version>, <major>.<minor>, <major>, latest and sha-<short>.
+#   3. The bumped package.json is committed back to main ("chore: release vX [skip ci]"), the tag vX is
+#      created and a GitHub release with generated notes is published.
+# A push that only changes documentation (README, docs/, LICENSE, NOTICE) is not a release: no image, no version bump.
+# To start a new minor or major line, edit "version" in package.json (e.g. to 1.1.0) and push: that exact
+# version is released, and the next push becomes 1.1.1. Run `git pull` before your next push, since the
+# workflow adds a commit to main.
+# If main is protected, allow GitHub Actions to push to it (or the commit-back step will fail).
+
 on:
   push:
     branches: [main]
-    tags: ['v*.*.*']
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.gitignore'
+      - '.dockerignore'
   workflow_dispatch:
- 
+
 permissions:
   contents: read
- 
+
+# Queue runs instead of cancelling: each one tags a release.
 concurrency:
   group: docker-publish-${{ github.ref }}
-  cancel-in-progress: true
- 
- 
+  cancel-in-progress: false
+
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -40,10 +54,13 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
- 
+
   publish:
     needs: test
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the version commit and tag, create the release
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
@@ -60,21 +77,39 @@ jobs:
           fi
           image="${DOCKERHUB_IMAGE:-$DOCKERHUB_USERNAME/check-in}"
           echo "IMAGE=$(echo "$image" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
- 
+
       - uses: actions/checkout@v6
- 
+        with:
+          fetch-depth: 0   # tags are needed to pick the next version
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Pick the version
+        id: ver
+        run: |
+          read -r version mode < <(node scripts/next-version.mjs)
+          echo "Releasing v$version ($mode)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "minor=${version%.*}" >> "$GITHUB_OUTPUT"
+          echo "major=${version%%.*}" >> "$GITHUB_OUTPUT"
+          # Put the version into the files the image is built from (committed to main after the push).
+          npm version "$version" --no-git-tag-version --allow-same-version
+
       - name: Set up QEMU (for arm64 builds)
         uses: docker/setup-qemu-action@v4
- 
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
- 
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v4
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
- 
+
       - name: Image tags and labels
         id: meta
         uses: docker/metadata-action@v6
@@ -82,11 +117,15 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=${{ steps.ver.outputs.minor }}
+            type=raw,value=${{ steps.ver.outputs.major }}
             type=sha,format=short
- 
+
+      - name: Build timestamp
+        id: date
+        run: echo "now=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push (amd64 + arm64)
         uses: docker/build-push-action@v7
         with:
@@ -95,5 +134,31 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.date.outputs.now }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Commit the version, tag it and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          MODE: ${{ steps.ver.outputs.mode }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          target="$GITHUB_SHA"
+          if [ "$MODE" = "bump" ]; then
+            for attempt in 1 2 3; do
+              git fetch origin main
+              git reset --hard origin/main
+              npm version "$VERSION" --no-git-tag-version --allow-same-version
+              git commit -am "chore: release v$VERSION [skip ci]" || true
+              if git push origin HEAD:main; then break; fi
+              [ "$attempt" = 3 ] && { echo "::error::Could not push the version commit to main"; exit 1; }
+              sleep $((attempt * 5))
+            done
+            target=$(git rev-parse HEAD)
+          fi
+          gh release create "v$VERSION" --target "$target" --title "v$VERSION" --generate-notes --latest

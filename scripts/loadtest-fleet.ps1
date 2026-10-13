@@ -96,6 +96,7 @@ param(
   [ValidateRange(100, 1000000)][int]$MaxInFlight = 20000,  # stop sending new check-ins while this many are waiting
   [switch]$SkipCertificateCheck,                           # for a self-signed HTTPS certificate
   [switch]$Cleanup,                                        # delete every "$Prefix*" record and exit
+  [switch]$TopProcesses,                                   # also send top_cpu/top_ram/top_disk text lines (only when over 85%, else null)
   [switch]$DryRun                                          # show the plan and a sample check-in; send nothing
 )
 
@@ -389,6 +390,13 @@ function Get-Body($d, [double]$elapsed) {
     failed_services = $failed; failed_service_names = $names
     system_time = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', $inv)
   }
+  if ($TopProcesses) {
+    # Same shape as the agent's topprocs group: a text line when over 85%, otherwise null (removes the field).
+    $pool = @(if ($d.Os -eq 'windows') { 'sqlservr', 'chrome', 'svchost', 'MsMpEng', 'w3wp', 'explorer' } else { 'java', 'postgres', 'nginx', 'python3', 'node', 'rsyslogd' }) | Get-Random -Count 3
+    $fields['top_cpu'] = if ($cpu -gt 85) { ($pool | ForEach-Object -Begin { $i = 0 } -Process { $_ + ' ' + [Math]::Max(1, [int]($cpu * (0.5, 0.25, 0.1)[$i])) + '%'; $i++ }) -join ', ' } else { $null }
+    $fields['top_ram'] = if ($ram -gt 85) { ($pool | ForEach-Object -Begin { $i = 0 } -Process { $_ + ' ' + [Math]::Round($d.RamMb * $ram / 100 / 1024 * (0.4, 0.2, 0.1)[$i], 1) + ' GB'; $i++ }) -join ', ' } else { $null }
+    $fields['top_disk'] = if ($busy -gt 85) { ($pool | ForEach-Object -Begin { $i = 0 } -Process { $_ + ' ' + [Math]::Round(120 * (0.5, 0.3, 0.1)[$i], 1) + ' MB/s'; $i++ }) -join ', ' } else { $null }
+  }
   $state = if ($d.Rdp) { $d.Rdp } else { $d.Ssh }
   if ($state) {
     $fields[$(if ($d.Rdp) { 'port_3389' } else { 'port_22' })] = $state
@@ -398,7 +406,8 @@ function Get-Body($d, [double]$elapsed) {
   # Hand-built JSON (ConvertTo-Json is slow in Windows PowerShell for thousands per second).
   $parts = foreach ($k in $fields.Keys) {
     $v = $fields[$k]
-    $j = if ($v -is [bool]) { if ($v) { 'true' } else { 'false' } }
+    $j = if ($null -eq $v) { 'null' }
+         elseif ($v -is [bool]) { if ($v) { 'true' } else { 'false' } }
          elseif ($v -is [ValueType]) { ([double]$v).ToString('0.###', $inv) }   # int, double, decimal...
          else { '"' + ([string]$v).Replace('\', '\\').Replace('"', '\"') + '"' }
     '"' + $k + '":' + $j

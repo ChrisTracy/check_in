@@ -99,7 +99,7 @@ Save the current filters, search, sort, grouping, columns and layout under a nam
 
 ### Record details, history and graph
 
-Click a row to open the record: every field, a **History** timeline of changes, and a **Graph** of CPU, RAM, disk space and disk activity over the stored history (the last `HISTORY_LIMIT` check-ins), with hover details and a min / avg / max table. The Graph reads `cpu_pct`, `ram_pct`, `disk_pct` and `disk_busy_pct` (what the agents send); it is greyed out for records without them.
+Click a row to open the record: every field, a **History** timeline of changes, and a **Graph** of CPU, RAM, disk space and disk activity with hover details and a min / avg / max table. The Graph opens on the **last 15 minutes**; the buttons above it switch to 1 hour, 6 hours, 24 hours, 3, 7 or 30 days, or **All** stored history. Only ranges that the device has data for are offered, and how far back you can go depends on the history limit ([Settings](#6-settings-and-the-account-menu)). The Graph reads `cpu_pct`, `ram_pct`, `disk_pct` and `disk_busy_pct` (what the agents send); it is greyed out for records without them.
 
 ![A record's history](screenshots/record-history.png)
 
@@ -115,6 +115,7 @@ Click a row to open the record: every field, a **History** timeline of changes, 
 
 - Changes stream in as they happen, with no refresh.
 - **Pause check-ins** (power users and admins, **Settings → Check-ins**) makes the server refuse check-ins and imports until resumed. A banner on every dashboard says who paused it and when. Reads, exports and deletes keep working.
+- **History limit** (power users and admins, **Settings → Check-ins**) sets how many check-ins each device keeps for History and Graph (0 turns history off, or tick Unlimited). It applies to everyone and wins over the `HISTORY_LIMIT` variable. Before saving you see what it does: **lowering the limit permanently deletes the older entries straight away** (with the number and size), and **raising it increases the disk space the database needs** (with an estimate). **Use default** goes back to `HISTORY_LIMIT`.
 - On a phone the header shrinks to the logo and your menu, the page tabs get their own row, menus and dialogs open as bottom sheets, and Settings opens full screen.
 
 ---
@@ -150,7 +151,7 @@ Click an issue to open its details: the problems, who it's assigned to, notes, a
 - **One issue per device.** A new problem on a device that already has an open or ignored issue is added to that issue.
 - **Problems clear one by one**, with a log entry showing the reading ("High CPU cleared: cpu_pct = 42"). When none are left the issue **closes itself**.
 - **Assign** to any user. **Assign to me** is one click.
-- **Ignore** an issue for 15 minutes up to 90 days. It leaves the Open list but keeps tracking. A *new kind* of problem on that device ends the ignore straight away, so ignoring one problem never hides another.
+- **Ignore** an issue for 15 minutes up to 90 days. It leaves the Open list but keeps tracking. Choose **Entire device** (the default) or **Only these problems** and tick the ones to ignore (for example High CPU but not RDP Closed). With the whole device, a *new kind* of problem ends the ignore straight away. With individual problems, only the ticked ones are hidden: they stay ignored on that device, even if the issue closes and they come back, until the time is up or you press **Stop ignoring** on the problem. If every active problem is ignored the issue moves out of the Open list; anything else keeps it open.
 - **Close** by hand, optionally with a reason. If the problem is still happening it won't open a new issue until it has stopped and happened again.
 - **Notes:** anyone with the User role or above can add notes and delete their own. Power users and admins can delete any.
 - **Same person when it comes back:** if a device gets a new issue within the **reassign window** (60 minutes by default; 0 turns it off) of its last one closing, the new issue goes to whoever had the last one.
@@ -231,7 +232,7 @@ Options go on the install URL: `?every=10&fields=default,security&exclude=users&
 
 ### What gets sent
 
-Both agents use the same field names, so filters and views work across Windows and Linux. Choose groups with `-Fields` / `--fields` (default: all but `updates` and `security`), drop some with `-Exclude` / `--exclude`.
+Both agents use the same field names, so filters and views work across Windows and Linux. Choose groups with `-Fields` / `--fields` (default: all but `updates`, `security` and `topprocs`), drop some with `-Exclude` / `--exclude`.
 
 | Group | Fields |
 |---|---|
@@ -247,8 +248,27 @@ Both agents use the same field names, so filters and views work across Windows a
 | `health` | processes, failed_services, failed_service_names, reboot_required |
 | `updates` | pending_updates, security_updates, last_update (slower) |
 | `security` | firewall_enabled, disk_encrypted, secure_boot (+ antivirus on Windows, SELinux/AppArmor on Linux) |
+| `topprocs` | top_cpu, top_ram, top_disk: the busiest process names, only while the metric is high ([details](#top-processes)) |
 
 Every agent also sends `agent_version` and `agent_os`. Anything a machine can't provide is left out, and one failing group doesn't stop the rest (the problem is noted in `agent_errors`). Run as administrator / SYSTEM or root for the fields that need it.
+
+### Top processes
+
+The `topprocs` group is **off unless you ask for it** (`-Fields default,topprocs` / `--fields default,topprocs`, or `all`; on the **Add Device** page tick **Top processes**). It answers "what is using the CPU?" without logging in to the machine.
+
+| Field | Example | Sent when |
+|---|---|---|
+| `top_cpu` | `sqlservr 38%, chrome 21%, svchost 9%` | `cpu_pct` is over 85 |
+| `top_ram` | `chrome 2.3 GB (7%), sqlservr 1.1 GB (3%)` | `ram_pct` is over 85 |
+| `top_disk` | `sqlservr 96.7 MB/s, backup 12.0 MB/s` | `disk_busy_pct` is over 85 |
+
+- **One text line per metric, at most three entries, and only process names.** Command lines and arguments are never read or sent. Processes with the same name (a browser's many processes) are added up. CPU is a share of the whole machine, so it lines up with `cpu_pct`.
+- **When the metric drops back to 85 or below, the field is cleared** on the next check-in, so a stale list never lingers.
+- **Linux:** disk figures are real storage reads and writes and need root; without root `top_disk` is left empty. **Windows:** disk figures are each process's total I/O (disk, network and pipes) and need an elevated run, and memory is the working set, which can count shared memory more than once.
+- **Cost:** a snapshot of the process list is taken on every check-in and a second one only while something is over the limit. On Linux this adds roughly 0.05 to 0.3 seconds; on Windows roughly 0.5 to 1.5 seconds per snapshot, more on a heavily loaded server.
+- **Change the 85:** set `DEFAULT_TOP_THRESHOLD` (Linux) or `$DefaultTopThreshold` (Windows) in the script, or `CHECKIN_TOP_THRESHOLD` in the environment or agent config file (`TopThreshold` in `agent.json` on Windows).
+- The group needs the `cpu`, `ram` and `disk` groups; a list is skipped for any group you exclude.
+- The history keeps these lines too, so a busy device adds a little to each history entry while it is over the limit.
 
 ### Agent options
 
@@ -307,7 +327,8 @@ Everything lives in one **Settings** panel. **General** is for everyone; **Admin
 | Tab | Who can change it | What it does |
 |---|---|---|
 | **Preferences** | Everyone | Theme, compact rows, change or set your own password |
-| **Check-ins** | Power user | Pause and resume check-ins, the active threshold, history limit |
+| **Check-ins** | Power user | Pause and resume check-ins, the active threshold, and how much history each device keeps |
+| **About** | Everyone | Version, build and links to GitHub (source, releases, report a problem) |
 | **Users** | Admin | Add, edit and remove users ([details](#7-users-roles-and-the-api-key)) |
 | **Single sign-on** | Admin | Microsoft Entra ID ([details](#8-single-sign-on-microsoft-entra-id)) |
 | **API key** | Power user (view, regenerate); admin (custom key, stop requiring it) | The key devices use to check in |
@@ -524,6 +545,7 @@ curl -X POST "https://checkin.example.com/api/checkin?id=web-01&check_ports=3389
 - **Fleet:** up to 20,000 devices with your choice of check-in interval. Devices start healthy, with realistic, slightly noisy readings in the same fields the agents send, including servers with roles and services (web, SQL, domain controller, file, containers) and the RDP / SSH port fields. A device's ID is its hostname, such as `SIM-SRV-SQL-00030`.
 - **Problems on demand:** switch on high CPU, memory, low disk, disk activity, clock skew, failed services, RDP / SSH closed, reboot required, not domain joined or offline for a percentage or a number of devices, then remove them to watch issues clear. You can also pick one device and choose exactly what is wrong with it, including which services are stopped.
 - **Live numbers:** check-ins per second against the target, latency (p50, p95, max), server CPU, event-loop delay, memory, failures and open issues, with charts of the last 2 minutes.
+- **Top processes:** tick **Include top processes** to add the opt-in `top_cpu`, `top_ram` and `top_disk` fields: a line of three process names for a device over 85% on that metric, and `null` (no field) otherwise, so you can see how the extra text affects the dashboard and database. The scripts do the same with `TOP_PROCS=1` (`scripts/loadtest.js`) and `-TopProcesses` (`scripts/loadtest-fleet.ps1`).
 - **Real requests:** every check-in goes through the real API in-process (only the network socket is skipped), so to measure the network and a reverse proxy too, use the scripts in [Performance](#15-performance) from another machine.
 - Simulated devices are ordinary records (`SIM-…`, `simulated = true`). **Remove simulated devices** deletes them and closes their issues without touching real devices. The simulation doesn't survive a restart, but the records stay (and go stale) until you remove them.
 
@@ -540,7 +562,7 @@ Settings come from environment variables or a `.env` file next to `docker-compos
 | `PORT` | `3000` | HTTP port |
 | `HOST` | `0.0.0.0` | Interface to bind |
 | `DB_PATH` | `data/checkin.db` | SQLite file (created automatically) |
-| `HISTORY_LIMIT` | `100` | History entries kept per record. `0` turns history off, `-1` keeps everything. Lowering it trims existing history at the next start |
+| `HISTORY_LIMIT` | `100` | History entries kept per record. `0` turns history off, `-1` keeps everything. This is only the default: a limit saved in **Settings → Check-ins** takes over, and **Use default** there goes back to this value. Lowering it here trims existing history at the next start |
 | `API_KEY` | *(empty)* | The API key to use on **first start** (otherwise one is generated). Manage it later in Settings → API key |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | *(empty)* | Creates the first admin automatically if no users exist |
 | `APP_SECRET` | *(generated)* | Encrypts stored secrets (SSO client secret, Apprise URLs, ACME keys) and sign-in cookies. If empty, a random one is saved to `data/.app-secret`; back that file up with the database |
@@ -654,6 +676,7 @@ The response is `201` when created and `200` when updated: `{ "ok": true, "actio
 | `GET /api/records?idsOnly=1` | Just the id of every record, plus the current `rev` |
 | `GET /api/records/:id` | One record |
 | `GET /api/records/:id/history?limit=500` | A record and its history, newest first, each entry with `changes: { field: [old, new] }` and a snapshot |
+| `GET /api/records/:id/metrics?fields=cpu_pct,ram_pct&minutes=15` | Graph data: just the listed fields (1 to 40) from each history entry, newest first. `minutes` limits it to that long ago (`all` for everything). Also returns `earliest` (the oldest entry stored), `now` and `truncated` (more than 50,000 points) |
 | `GET /api/history?limit=200` | Recent activity across all records (`before`, `after`, `data=0`) |
 | `GET /api/fields` · `GET /api/stats` | Field names with counts · counts and write statistics |
 | `GET /api/events` | Server-Sent Events stream (`change`, `delete`, `clear`, `issues`) used for live updates |
@@ -702,7 +725,7 @@ All need the issues list turned on (otherwise `409`), except `config`, `summary`
 | `GET /api/issues/:id` | Reader | One issue with its problems, `events`, `snapshot` and `current` |
 | `GET /api/issues/assignees` | User | Users an issue can be assigned to |
 | `PUT /api/issues/:id/assign` | User | `{ "assignee": 12 }` or `null` |
-| `POST /api/issues/:id/ignore` · `/unignore` | User | `{ "minutes": 240 }` (1 minute to 90 days) |
+| `POST /api/issues/:id/ignore` · `/unignore` | User | `{ "minutes": 240 }` (1 minute to 90 days) for the whole device, or `{ "minutes": 240, "problems": ["<rule id>"] }` for only those problems. `/unignore` takes the same `problems` list, or none to stop all ignores on the device. Problems carry `ruleId`, `ignoredUntil` and `ignoredBy`; issues carry `ignoreScope` (`device` or `problems`) |
 | `POST /api/issues/:id/close` | User | `{ "reason": "optional" }` |
 | `POST /api/issues/:id/notes` · `DELETE …/notes/:noteId` | User | `{ "text" }` (up to 4,000 characters). You can delete your own; power users and admins any |
 | `GET /api/issues/export.csv` | User | One row per issue; `?kind=log` one row per log entry. Takes the same filters as the list (default `status=all`) |

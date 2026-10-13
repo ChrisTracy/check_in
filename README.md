@@ -49,7 +49,7 @@ A self-hosted dashboard that keeps track of your devices. Each device checks in 
        ports:
          - "3000:3000"
        environment:
-         HISTORY_LIMIT: 100     # check-ins kept per device (for History and Graph)
+         HISTORY_LIMIT: 100     # check-ins kept per device (default; Settings → Check-ins can change it)
          # TRUST_PROXY: 1       # uncomment behind a reverse proxy (Caddy, Nginx, Traefik)
          APPRISE_URL: http://apprise:8000   # only used if you turn on Settings → Alerts
        volumes:
@@ -136,3 +136,25 @@ To build and run the Docker image from your copy of the code instead:
 ```bash
 docker compose up -d --build     # uses the docker-compose.yml in the repository
 ```
+
+## Releases and versions
+
+Every push to `main` is a release (except pushes that only change documentation: the README, `docs/`, `LICENSE` and `NOTICE` never build an image or bump the version), and the patch number goes up by itself (1.0.27 becomes 1.0.28). **Settings → About** shows the version, the build commit and when the server started.
+
+What the GitHub workflow (`.github/workflows/docker-publish.yml`) does on each push to `main`:
+
+1. Runs the tests, then picks the version (`scripts/next-version.mjs`).
+2. Builds the image and pushes it to Docker Hub as `1.0.28`, `1.0`, `1`, `latest` and `sha-<commit>`.
+3. Commits the new number back to `package.json` ("chore: release v1.0.28 [skip ci]"), tags `v1.0.28` and publishes a GitHub release with generated notes.
+4. Komodo then redeploys, as before.
+
+Two things to do yourself:
+
+- **Pull before you push again.** The workflow adds a commit to `main`, so run `git pull` first, or your push is rejected.
+- **New minor or major version:** edit `"version"` in `package.json` to the new number with the patch at 0 (for example `1.1.0`) and push. That exact version is released, and the next push is `1.1.1`. If the version in `package.json` has no tag yet, it is released as written, which is also how the first release (1.0.27) works.
+
+If `main` is protected, allow GitHub Actions to push to it, or the version commit fails.
+
+## License
+
+Copyright 2026 Chris Tracy. Check-In is licensed under the [Apache License 2.0](LICENSE). You may use, modify and distribute it, including commercially, as long as you keep the copyright notice, the `LICENSE` file and the `NOTICE` file with any copy you distribute, and mark files you changed. The license does not give you the right to use the Check-In name or the author's name to promote your own product.

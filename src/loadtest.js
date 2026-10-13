@@ -93,6 +93,29 @@ function rng(seed) {
 const pick = (r, list) => list[Math.floor(r() * list.length)];
 const percentile = (sorted, p) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))] : 0);
 
+// What an agent with the topprocs group on sends: one text line per metric that is over 85%, and null
+// (which clears the field) for the others. The names are made up and change every minute.
+const TOP_WIN = ['sqlservr', 'chrome', 'MsMpEng', 'w3wp', 'svchost', 'python', 'node', 'TiWorker', 'backupsvc'];
+const TOP_LINUX = ['postgres', 'java', 'nginx', 'python3', 'node', 'rsync', 'dockerd', 'kswapd0'];
+export const TOP_THRESHOLD = 85;
+function topProcessFields(f, s, i) {
+  const r = rng((i + 1) * 7919 + Math.floor(Date.now() / 60000));
+  const names = (s.os.startsWith('Windows') ? TOP_WIN : TOP_LINUX).slice();
+  const three = [];
+  for (let k = 0; k < 3; k++) three.push(names.splice(Math.floor(r() * names.length), 1)[0]);
+  const shares = [0.4 + r() * 0.2, 0.15 + r() * 0.1, 0.05 + r() * 0.05];
+  const out = { top_cpu: null, top_ram: null, top_disk: null };
+  if (f.cpu_pct > TOP_THRESHOLD) out.top_cpu = three.map((n, k) => `${n} ${Math.max(1, Math.round(f.cpu_pct * shares[k]))}%`).join(', ');
+  if (f.ram_pct > TOP_THRESHOLD) {
+    out.top_ram = three.map((n, k) => {
+      const mb = f.ram_total_mb * f.ram_pct / 100 * shares[k];
+      return `${n} ${mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB'} (${Math.round(mb * 100 / f.ram_total_mb)}%)`;
+    }).join(', ');
+  }
+  if (f.disk_busy_pct > TOP_THRESHOLD) out.top_disk = three.map((n, k) => `${n} ${(f.disk_busy_pct * [1.4, 0.5, 0.1][k] * (0.8 + r() * 0.4)).toFixed(1)} MB/s`).join(', ');
+  return out;
+}
+
 export class LoadTest {
   constructor({ app, store, log = console }) {
     this.app = app;
@@ -101,6 +124,7 @@ export class LoadTest {
     this.running = false;
     this.devices = 500;
     this.interval = 60;          // seconds between a device's check-ins
+    this.topProcs = false;       // send top_cpu / top_ram / top_disk like an agent with the topprocs group on
     this.scenarios = [];         // { id, key, mode: 'percent'|'count', amount, set: Set<index> }
     this.overrides = new Map();  // index -> { problems: Set<key>, stopped: Set<service>, at } for specific devices
     this.statics = new Map();    // index -> per-device constants
@@ -214,6 +238,7 @@ export class LoadTest {
       f.failed_services = stopped.size;
       f.failed_service_names = s.services.filter((x) => stopped.has(x)).join(', ');
     }
+    if (this.topProcs) Object.assign(f, topProcessFields(f, s, i));
     return f;
   }
   #offline(i) { return this.overrides.get(i)?.problems.has('offline') || this.scenarios.some((sc) => sc.key === 'offline' && sc.set.has(i)); }
@@ -284,7 +309,7 @@ export class LoadTest {
   }
 
   // ------------------------------------------------------------ control
-  configure({ devices, interval } = {}) {
+  configure({ devices, interval, topProcs } = {}) {
     // Validate everything before changing anything.
     let n = this.devices;
     let iv = this.interval;
@@ -296,7 +321,13 @@ export class LoadTest {
       iv = num(interval);
       if (!Number.isFinite(iv) || iv < 1 || iv > 3600) throw new HttpError(400, 'Interval must be a number between 1 and 3600 seconds');
     }
-    if (n === this.devices && iv === this.interval) return this.state(); // nothing changed: keep the cycle going as it is
+    let tp = this.topProcs;
+    if (topProcs !== undefined) {
+      if (typeof topProcs !== 'boolean') throw new HttpError(400, 'topProcs must be true or false');
+      tp = topProcs;
+    }
+    if (n === this.devices && iv === this.interval && tp === this.topProcs) return this.state(); // nothing changed: keep the cycle going as it is
+    this.topProcs = tp;
     const old = this.devices;
     // Where the cycle is: the next device due. Kept, so Apply doesn't start over from device #1.
     const pos = this.running ? this.cursor % old : 0;
@@ -349,7 +380,7 @@ export class LoadTest {
 
   start(opts = {}) {
     if (this.removing) throw new HttpError(409, 'Simulated devices are being removed');
-    if (opts.devices !== undefined || opts.interval !== undefined) this.configure(opts);
+    if (opts.devices !== undefined || opts.interval !== undefined || opts.topProcs !== undefined) this.configure(opts);
     if (this.running) return this.state();
     this.running = true;
     this.resetStats();
@@ -595,6 +626,7 @@ export class LoadTest {
       running: this.running,
       devices: this.devices,
       interval: this.interval,
+      topProcs: this.topProcs,
       target: Math.round(this.devices / this.interval * 100) / 100,   // check-ins per second when running
       inflight: this.inflight,
       maxInflight: MAX_INFLIGHT,
