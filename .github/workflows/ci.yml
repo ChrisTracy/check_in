@@ -3,6 +3,13 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.gitignore'
+      - '.dockerignore'
   pull_request:
 
 permissions:
@@ -32,8 +39,13 @@ jobs:
         run: docker build -t check-in-api:ci .
       - name: Smoke test
         run: |
-          docker run -d --name ci -p 3000:3000 check-in-api:ci
+          # Check-ins need an API key now, so start the container with a known one and send it.
+          docker run -d --name ci -p 3000:3000 -e API_KEY=ci-smoke-key-1234567890abcd check-in-api:ci
           for i in $(seq 1 30); do curl -fs http://localhost:3000/health && break; sleep 1; done
-          curl -fs -X POST "http://localhost:3000/api/checkin?id=ci-1&status=ok"
+          echo
+          # Without the key a check-in must be refused; with it, accepted (-S shows the reason if it fails).
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST 'http://localhost:3000/api/checkin?id=ci-1&status=ok')" = 401
+          curl -fsS -X POST -H 'X-API-Key: ci-smoke-key-1234567890abcd' 'http://localhost:3000/api/checkin?id=ci-1&status=ok' || { docker logs ci; docker rm -f ci; exit 1; }
+          echo
           docker logs ci
           docker rm -f ci
