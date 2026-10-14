@@ -463,7 +463,7 @@ export function buildApp({ config, store, accounts, oidc }) {
       throw new HttpError(415, 'Send the CSV file as the raw request body with Content-Type: text/csv');
     }
     let rows;
-    try { rows = parseCsvRows(req.body); } catch (e) { throw new HttpError(400, 'Could not parse CSV: ' + e.message); }
+    try { rows = parseCsvRows(req.body, { maxColumns: store.maxFields + 1 }); } catch (e) { throw new HttpError(400, 'Could not parse CSV: ' + e.message); }
     if (!rows.length) throw new HttpError(400, 'CSV has no data rows');
     const header = rows.names || Object.keys(rows[0].row);
     if (!header.some((h) => h.toLowerCase() === 'id')) throw new HttpError(400, 'CSV must have an "id" column');

@@ -391,7 +391,7 @@ export class Store extends EventEmitter {
   history(id, { limit = 500 } = {}) {
     return this.db.prepare(
       'SELECT hid, record_id AS id, version, action, changes, data, at FROM history WHERE record_id = ? ORDER BY hid DESC LIMIT ?'
-    ).all(id, Math.min(Number(limit) || 500, 100000)).map(parseHist);
+    ).all(id, Math.max(1, Math.min(Math.floor(Number(limit)) || 500, 100000))).map(parseHist);
   }
 
   /**
@@ -424,7 +424,7 @@ export class Store extends EventEmitter {
    * snapshot of each entry (the activity feed only needs the changes).
    */
   recentHistory({ limit = 200, before, after, data = true } = {}) {
-    const lim = Math.min(Number(limit) || 200, 5000);
+    const lim = Math.max(1, Math.min(Math.floor(Number(limit)) || 200, 5000));
     const cols = data ? 'hid, record_id AS id, version, action, changes, data, at' : 'hid, record_id AS id, version, action, changes, at';
     let rows;
     if (before) rows = this.db.prepare(`SELECT ${cols} FROM history WHERE hid < ? ORDER BY hid DESC LIMIT ?`).all(Number(before), lim);

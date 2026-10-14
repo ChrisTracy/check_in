@@ -615,6 +615,27 @@ test('responses are compressed; id list and lightweight activity feed', async ()
   assert.ok(newer[0].data);
 });
 
+test('history limits cannot be turned off with zero or negative values; wide CSV files are refused early', async () => {
+  const { call } = await setup();
+  for (let i = 0; i < 5; i++) await call({ method: 'POST', url: '/api/checkin', payload: { id: 'h1', i } });
+  for (const [limit, n] of [[-1, 1], [-100, 1], [0, 3], ['abc', 3], [2, 2], [1.7, 1]]) { // 3 = the history kept per device here
+    assert.equal((await call({ url: `/api/history?limit=${limit}` })).json().history.length, n, `history limit=${limit}`);
+    assert.equal((await call({ url: `/api/records/h1/history?limit=${limit}` })).json().history.length, n, `record history limit=${limit}`);
+  }
+  const csv = (text) => call({ method: 'POST', url: '/api/import', payload: text, headers: { 'content-type': 'text/csv' } });
+  // More columns than id + the per-record field limit (500 here)
+  let r = await csv('id,' + Array.from({ length: 501 }, (_, i) => 'c' + i).join(',') + '\na\n');
+  assert.equal(r.statusCode, 400);
+  assert.match(r.json().error, /Too many columns \(502\)/);
+  // Rows far wider than the header
+  r = await csv('id,a\nx,1' + ','.repeat(5000) + '\n');
+  assert.equal(r.statusCode, 400);
+  assert.match(r.json().error, /cells but the header has 2 columns/);
+  // A few trailing cells (spreadsheet exports) are still fine
+  r = await csv('id,a\nx,1,,\ny,2\n');
+  assert.equal(r.json().imported, 2);
+});
+
 test('the rev counter never goes backwards after deleting the newest records', async () => {
   const db = openDb(':memory:');
   const store = new Store(db, { historyLimit: 3, maxBatch: 100 });

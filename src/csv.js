@@ -72,7 +72,15 @@ export const decodeHeader = (h) => {
  * line the row starts on in the file (quoted cells can span several lines, so it isn't simply
  * the row's index). Throws on duplicate header names instead of silently keeping one column.
  */
-export function parseCsvRows(text) {
+export function parseCsvRows(text, { maxColumns = Infinity } = {}) {
+  // Check the header first: a file with a huge header (a million columns) would otherwise make every
+  // row allocate that many cells while the whole file is parsed in one go, blocking the server.
+  if (Number.isFinite(maxColumns)) {
+    const head = parse(text.slice(0, 1024 * 1024), { bom: true, skip_empty_lines: true, relax_column_count: true, relax_quotes: true, to: 1 });
+    const n = head[0]?.length || 0;
+    if (n > maxColumns) throw new Error(`Too many columns (${n}${text.length > 1024 * 1024 ? ' or more' : ''}). The most allowed is ${maxColumns}: the id plus the per-record field limit.`);
+  }
+  let width = Infinity;
   const records = parse(text, {
     bom: true,
     skip_empty_lines: true,
@@ -80,6 +88,14 @@ export function parseCsvRows(text) {
     relax_quotes: true,
     trim: false,
     info: true,
+    // Rows can't be much wider than the header: cells past it have no name and would be dropped
+    // anyway, and a file of very wide rows would use a lot of memory. A few spare (trailing) cells are fine.
+    on_record: (r) => {
+      if (width === Infinity) { width = r.record.length; return r; }
+      if (r.record.length > width + 10) throw new Error(`A row has ${r.record.length} cells but the header has ${width} columns`);
+      if (r.record.length > width) r.record.length = width;
+      return r;
+    },
   });
   if (!records.length) return [];
   const names = records[0].record.map(decodeHeader);
