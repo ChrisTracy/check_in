@@ -191,8 +191,7 @@
       <div class="admin-section"><h4>Accepting check-ins</h4><div id="ciPauseBox">${pauseCard()}</div></div>
       <div class="admin-section" data-cap="threshold">
         <h4>Active threshold</h4>
-        <div class="copy-row"><input class="input" id="ciStale" type="number" min="1" step="1" value="${esc(S.settings.staleMinutes)}" style="width:120px;font-family:inherit;background:var(--surface)" aria-label="Active threshold in minutes"><span class="muted">minutes</span>
-          <button class="btn primary" id="ciSave">Save</button></div>
+        <div class="copy-row"><input class="input" id="ciStale" type="number" min="1" step="1" value="${esc(S.settings.staleMinutes)}" style="width:120px;flex:none;font-family:inherit;background:var(--surface)" aria-label="Active threshold in minutes"><span class="muted">minutes</span></div>
         <p class="muted" style="margin:0;font-size:12px">A record is <b>active</b> within the threshold, <b>aging</b> up to twice that, and <b>stale</b> after that. This applies to everyone.</p>
       </div>
       <div class="admin-section" data-cap="historyLimit" id="ciHist">
@@ -200,17 +199,27 @@
         <div id="ciHistBody"><div class="muted">Loading…</div></div>
       </div>`;
     wirePause();
+    histSave = null;
     loadHistoryLimit();
+    foot('<button class="btn primary" id="ciSave" data-cap="threshold">Save changes</button>');
     $('#ciSave').addEventListener('click', async () => {
+      let did = false;
       const m = Math.floor(Number($('#ciStale').value));
       if (!Number.isFinite(m) || m < 1) { toast('Enter a whole number of minutes (1 or more)', 'error'); return; }
-      try { $('#ciStale').value = await UI.saveThreshold(m); toast('Active threshold updated for everyone'); } catch (e) { toast(e.message, 'error'); }
+      if (m !== Number(UI.state.settings.staleMinutes)) {
+        try { $('#ciStale').value = await UI.saveThreshold(m); toast('Active threshold updated for everyone'); did = true; } catch (e) { toast(e.message, 'error'); return; }
+      }
+      const h = histSave ? histSave() : 'none'; // opens its own confirmation when the limit changed
+      if (h === 'asked') did = true;
+      if (h === 'invalid') return;
+      if (!did) toast('Nothing to save');
     });
     $('#ciStale').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#ciSave').click(); });
   }
   // ---- history limit: how many check-ins each device keeps (power users) ----
   const sizeText = (b) => (b >= 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b >= 1e6 ? (b / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1e3)) + ' KB');
   const limitText = (n) => (n < 0 ? 'unlimited' : n === 0 ? 'off' : nf.format(n));
+  let histSave = null; // set while the History section is showing: returns 'asked', 'same' or 'invalid'
   async function loadHistoryLimit() {
     const box = $('#ciHistBody');
     if (!box) return;
@@ -224,20 +233,20 @@
     const unlimited = h.limit < 0;
     box.innerHTML = `
       <p class="muted" style="margin:0 0 8px;font-size:13px" data-ro-ok>Check-ins kept for each device, used by History and Graph. Now: <b>${esc(limitText(h.limit))}</b> (${h.source === 'settings' ? 'set here' : `default from <code>HISTORY_LIMIT</code>`}). The database holds ${nf.format(h.rows)} entries, about ${esc(sizeText(h.bytes))}.</p>
-      <div class="copy-row"><input class="input" id="ciHL" type="number" min="0" max="1000000" step="1" value="${unlimited ? '' : esc(h.limit)}" ${unlimited ? 'disabled' : ''} style="width:120px;font-family:inherit;background:var(--surface)" aria-label="History entries per device"><span class="muted">entries per device</span>
+      <div class="copy-row"><input class="input" id="ciHL" type="number" min="0" max="1000000" step="1" value="${unlimited ? '' : esc(h.limit)}" ${unlimited ? 'disabled' : ''} style="width:120px;flex:none;font-family:inherit;background:var(--surface)" aria-label="History entries per device"><span class="muted">entries per device</span>
         <label class="switch" style="margin:0 0 0 8px"><input type="checkbox" id="ciHLinf" ${unlimited ? 'checked' : ''}><span class="track"></span><b>Unlimited</b></label>
-        <button class="btn primary" id="ciHLsave">Save</button>
         ${h.source === 'settings' && h.environmentLimit !== h.limit ? `<button class="btn" id="ciHLreset" title="Go back to the HISTORY_LIMIT value (${esc(limitText(h.environmentLimit))})">Use default</button>` : ''}</div>
       <p class="muted" style="margin:6px 0 0;font-size:12px">0 turns history off. <b>Lowering the limit deletes older entries straight away. Raising it makes the database, and the disk space it needs, grow.</b></p>`;
     $('#ciHLinf').addEventListener('change', (e) => { $('#ciHL').disabled = e.target.checked; if (!e.target.checked && $('#ciHL').value === '') $('#ciHL').value = h.environmentLimit >= 0 ? h.environmentLimit : 100; });
     const wanted = () => ($('#ciHLinf').checked ? -1 : Number($('#ciHL').value));
-    $('#ciHLsave').addEventListener('click', () => {
+    histSave = () => {
       const n = wanted();
-      if ($('#ciHL').value === '' && n !== -1) { toast('Enter a number, or choose Unlimited', 'error'); return; }
-      if (!Number.isInteger(n) || n < -1 || n > 1000000) { toast('Enter a whole number from 0 to 1,000,000', 'error'); return; }
-      if (n === h.limit && h.source === 'settings') { toast('That is already the limit'); return; }
+      if ($('#ciHL').value === '' && n !== -1) { toast('Enter a number, or choose Unlimited', 'error'); return 'invalid'; }
+      if (!Number.isInteger(n) || n < -1 || n > 1000000) { toast('Enter a whole number from 0 to 1,000,000', 'error'); return 'invalid'; }
+      if (n === h.limit) return 'same';
       confirmHistoryLimit(n, h, false);
-    });
+      return 'asked';
+    };
     $('#ciHLreset')?.addEventListener('click', () => confirmHistoryLimit(h.environmentLimit, h, true));
   }
   // Show what the change does before doing it: lowering deletes data, raising needs more disk.
@@ -815,7 +824,7 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
         <h4>Certificate history</h4>
         ${historyHtml(st.events || [])}
       </div>`;
-    foot('<button class="btn primary" id="tSave">Save HTTPS settings</button>');
+    foot('<button class="btn primary" id="tSave">Save changes</button>');
 
     // Delegate on the container: the source switcher is re-rendered with the form.
     $('#tForm').addEventListener('click', (e) => {
@@ -1154,7 +1163,6 @@ Invoke-RestMethod -Method Post "${esc(origin)}/api/checkin?id=device-1&amp;statu
           <label class="field" style="flex:1;min-width:180px">Checks per address per minute<input class="input" id="pcRate" type="number" min="10" max="1000000" step="10" value="${esc(pc.perIpPerMinute)}"></label>
         </div>
         <p class="muted" style="margin:6px 0 10px;font-size:12px">A port that doesn't answer within the wait counts as closed (shown as <i>filtered</i> in the details). The per-address limit stops one caller from keeping the server busy; raise it when many devices share one address (a site behind NAT, or a load test).</p>
-        <button class="btn primary" id="pcSave" style="align-self:flex-start">Save limits</button>
       </div>
       <div class="admin-section">
         <h4>How it works</h4>
@@ -1182,6 +1190,7 @@ checkin-agent.ps1 -PortCheck 3389                (Windows: ask once)
         <h4>Since the server started</h4>
         <p class="muted" style="margin:0">${nf.format(s.checks || 0)} ports checked: ${nf.format(s.open || 0)} open, ${nf.format(s.closed || 0)} closed, ${nf.format(s.filtered || 0)} no answer${s.error ? `, ${nf.format(s.error)} errors` : ''}.</p>
       </div>`;
+    foot('<button class="btn primary" id="pcSave">Save changes</button>');
     $('#pcEnabled').addEventListener('change', async (e) => {
       try {
         renderPorts(await apiJson('/api/admin/portcheck', json('PUT', { enabled: e.target.checked })));
@@ -1227,10 +1236,6 @@ checkin-agent.ps1 -PortCheck 3389                (Windows: ask once)
           <label class="field" style="flex:1;min-width:150px">Quiet for this long after start-up (s)<input class="input" id="alGrace" type="number" min="0" max="3600" value="${esc(a.graceSeconds)}"></label>
         </div>
         <p class="muted" style="margin:6px 0 10px;font-size:12px">Past the limit, alerts stop going out one by one and a single summary ("N more issues opened") is sent when the time is up. The issues are all still on the Issues page. The quiet time covers a restart, when every device is checked again.</p>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn primary" id="alSave">Save</button>
-          <button class="btn" id="alTest" ${a.appriseUrl && (dest.length || a.configKey) ? '' : 'disabled'}>Send test alert</button>
-        </div>
       </div>
       <div class="admin-section">
         <h4>Since the server started</h4>
@@ -1244,6 +1249,7 @@ docker compose up -d
 # Or on its own
 docker run -d --name apprise -p 8000:8000 caronc/apprise:latest</pre>
       </div>`;
+    foot(`<button class="btn" id="alTest" ${a.appriseUrl && (dest.length || a.configKey) ? '' : 'disabled'}>Send test alert</button><button class="btn primary" id="alSave">Save changes</button>`);
     const body = () => {
       const b = { appriseUrl: $('#alUrl').value, configKey: $('#alKey').value, linkUrl: $('#alLink').value, max: Number($('#alMax').value), perSeconds: Number($('#alSecs').value), graceSeconds: Number($('#alGrace').value) };
       if ($('#alUrls').value.trim()) b.urls = $('#alUrls').value;
