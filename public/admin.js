@@ -314,6 +314,7 @@
           ${row('Running since', esc(when(i.startedAt) || ''))}
           ${row('Node.js', esc(i.node))}
           ${row('Platform', esc(i.platform))}
+          ${i.database ? row('Database', `<b>${esc(sizeText(i.database.bytes))}</b> <span class="muted">· ${nf.format(i.database.records)} devices, ${nf.format(i.database.history)} history entries${i.database.wal >= 1e6 ? ` · ${esc(sizeText(i.database.wal))} of it in the write-ahead log` : ''}</span>`) : ''}
           ${row('License', esc(i.license))}
         </table>
       </div>

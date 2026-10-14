@@ -246,7 +246,10 @@ export function buildApp({ config, store, accounts, oidc }) {
   // ---- agent downloads and one-line installers (see src/agents.js) -------
   registerAgentRoutes(app);
 
-  app.get('/api/about', { config: { cap: 'view' } }, async () => aboutInfo());
+  app.get('/api/about', { config: { cap: 'view' } }, async () => {
+    const s = store.summary();
+    return { ...aboutInfo(), database: { ...store.diskUsage(config.dbPath), records: s.records, history: s.history } };
+  });
 
   app.get('/health', async () => ({ ok: true, accepting: !accounts.ingest().paused }));
 

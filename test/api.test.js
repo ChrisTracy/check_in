@@ -811,6 +811,23 @@ test('the About page data needs a login and matches package.json', async () => {
   assert.equal(i.license, 'Apache-2.0');
   assert.match(i.node, /^\d+\./);
   assert.ok(i.repoUrl.startsWith('https://github.com/'));
+  assert.ok(i.database.bytes > 0, 'database size');
+  assert.equal(typeof i.database.records, 'number');
+  assert.equal(typeof i.database.history, 'number');
+  assert.equal(i.database.path, undefined, 'the file path is not shown');
+});
+
+test('database size on disk counts the file and its write-ahead log', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ci-size-')), 'x.db');
+  const store = new Store(openDb(file), { historyLimit: 10 });
+  for (let i = 0; i < 200; i++) await store.enqueue('d' + (i % 20), { i, pad: 'x'.repeat(500) });
+  const u = store.diskUsage(file);
+  const onDisk = ['', '-wal', '-shm'].reduce((t, s) => t + (fs.existsSync(file + s) ? fs.statSync(file + s).size : 0), 0);
+  assert.equal(u.bytes, onDisk);
+  assert.ok(u.bytes > 100_000);
 });
 
 test('history limit: power users change it; lowering deletes, the saved value wins, and it can be reset', async () => {

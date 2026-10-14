@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { isDeepStrictEqual } from 'node:util';
 
@@ -495,6 +496,19 @@ export class Store extends EventEmitter {
     return [...this.fieldCounts.entries()]
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  }
+
+  /**
+   * Size on disk: the database file plus its write-ahead log (-wal) and shared-memory (-shm) files.
+   * An in-memory database reports the pages it uses instead.
+   */
+  diskUsage(file) {
+    const size = (f) => { try { return fs.statSync(f).size; } catch { return 0; } };
+    const main = file && file !== ':memory:' ? size(file) : 0;
+    const wal = main ? size(file + '-wal') + size(file + '-shm') : 0;
+    const pages = this.db.prepare('PRAGMA page_count').get().page_count * this.db.prepare('PRAGMA page_size').get().page_size;
+    const free = this.db.prepare('PRAGMA freelist_count').get().freelist_count * this.db.prepare('PRAGMA page_size').get().page_size;
+    return { bytes: (main || pages) + wal, file: main || pages, wal, free };
   }
 
   summary() {
