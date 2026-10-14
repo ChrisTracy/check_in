@@ -368,6 +368,13 @@ if ($Stale) {
 }
 
 $inv = [System.Globalization.CultureInfo]::InvariantCulture
+# "12d 4h 7m", the same text the agents send in uptime.
+function Format-Uptime([double]$hours) {
+  $t = [TimeSpan]::FromHours($hours)
+  if ($t.Days -gt 0) { return '{0}d {1}h {2}m' -f $t.Days, $t.Hours, $t.Minutes }
+  if ($t.Hours -gt 0) { return '{0}h {1}m' -f $t.Hours, $t.Minutes }
+  return '{0}m' -f $t.Minutes
+}
 function Get-Body($d, [double]$elapsed) {
   # Normal readings wander a little each time; conditions stay over the box thresholds.
   $d.Cpu = [Math]::Min(60, [Math]::Max(2, $d.Cpu + $rand.Next(-8, 9)))
@@ -385,7 +392,8 @@ function Get-Body($d, [double]$elapsed) {
     cpu_pct = [Math]::Round($cpu, 1); ram_pct = [Math]::Round($ram, 1); ram_total_mb = $d.RamMb
     disk_pct = $disk; disk_max_pct = $disk; disk_max_mount = $(if ($d.Os -eq 'windows') { 'C:' } else { '/' })
     disk_busy_pct = [Math]::Round($busy, 1); disk_size_gb = $d.DiskGb; disk_free_gb = [Math]::Round($d.DiskGb * (100 - $disk) / 100, 1)
-    uptime_h = [Math]::Round($uptimeH, 1); reboot_required = [bool]$d.RebootRequired
+    uptime_h = [Math]::Round($uptimeH, 1); uptime = $(Format-Uptime $uptimeH)
+    boot_time = [DateTime]::UtcNow.AddHours(-$uptimeH).ToString('yyyy-MM-ddTHH:mm:ssZ', $inv); reboot_required = [bool]$d.RebootRequired
     domain_joined = -not $d.NotDomainJoined; domain = $(if ($d.NotDomainJoined) { '' } else { 'corp.example.com' })
     failed_services = $failed; failed_service_names = $names
     system_time = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', $inv)

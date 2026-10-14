@@ -563,3 +563,13 @@ test('load test: top processes are opt in; text only when a metric is over 85, e
   assert.equal(ok.statusCode, 200);
   assert.equal((await admin({ url: '/api/admin/loadtest' })).j().topProcs, true);
 });
+
+test('load test: simulated devices send uptime like the agents (boot_time, uptime, uptime_h)', async (t) => {
+  const { app, store } = await setup(t);
+  const { LoadTest } = await import('../src/loadtest.js');
+  const lt = new LoadTest({ app, store, log: { info() {}, warn() {}, error() {} } });
+  const f = lt.fields(3);
+  assert.match(f.uptime, /^(\d+d \d+h \d+m|\d+h \d+m|\d+m)$/);
+  assert.match(f.boot_time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[-+]\d{2}:\d{2}$/);
+  assert.ok(Math.abs((Date.now() - Date.parse(f.boot_time)) / 36e5 - f.uptime_h) < 0.1, 'uptime_h matches boot_time');
+});

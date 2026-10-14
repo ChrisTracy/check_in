@@ -85,6 +85,12 @@ function localTime(ms) {
   const d = new Date(ms - 5 * 3600e3);
   return d.toISOString().slice(0, 19) + '-05:00';
 }
+/** "12d 4h 7m", the same text the agents send in `uptime`. */
+function humanDuration(ms) {
+  const m = Math.max(0, Math.floor(ms / 60000));
+  const d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60;
+  return d ? `${d}d ${h}h ${mm}m` : h ? `${h}h ${mm}m` : `${mm}m`;
+}
 /** Small seeded random generator, so each device keeps its own character. */
 function rng(seed) {
   let s = seed >>> 0 || 1;
@@ -210,7 +216,8 @@ export class LoadTest {
       disk_pct: jitter(s.diskBase, 2), disk_max_pct: jitter(s.diskBase + 5, 2), disk_size_gb: s.disk_size_gb,
       disk_free_gb: Math.round(s.disk_size_gb * (1 - (s.diskBase + 5) / 100)), disk_busy_pct: jitter(8, 12),
       system_time: localTime(Date.now()), time_synced: true, timezone: 'Central Standard Time',
-      uptime_h: Math.round((Date.now() - s.boot) / 36e5), ip: s.ip,
+      boot_time: localTime(s.boot), uptime: humanDuration(Date.now() - s.boot),
+      uptime_h: Math.round((Date.now() - s.boot) / 36e5 * 10) / 10, ip: s.ip,
       domain_joined: true, domain: 'corp.example.com', secure_channel_ok: true,
       failed_services: 0, failed_service_names: '', reboot_required: false, processes: 120 + Math.round(r() * 120),
       services_total: s.services.length,

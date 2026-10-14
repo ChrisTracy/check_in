@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Check-In agent for Linux                                         version 2.2.0
+# Check-In agent for Linux                                         version 2.2.1
 #
 # 1. Asks the server whether it is accepting check-ins   (GET  /api/status)
 # 2. Only if it is: gathers the selected details        (CPU sample takes 1s)
@@ -91,7 +91,7 @@ DEFAULT_CHECK_PORTS=""          # ports the server tests on each check-in, e.g. 
 DEFAULT_GROUPS="system cpu ram disk time uptime network domain users health"
 # ----------------------------------------------------------------------------------------------
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 INSTALL_PATH="/usr/local/bin/checkin-agent"
 DEFAULT_CONFIG="/etc/check-in/agent.conf"
 ALL_GROUPS="system cpu ram disk time uptime network domain users health updates security topprocs"
@@ -204,7 +204,7 @@ if [ "$ACTION" = "uninstall" ]; then
   fi
   if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/checkin-agent.timer ]; then
     systemctl disable --now checkin-agent.timer >/dev/null 2>&1
-    rm -f /etc/systemd/system/checkin-agent.timer /etc/systemd/system/checkin-agent.service
+    rm -f /etc/systemd/system/checkin-agent.timer /etc/systemd/system/checkin-agent.service /var/lib/systemd/timers/stamp-checkin-agent.timer
     systemctl daemon-reload
   fi
   rm -f /etc/cron.d/checkin-agent "$INSTALL_PATH" "$DEFAULT_CONFIG"
@@ -215,6 +215,7 @@ fi
 
 if [ "$ACTION" = "install" ]; then
   [ "$(id -u)" = 0 ] || die "--install needs root (use sudo)"
+  umask 022   # files written below must not be writable by other users, whatever umask we were started with
   [ -n "$URL" ] || die "--install needs --url"
   case "$EVERY" in ''|*[!0-9]*|0) die "--every must be a whole number of minutes (1 or more)" ;; esac
   [ "$EVERY" -le 59 ] || die "--every must be 59 minutes or less"
@@ -227,7 +228,7 @@ if [ "$ACTION" = "install" ]; then
   if [ "$(readlink -f "$SRC" 2>/dev/null)" != "$(readlink -f "$INSTALL_PATH" 2>/dev/null)" ]; then
     install -m 0755 "$SRC" "$INSTALL_PATH" || die "could not copy the agent to $INSTALL_PATH"
   fi
-  mkdir -p "$(dirname "$DEFAULT_CONFIG")"
+  mkdir -p "$(dirname "$DEFAULT_CONFIG")"; chmod 755 "$(dirname "$DEFAULT_CONFIG")"
   ( umask 077
     { echo "# Check-In agent settings, written by --install on $(date -Is). Edit freely."
       printf 'CHECKIN_URL=%q\n' "$URL"
@@ -252,20 +253,30 @@ After=network-online.target
 Type=oneshot
 ExecStart=$INSTALL_PATH
 SuccessExitStatus=2
+# Stop a run that hangs (a stuck command or network call), so the next one can start on time.
+# A normal run takes a few seconds; curl alone gives up within about a minute.
+TimeoutStartSec=120
 EOF
     cat > /etc/systemd/system/checkin-agent.timer <<EOF
 [Unit]
 Description=Run the Check-In agent every $EVERY minute(s)
 
 [Timer]
+# OnActiveSec starts the cycle 1 minute after an install (re)starts the timer; OnBootSec does the same
+# after a reboot. Without it, a reinstall on a machine that had been up a while could leave the timer
+# with nothing to count from, and it stopped running until the next reboot.
+OnActiveSec=1min
 OnBootSec=1min
 OnUnitActiveSec=${EVERY}min
 RandomizedDelaySec=20
+# systemd's default 1-minute accuracy can push a run into the next minute (every 1 minute became every 2).
+AccuracySec=1s
 Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF
+    chmod 644 /etc/systemd/system/checkin-agent.service /etc/systemd/system/checkin-agent.timer
     systemctl daemon-reload
     systemctl enable checkin-agent.timer >/dev/null 2>&1 || die "could not enable checkin-agent.timer"
     # Restart (not just start) so a changed interval applies to a timer that was already running.
@@ -275,7 +286,7 @@ EOF
   else
     if [ -f /etc/systemd/system/checkin-agent.timer ]; then
       systemctl disable --now checkin-agent.timer >/dev/null 2>&1
-      rm -f /etc/systemd/system/checkin-agent.timer /etc/systemd/system/checkin-agent.service
+      rm -f /etc/systemd/system/checkin-agent.timer /etc/systemd/system/checkin-agent.service /var/lib/systemd/timers/stamp-checkin-agent.timer
     fi
     echo "*/$EVERY * * * * root $INSTALL_PATH >/dev/null 2>&1" > /etc/cron.d/checkin-agent
     chmod 644 /etc/cron.d/checkin-agent
